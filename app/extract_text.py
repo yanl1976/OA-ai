@@ -31,68 +31,79 @@ try:
 except ImportError:
     pass
 
+import os
+
 ALLOWED_EXT = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pptx", ".pdf"}
 
-# LLM 配置（暂时禁用）
-USE_LLM = False
+# LLM 配置：默认关闭，可在 .env 中设置 USE_LLM=true 并配置 MINIMAX_API_KEY 启用
+# 启用后，PDF/DOCX 会先用基础解析得到原始文本，再交由大模型做结构化排版
+USE_LLM = os.environ.get("USE_LLM", "false").lower() in ("1", "true", "yes")
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
+MINIMAX_API_URL = os.environ.get(
+    "MINIMAX_API_URL",
+    "https://api.minimax.io/v1/text/chatcompletion_v2",
+)
+MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "abab6.5s-chat")
 
 
 # ---------------- LLM 提取 ----------------
 def _call_llm(prompt: str, text: str) -> str:
-    """调用 MiniMax API 进行结构化提取。"""
+    """调用 MiniMax API 进行结构化提取。
+
+    大模型只负责「重新排版」：把 PDF/Word 抽取出的、挤在一起的原始文本，
+    按中文文档的自然结构（封面、章节、条款、表格）整理成干净的多行纯文本。
+    不理解/不增删内容，仅做排版还原。
+    """
     if not MINIMAX_API_KEY:
         raise ValueError("MINIMAX_API_KEY not configured")
 
     url = MINIMAX_API_URL
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    system_prompt = """你是一个文档格式化工具。输入是PDF抽取的原始文本（可能所有内容都挤在一起）。你只需要重新排版输出，不需要理解内容。
+    system_prompt = (
+        "你是一个中文文档排版还原工具。输入是 PDF/Word 抽取出的原始文本"
+        "（可能所有内容挤在一起、缺失换行、章节条目粘连）。\n"
+        "你只需重新排版输出，不需要理解或改写内容。\n\n"
+        "排版规则：\n"
+        "1. 封面/红头区域：单位名、文件标题、文号、发布日期、实施日期 各自单独成行。\n"
+        "2. 「2025-8-11发布」和「2025-8-11实施」必须是两行。\n"
+        "3. 章节编号（1、2、2.1、3.1、第一章、第一条、（一））单独成行。\n"
+        "4. 普通正文按自然段落合并（连续的中文句子合并为一段，段间空行）。\n"
+        "5. 表格内容尽量保留行列结构（可用制表符或空格对齐）。\n"
+        "6. 直接输出整理后的纯文本，不要任何说明文字、不要 Markdown 代码块标记。\n"
+    )
 
-严格按以下格式输出（每行一个元素）：
-
-天水电气传动研究所集团有限公司管理标准
-公司标准体系
-Q/CT 300-2022
-天水电气传动研究所集团有限公司
-2025-8-11发布
-2025-8-11实施
-
-1 范围
-本标准规定了...
-
-2 规范性引用文件
-...
-
-格式化规则：
-1. 封面区域：单位名、标题、标准号、日期 各自单独一行
-2. "2025-8-11发布" 和 "2025-8-11实施" 必须是两行
-3. 正文：每个章节编号（1、2、2.1、3.1）单独一行
-4. 直接输出纯文本，不要任何说明文字"""
+    # 长文档分段提交，避免超出模型上下文；这里取前 16000 字符（约 8K 中文）
+    snippet = text[:16000]
 
     payload = {
-        "model": "abab6.5s-chat",
+        "model": MINIMAX_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请提取以下文档的结构化内容：\n\n{text[:8000]}"}
+            {"role": "user", "content": f"请将以下文档整理为干净的结构化纯文本：\n\n{snippet}"},
         ],
-        "temperature": 0.3
+        "temperature": 0.2,
     }
 
     import urllib.request
     import urllib.error
 
-    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(response.read().decode('utf-8'))
+            result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP Error: {e.code} - {e.read().decode()}")
 
     if "choices" in result and result["choices"]:
         return result["choices"][0]["message"]["content"]
+    if "reply" in result:  # 兼容部分 MiniMax 返回结构
+        return result["reply"]
     raise RuntimeError(f"LLM API error: {result}")
 
 
@@ -480,59 +491,105 @@ def merge_lines_to_paragraphs(lines) -> list:
     return [p for p in header_paras + body_paras if p.strip()]
 
 
-def _decode_pdf(raw: bytes) -> str:
-    """PDF 底层解码：使用 pdfplumber 保留原始行架，过滤位置码。"""
+def _decode_pdf_pymupdf(raw: bytes) -> str:
+    """PDF 底层解码（主引擎）：使用 PyMuPDF 按文本块提取，保留阅读顺序。
+
+    PyMuPDF 的 get_text("blocks") 会按 (x0,y0,x1,y1, text, block_no, block_type)
+    返回文本块，配合 sort=True 按阅读顺序（从上到下、从左到右）排序，对多栏
+    / 表格 / 复杂排版远比逐行坐标提取鲁棒。图像型 PDF（无文本层）会返回空，
+    由调用方给出扫描件告警。
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        raise RuntimeError("服务端未安装 PyMuPDF（pymupdf），无法解析 PDF")
+
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception as e:
+        raise RuntimeError(f"PDF 打开失败: {e}")
+
+    parts = []
+    for page in doc:
+        # blocks=True 返回 (x0,y0,x1,y1, text, block_no, block_type)
+        # 文本块 block_type=0；图片块 block_type=1 跳过（图片无文本）
+        blocks = page.get_text("blocks", sort=True)
+        page_lines = []
+        for b in blocks:
+            if len(b) < 5:
+                continue
+            txt = (b[4] or "").strip()
+            if not txt:
+                continue
+            # 过滤位置码：格式如 2-1-5-1
+            if re.fullmatch(r"\d+-\d+-\d+-\d+", txt):
+                continue
+            # 过滤纯页码行
+            if re.fullmatch(r"[\d\s\-—/．.]+", txt) and len(txt) <= 6:
+                continue
+            page_lines.append(txt)
+        if page_lines:
+            parts.append("\n".join(page_lines))
+    doc.close()
+
+    text = "\n\n".join(parts)
+    return _post_clean_pdf_text(text)
+
+
+def _decode_pdf_pdfplumber(raw: bytes) -> str:
+    """PDF 底层解码（回退引擎）：pdfplumber 按坐标逐行提取。"""
     try:
         import pdfplumber
     except ImportError:
-        raise RuntimeError("服务端未安装 pdfplumber，无法解析 PDF")
+        raise RuntimeError("服务端未安装 pdfplumber 也无法解析 PDF（且 PyMuPDF 缺失）")
 
     try:
         with pdfplumber.open(io.BytesIO(raw)) as pdf:
             parts = []
             for page in pdf.pages:
-                # 提取文本，保留原始行
                 txt = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
                 if txt.strip():
                     parts.append(txt)
     except Exception as e:
         raise RuntimeError(f"PDF 解析失败: {e}")
 
-    # 过滤和清理
     lines = []
     for ln in "\n".join(parts).split("\n"):
         s = ln.strip()
-        # 过滤位置码：格式如 2-1-5-1、2-1-5-2
         if re.fullmatch(r"\d+-\d+-\d+-\d+", s):
             continue
-        # 过滤纯页码行
         if re.fullmatch(r"[\d\s\-—/．.]+", s) and len(s) <= 6:
             continue
         lines.append(ln)
 
-    # 后处理：分开日期
     text = "\n".join(lines)
+    return _post_clean_pdf_text(text)
 
-    # 定义替换函数 - 用函数代替字符串替换
+
+def _post_clean_pdf_text(text: str) -> str:
+    """PDF 文本公共后处理：把粘连的『发布/实施』日期拆成两行。"""
     def split_date_replace(m):
         return "\n".join(m.groups())
 
-    # 分开两个日期："2022-11-28发布2022-11-28实施" 或 "2022-11-28发布 2022-11-28实施"
     text = re.sub(r"(\d{4}-\d+-\d+)\s*(发布)\s*(\d{4}-\d+-\d+)\s*(实施)", split_date_replace, text)
-    # 处理无空格情况："2022-11-28发布2022-11-28实施" (日期紧跟发布)
     text = re.sub(r"(\d{4}-\d+-\d+)(发布)(\d{4}-\d+-\d+)(实施)", split_date_replace, text)
-    # 分开 "公司名+日期" 的粘连
     text = re.sub(r"([^\s]{10,})(\d{4}-\d+-\d+)\s*(发布)\s*(实施)", split_date_replace, text)
     text = re.sub(r"([^\s]{10,})(\d{4}-\d+-\d+)(发布)(\d{4}-\d+-\d+)(实施)", split_date_replace, text)
-    # 处理跨行情况
     text = re.sub(r"([^\s]{10,})(\d{4}-\d+-\d+)(发布)\n\s*(\d{4}-\d+-\d+)(实施)", split_date_replace, text)
     text = re.sub(r"(发布)\n\s*(\d{4}-\d+-\d+)(实施)", split_date_replace, text)
     text = re.sub(r"(发布)\n\s*(\d{4}-\d+-\d+)\s*(实施)", split_date_replace, text)
-    # 分开 "发布" 和 "实施"
     text = re.sub(r"(发布)\s+(实施)", split_date_replace, text)
     text = re.sub(r"(发布)(实施)", split_date_replace, text)
-
     return text
+
+
+def _decode_pdf(raw: bytes) -> str:
+    """PDF 底层解码：优先 PyMuPDF（更强、已默认安装），缺失时回退 pdfplumber。"""
+    try:
+        return _decode_pdf_pymupdf(raw)
+    except RuntimeError as e:
+        # PyMuPDF 缺失或失败，尝试 pdfplumber
+        return _decode_pdf_pdfplumber(raw)
 
 
 # ============================================================================
