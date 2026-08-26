@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Node
+web_vue/node_modules/
+web_vue/dist/
+
+# 敏感数据（本地数据库与加密密钥，切勿上传）
+data/
+
+# 知识库运行时产物（install.sh 会自动重建索引）
+knowledge_base/bm25_index/
+knowledge_base/vec_index/
+knowledge_base/uploads/
+
+# 环境配置（真实 .env 含凭证，切勿上传）
+.env
+.env.bak
+config/.env
+
+# 运行时缓存
+.jieba_cache/
+
+# 临时诊断文件
+__diag_out.pdf
+__test_derived.pdf
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

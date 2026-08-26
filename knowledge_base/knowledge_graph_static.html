@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识图谱 - 3D神经网络可视化（增强版 v2.0）</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #030612;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #header {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(3,6,18,0.94); backdrop-filter: blur(20px);
+    border-bottom: 1px solid rgba(79,195,247,0.12);
+    padding: 0 24px; height: 52px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  #header h1 { 
+    font-size: 15px; font-weight: 600; color: #e0e8f0; 
+    display: flex; align-items: center; gap: 10px;
+  }
+  #header h1::before {
+    content: '';
+    width: 10px; height: 10px;
+    background: #4fc3f7;
+    border-radius: 50%;
+    box-shadow: 0 0 12px #4fc3f7, 0 0 24px rgba(79,195,247,0.5);
+    animation: pulse-dot 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse-dot {
+    0%,100%{box-shadow: 0 0 8px #4fc3f7, 0 0 20px rgba(79,195,247,0.4);}
+    50%{box-shadow: 0 0 18px #4fc3f7, 0 0 40px rgba(79,195,247,0.8);}
+  }
+  #header .stats { font-size: 12px; color: #5a7a9a; }
+
+  #search-bar {
+    position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 100;
+    background: rgba(3,6,18,0.88); border: 1px solid rgba(79,195,247,0.2);
+    border-radius: 24px; padding: 10px 20px;
+    font-size: 13px; width: 340px; color: #e0e8f0;
+    outline: none; backdrop-filter: blur(10px);
+    transition: all 0.3s;
+  }
+  #search-bar::placeholder { color: #3a5a7a; }
+  #search-bar:focus { 
+    border-color: rgba(79,195,247,0.5); 
+    box-shadow: 0 0 24px rgba(79,195,247,0.12);
+  }
+
+  #sidebar {
+    position: fixed; right: 0; top: 52px; bottom: 0; width: 310px;
+    background: rgba(3,6,18,0.96); border-left: 1px solid rgba(79,195,247,0.1);
+    overflow-y: auto; padding: 16px 0; z-index: 90;
+    transform: translateX(100%); transition: transform 0.35s cubic-bezier(0.4,0,0.2,1);
+    backdrop-filter: blur(20px);
+  }
+  #sidebar.open { transform: translateX(0); }
+  #sidebar h3 { 
+    font-size: 13px; font-weight: 600; color: #c0d0e8; 
+    padding: 0 20px 14px; border-bottom: 1px solid rgba(79,195,247,0.08); margin-bottom: 12px; 
+  }
+  .doc-item { 
+    padding: 10px 20px; cursor: pointer; border-radius: 6px; margin: 2px 12px; 
+    transition: all 0.2s; color: #8090a8; font-size: 12px;
+  }
+  .doc-item:hover { 
+    background: rgba(79,195,247,0.06); color: #fff; 
+  }
+  .doc-item .name { font-size: 13px; font-weight: 500; color: #b0c0d8; margin-bottom: 3px; }
+  .doc-item .meta { font-size: 11px; color: #506a8a; }
+
+  #toggle-btn {
+    position: fixed; right: 16px; bottom: 20px; z-index: 200;
+    width: 48px; height: 48px; border-radius: 50%;
+    background: linear-gradient(135deg, #185FA5, #0c447c); color: #fff; border: none; cursor: pointer;
+    font-size: 20px; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 20px rgba(24,95,165,0.4);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  #toggle-btn:hover { transform: scale(1.08); box-shadow: 0 6px 28px rgba(24,95,165,0.5); }
+
+  #tooltip {
+    position: fixed; z-index: 300; pointer-events: none;
+    background: linear-gradient(135deg, rgba(5,8,18,0.97), rgba(5,8,18,0.93));
+    color: #fff;
+    border-radius: 12px; padding: 14px 18px; font-size: 12px;
+    max-width: 300px; line-height: 1.5;
+    opacity: 0; transition: opacity 0.12s; box-shadow: 0 8px 36px rgba(0,0,0,0.5);
+    border: 1px solid rgba(79,195,247,0.18);
+  }
+  #tooltip .tip-title { font-weight: 600; font-size: 14px; margin-bottom: 5px; color: #e0e8f0; }
+  #tooltip .tip-sub { color: #7a9ab8; font-size: 11px; }
+
+  #legend {
+    position: fixed; left: 16px; bottom: 20px; z-index: 100;
+    background: rgba(3,6,18,0.88); backdrop-filter: blur(12px);
+    border: 1px solid rgba(79,195,247,0.08); border-radius: 14px;
+    padding: 16px 20px; font-size: 11px; color: #5a7a9a;
+  }
+  #legend .leg-item { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  #legend .leg-dot { 
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    box-shadow: 0 0 8px currentColor;
+  }
+
+  #search-feedback {
+    position: fixed; top: 116px; left: 50%; transform: translateX(-50%);
+    z-index: 100; text-align: center;
+    font-size: 12px; color: #4fc3f7; pointer-events: none;
+    opacity: 0; transition: opacity 0.2s;
+  }
+
+  #reset-btn {
+    position: fixed; left: 16px; top: 64px; z-index: 100;
+    background: rgba(3,6,18,0.84); border: 1px solid rgba(79,195,247,0.18);
+    border-radius: 20px; padding: 8px 16px; font-size: 12px; color: #8090a8;
+    cursor: pointer; backdrop-filter: blur(10px);
+  }
+  #reset-btn:hover { background: rgba(79,195,247,0.08); color: #fff; }
+
+  #sidebar-close {
+    display: none; position: absolute; top: 14px; right: 14px;
+    width: 28px; height: 28px; border-radius: 50%;
+    background: rgba(79,195,247,0.08); border: none; cursor: pointer;
+    font-size: 14px; color: #5a7a9a; 
+  }
+  #sidebar.open #sidebar-close { display: flex; align-items: center; justify-content: center; }
+
+  #three-container {
+    position: fixed; top: 52px; left: 0; right: 0; bottom: 0;
+    z-index: 1; cursor: grab;
+  }
+  #three-container:active { cursor: grabbing; }
+  #three-container canvas { display: block; }
+
+  #perf-note {
+    position: fixed; top: 64px; right: 16px; z-index: 100;
+    font-size: 11px; color: #3a5a7a; pointer-events: none;
+    opacity: 0; transition: opacity 0.5s;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>公司管理制度 · 3D神经网络知识图谱 v2</h1>
+  <span class="stats" id="header-stats">16 大类 · 183 份制度文件 · 1091 页</span>
+</div>
+
+<input type="text" id="search-bar" placeholder="搜索类别或文件名（支持中英文模糊匹配）...">
+<button id="reset-btn" onclick="resetView()">重置</button>
+<div id="search-feedback">找到 <span class="count">0</span> 个结果</div>
+<div id="perf-note">3D神经网络 · 全183文档节点已加载</div>
+
+<div id="tooltip">
+  <div class="tip-title"></div>
+  <div class="tip-sub"></div>
+</div>
+
+<div id="sidebar">
+  <button id="sidebar-close" onclick="toggleSidebar()">✕</button>
+  <h3>文件列表</h3>
+  <div id="doc-list"></div>
+</div>
+
+<button id="toggle-btn" onclick="toggleSidebar()">☰</button>
+
+<div id="legend">
+  <div class="leg-item"><div class="leg-dot" style="background:#ffd740;color:#ffd740"></div>根节点 · 知识库中心</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#7F77DD;color:#7F77DD"></div>大类（点击展开文档）</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#4fc3f7;color:#4fc3f7"></div>文档节点（183份 · hover查看）</div>
+  <div class="leg-item" style="margin-top:6px;color:#3a5a7a;">拖拽旋转 · 滚轮缩放 · 双击聚焦</div>
+</div>
+
+<div id="three-container"></div>
+
+<script src="knowledge_graph_data.js"></script>
+<script src="three.min.js"></script>
+
+<script>
+// ========== 性能提示 ==========
+const perfNote = document.getElementById("perf-note");
+perfNote.style.opacity = "1";
+setTimeout(() => { perfNote.style.opacity = "0"; }, 3500);
+
+// ========== 数据层 ==========
+const nodeMap = {};
+NODES.forEach(n => nodeMap[n.id] = n);
+
+const CATEGORIES = NODES.filter(n => n.type === "category").map(cat => ({
+  id: cat.id, name: cat.name, code: cat.code, count: cat.count, color: cat.color,
+  children: NODES.filter(n => n.type === "doc" && n.parent === cat.id).map(doc => ({
+    name: doc.name, code: doc.code, id: doc.id, pages: doc.pages
+  }))
+}));
+
+// ========== Three.js 场景 ==========
+const T = THREE;
+const container = document.getElementById('three-container');
+const W = () => container.clientWidth;
+const H = () => container.clientHeight;
+
+const scene = new T.Scene();
+scene.background = new T.Color(0x030612);
+scene.fog = new T.FogExp2(0x030612, 0.00006);
+
+const camera = new T.PerspectiveCamera(48, W()/H(), 10, 3500);
+camera.position.set(0, 120, 900);
+camera.lookAt(0, 0, 0);
+
+const renderer = new T.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(W(), H());
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = false;
+container.appendChild(renderer.domElement);
+
+// ========== 轨道控制 ==========
+let orbit = {
+  theta: 0, phi: Math.PI/2, distance: 900,
+  target: new T.Vector3(0, 0, 0),
+  autoRotate: true, autoRotateSpeed: 0.18,
+  damping: 0.08, vTheta: 0, vPhi: 0, vDist: 0
+};
+
+function updateCameraPosition() {
+  const r = orbit.distance;
+  const phi = orbit.phi;
+  const theta = orbit.theta;
+  camera.position.set(
+    orbit.target.x + r * Math.sin(phi) * Math.cos(theta),
+    orbit.target.y + r * Math.cos(phi),
+    orbit.target.z + r * Math.sin(phi) * Math.sin(theta)
+  );
+  camera.lookAt(orbit.target);
+}
+
+function animateToTarget(newTarget, newDistance) {
+  const start = { tx: orbit.target.x, ty: orbit.target.y, tz: orbit.target.z, d: orbit.distance };
+  const end = { tx: newTarget.x, ty: newTarget.y, tz: newTarget.z, d: newDistance || orbit.distance };
+  const startTime = performance.now();
+  const duration = 900;
+  orbit.autoRotate = false;
+  function step(time) {
+    const elapsed = time - startTime;
+    let t = Math.min(elapsed / duration, 1);
+    t = t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+    orbit.target.set(
+      start.tx + (end.tx - start.tx) * t,
+      start.ty + (end.ty - start.ty) * t,
+      start.tz + (end.tz - start.tz) * t
+    );
+    orbit.distance = start.d + (end.d - start.d) * t;
+    updateCameraPosition();
+    if (t < 1) requestAnimationFrame(step);
+    else setTimeout(() => orbit.autoRotate = true, 2000);
+  }
+  requestAnimationFrame(step);
+}
+
+// 鼠标交互
+let isDragging = false, prevMouse = { x: 0, y: 0 };
+renderer.domElement.addEventListener('mousedown', (e) => {
+  isDragging = true;
+  prevMouse.x = e.clientX;
+  prevMouse.y = e.clientY;
+  orbit.autoRotate = false;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - prevMouse.x;
+  const dy = e.clientY - prevMouse.y;
+  orbit.vTheta += dx * 0.005;
+  orbit.vPhi -= dy * 0.005;
+  prevMouse.x = e.clientX;
+  prevMouse.y = e.clientY;
+});
+window.addEventListener('mouseup', () => {
+  isDragging = false;
+  setTimeout(() => orbit.autoRotate = true, 2000);
+});
+renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  orbit.vDist += e.deltaY * 0.5;
+  orbit.autoRotate = false;
+  setTimeout(() => orbit.autoRotate = true, 2000);
+}, { passive: false });
+renderer.domElement.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 1) {
+    isDragging = true;
+    prevMouse.x = e.touches[0].clientX;
+    prevMouse.y = e.touches[0].clientY;
+    orbit.autoRotate = false;
+  }
+});
+renderer.domElement.addEventListener('touchmove', (e) => {
+  if (!isDragging || e.touches.length !== 1) return;
+  const dx = e.touches[0].clientX - prevMouse.x;
+  const dy = e.touches[0].clientY - prevMouse.y;
+  orbit.vTheta += dx * 0.005;
+  orbit.vPhi -= dy * 0.005;
+  prevMouse.x = e.touches[0].clientX;
+  prevMouse.y = e.touches[0].clientY;
+});
+renderer.domElement.addEventListener('touchend', () => {
+  isDragging = false;
+  setTimeout(() => orbit.autoRotate = true, 2000);
+});
+updateCameraPosition();
+
+// ========== 光照 ==========
+scene.add(new T.AmbientLight(0x334466, 0.7));
+const pl1 = new T.PointLight(0x4fc3f7, 2.5, 1200); pl1.position.set(400, 350, 400); scene.add(pl1);
+const pl2 = new T.PointLight(0xffa040, 2, 1000); pl2.position.set(-300, -100, 300); scene.add(pl2);
+const pl3 = new T.PointLight(0x7F77DD, 1.2, 700); pl3.position.set(0, -300, -400); scene.add(pl3);
+const pl4 = new T.PointLight(0x4fc3f7, 0.8, 600); pl4.position.set(-200, 250, -200); scene.add(pl4);
+
+// ========== 星空背景（增强版）==========
+const starsGeo = new T.BufferGeometry();
+const starCount = 3000;
+const starPos = new Float32Array(starCount * 3);
+const starCol = new Float32Array(starCount * 3);
+const starSizes = new Float32Array(starCount);
+for (let i = 0; i < starCount; i++) {
+  const dist = 400 + Math.random() * 2100;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const theta = Math.random() * Math.PI * 2;
+  starPos[i*3] = dist * Math.sin(phi) * Math.cos(theta);
+  starPos[i*3+1] = dist * Math.sin(phi) * Math.sin(theta);
+  starPos[i*3+2] = dist * Math.cos(phi);
+  const c = new T.Color().setHSL(0.54 + Math.random()*0.22, 0.5, 0.25 + Math.random()*0.65);
+  starCol[i*3] = c.r; starCol[i*3+1] = c.g; starCol[i*3+2] = c.b;
+  starSizes[i] = 0.5 + Math.random() * 2;
+}
+starsGeo.setAttribute('position', new T.BufferAttribute(starPos, 3));
+starsGeo.setAttribute('color', new T.BufferAttribute(starCol, 3));
+starsGeo.setAttribute('size', new T.BufferAttribute(starSizes, 1));
+const starsMat = new T.PointsMaterial({ size: 1.6, vertexColors: true, blending: T.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.8 });
+const stars = new T.Points(starsGeo, starsMat);
+scene.add(stars);
+
+// ========== 参考环（多层增强）==========
+function createGridRing(radius, segments, color, opacity, y) {
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push(new T.Vector3(Math.cos(a) * radius, y, Math.sin(a) * radius));
+  }
+  const geo = new T.BufferGeometry().setFromPoints(pts);
+  return new T.Line(geo, new T.LineBasicMaterial({ color, transparent: true, opacity }));
+}
+scene.add(createGridRing(550, 160, 0x4fc3f7, 0.05, -280));
+scene.add(createGridRing(750, 160, 0x4fc3f7, 0.03, -280));
+scene.add(createGridRing(950, 160, 0x4fc3f7, 0.015, -280));
+
+// 竖直参考环（神经网络训练场感）
+function createVerticalRing(radius, segments, color, opacity) {
+  const pts = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push(new T.Vector3(Math.cos(a) * radius, Math.sin(a) * radius, 0));
+  }
+  const geo = new T.BufferGeometry().setFromPoints(pts);
+  return new T.Line(geo, new T.LineBasicMaterial({ color, transparent: true, opacity }));
+}
+scene.add(createVerticalRing(500, 128, 0x4fc3f7, 0.03));
+
+// ========== 3D节点位置计算 ==========
+const node3DPos = {};
+NODES.forEach(node => {
+  const id = node.id;
+  if (node.type === "root") {
+    node3DPos[id] = { x: 0, y: 0, z: 0 };
+  } else if (node.type === "category") {
+    const idx = parseInt(id.split("_")[1]);
+    const phi = Math.acos(1 - 2 * (idx + 0.5) / 16);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * (idx + 1);
+    const r = 360 + idx * 14 + (node.count || 1) * 3;
+    node3DPos[id] = {
+      x: r * Math.sin(phi) * Math.cos(theta),
+      y: r * Math.cos(phi),
+      z: r * Math.sin(phi) * Math.sin(theta)
+    };
+  } else if (node.type === "doc") {
+    const parent = NODES.find(n => n.id === node.parent);
+    if (!parent) { node3DPos[id] = { x:0, y:0, z:0 }; return; }
+    const pp = node3DPos[parent.id];
+    const di = parseInt(id.split("_")[2]);
+    const dc = parent.count || 1;
+    const phi2 = Math.acos(1 - 2 * (di + 0.5) / Math.max(dc, 1));
+    const theta2 = Math.PI * (1 + Math.sqrt(5)) * (di + 1);
+    const r2 = 65 + Math.log(dc + 1) * 22;
+    node3DPos[id] = {
+      x: pp.x + r2 * Math.sin(phi2) * Math.cos(theta2),
+      y: pp.y + r2 * Math.cos(phi2),
+      z: pp.z + r2 * Math.sin(phi2) * Math.sin(theta2)
+    };
+  }
+});
+
+// ========== 纹理生成 ==========
+function glowTex(color, size) {
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(0.08, color);
+  g.addColorStop(0.3, color + 'cc');
+  g.addColorStop(0.55, color + '44');
+  g.addColorStop(0.8, color + '08');
+  g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return new T.CanvasTexture(c);
+}
+
+function labelTex(text, color, fontSize) {
+  const fs = fontSize || 32;
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const ctx = c.getContext('2d');
+  // 外发光
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 18;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold ${fs}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.fillStyle = color;
+  ctx.fillText(text, 256, 43);
+  // 描边增强可读性
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+  ctx.lineWidth = 3;
+  ctx.strokeText(text, 256, 43);
+  // 再画一层亮色
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 8;
+  ctx.fillStyle = '#ffffff';
+  ctx.globalAlpha = 0.4;
+  ctx.fillText(text, 256, 43);
+  ctx.globalAlpha = 1;
+  return new T.CanvasTexture(c);
+}
+
+// 纹理缓存
+const texCache = {};
+
+// ========== 场景对象组 ==========
+const linkGroup = new T.Group();
+const tubeGroup = new T.Group();
+const nodeGroup = new T.Group();
+const glowGroup = new T.Group();
+const labelGroup = new T.Group();
+scene.add(linkGroup);
+scene.add(tubeGroup);
+scene.add(nodeGroup);
+scene.add(glowGroup);
+scene.add(labelGroup);
+
+const meshMap = {};
+const glowMap = {};
+const docLabelMap = {};
+
+// ========== 创建节点 ==========
+function createNodes() {
+  NODES.forEach(node => {
+    const pos = node3DPos[node.id];
+    let r, geo, mat;
+
+    if (node.type === "root") {
+      r = 32;
+      geo = new T.SphereGeometry(r, 48, 48);
+      mat = new T.MeshStandardMaterial({
+        color: new T.Color('#ffaa00'),
+        emissive: new T.Color('#ff8c00'),
+        emissiveIntensity: 1.4,
+        roughness: 0.2,
+        metalness: 0.2
+      });
+    } else if (node.type === "category") {
+      r = 13 + Math.min((node.count || 1) * 0.28, 9);
+      geo = new T.SphereGeometry(r, 32, 32);
+      mat = new T.MeshStandardMaterial({
+        color: new T.Color(node.color),
+        emissive: new T.Color(node.color),
+        emissiveIntensity: 0.75,
+        roughness: 0.2,
+        metalness: 0.15
+      });
+    } else {
+      r = 6;
+      geo = new T.SphereGeometry(r, 16, 16);
+      mat = new T.MeshStandardMaterial({
+        color: new T.Color(node.color),
+        emissive: new T.Color(node.color),
+        emissiveIntensity: 0.65,
+        roughness: 0.3,
+        metalness: 0.08
+      });
+    }
+
+    const mesh = new T.Mesh(geo, mat);
+    mesh.position.set(pos.x, pos.y, pos.z);
+    mesh.userData = { nodeId: node.id, nodeType: node.type, originalColor: node.color, baseR: r };
+    nodeGroup.add(mesh);
+    meshMap[node.id] = mesh;
+
+    // 外发光
+    const gSize = node.type === "root" ? 320 : node.type === "category" ? 160 : 128;
+    const gKey = node.color + "_v2_" + gSize;
+    if (!texCache[gKey]) {
+      texCache[gKey] = glowTex(node.color, gSize);
+    }
+    const gMat = new T.SpriteMaterial({ 
+      map: texCache[gKey], 
+      blending: T.AdditiveBlending, 
+      depthWrite: false, 
+      transparent: true, 
+      opacity: node.type === "root" ? 0.7 : node.type === "category" ? 0.45 : 0.38
+    });
+    const gSprite = new T.Sprite(gMat);
+    const gs = r * (node.type === "root" ? 5 : node.type === "category" ? 4.5 : 4.2);
+    gSprite.scale.set(gs, gs, 1);
+    gSprite.position.copy(mesh.position);
+    glowGroup.add(gSprite);
+    glowMap[node.id] = gSprite;
+
+    // 标签
+    if (node.type === "root") {
+      const lTex = labelTex("知识库中心", "#ffd740", 36);
+      const lMat = new T.SpriteMaterial({ map: lTex, depthTest: false, depthWrite: false, transparent: true });
+      const lSprite = new T.Sprite(lMat);
+      lSprite.scale.set(130, 36, 1);
+      lSprite.position.set(pos.x, pos.y + r + 18, pos.z);
+      labelGroup.add(lSprite);
+    } else if (node.type === "category") {
+      const txt = node.name.substring(3);
+      const lTex = labelTex(txt, node.color, 28);
+      const lMat = new T.SpriteMaterial({ map: lTex, depthTest: false, depthWrite: false, transparent: true });
+      const lSprite = new T.Sprite(lMat);
+      lSprite.scale.set(120, 30, 1);
+      lSprite.position.set(pos.x, pos.y + r + 18, pos.z);
+      labelGroup.add(lSprite);
+    } else if (node.type === "doc") {
+      // 全部文档节点显示标签
+      const shortName = node.name.length > 16 ? node.name.substring(0,15)+'…' : node.name;
+      const lTex = labelTex(shortName, node.color, 16);
+      const lMat = new T.SpriteMaterial({ map: lTex, depthTest: false, depthWrite: false, transparent: true, opacity: 0.55 });
+      const lSprite = new T.Sprite(lMat);
+      lSprite.scale.set(70, 12, 1);
+      lSprite.position.set(pos.x, pos.y + r + 9, pos.z);
+      labelGroup.add(lSprite);
+      docLabelMap[node.id] = lSprite;
+    }
+  });
+}
+
+// ========== 创建连线（增强版）==========
+const flowParticles = [];
+function createLinks() {
+  LINKS.forEach(link => {
+    const sp = node3DPos[link.source];
+    const tp = node3DPos[link.target];
+    if (!sp || !tp) return;
+
+    const srcNode = NODES.find(n => n.id === link.source);
+    const isRoot = link.source === "root";
+    const linkColor = isRoot ? 0xffb300 : new T.Color(srcNode ? srcNode.color : "#556688");
+
+    // 贝塞尔曲线
+    const mx = (sp.x + tp.x)/2, my = (sp.y + tp.y)/2, mz = (sp.z + tp.z)/2;
+    const offsetRange = isRoot ? 80 : 12;
+    const ox = (Math.random()-0.5) * offsetRange;
+    const oy = (Math.random()-0.5) * offsetRange;
+    const oz = (Math.random()-0.5) * offsetRange;
+    const curve = new T.QuadraticBezierCurve3(
+      new T.Vector3(sp.x, sp.y, sp.z),
+      new T.Vector3(mx+ox, my+oy, mz+oz),
+      new T.Vector3(tp.x, tp.y, tp.z)
+    );
+
+    if (isRoot) {
+      // 根→大类：管状体（TubeGeometry）代替细线，视觉更震撼
+      const tubeGeo = new T.TubeGeometry(curve, 80, 1.8, 12, false);
+      const tubeMat = new T.MeshStandardMaterial({
+        color: 0xffb300,
+        emissive: 0xff8c00,
+        emissiveIntensity: 1.2,
+        roughness: 0.3,
+        metalness: 0.1,
+        transparent: true,
+        opacity: 0.8
+      });
+      const tube = new T.Mesh(tubeGeo, tubeMat);
+      tube.userData = { isRoot: true, curve };
+      tubeGroup.add(tube);
+
+      // 管体发光伴线
+      const glowPts = curve.getPoints(100);
+      const glowGeo = new T.BufferGeometry().setFromPoints(glowPts);
+      const glowLine = new T.Line(glowGeo, new T.LineBasicMaterial({ 
+        color: 0xffd740, transparent: true, opacity: 0.35, blending: T.AdditiveBlending, depthWrite: false
+      }));
+      linkGroup.add(glowLine);
+
+      // 流动粒子
+      for (let i = 0; i < 6; i++) {
+        const pGeo = new T.SphereGeometry(1.6, 8, 8);
+        const pMat = new T.MeshBasicMaterial({ 
+          color: i % 2 === 0 ? 0xffffff : 0xffd740, 
+          transparent: true, opacity: 0.9, blending: T.AdditiveBlending 
+        });
+        const particle = new T.Mesh(pGeo, pMat);
+        particle.userData = { curve, t: i / 6, speed: 0.0005 + Math.random() * 0.0008 };
+        particle.position.copy(curve.getPoint(i / 6));
+        tubeGroup.add(particle);
+        flowParticles.push(particle);
+      }
+    } else {
+      // 大类→文档：加粗连线 + 发光伴线
+      const pts = curve.getPoints(30);
+      const lineGeo = new T.BufferGeometry().setFromPoints(pts);
+      const lineMat = new T.LineBasicMaterial({ 
+        color: linkColor, 
+        transparent: true, 
+        opacity: 0.45
+      });
+      const line = new T.Line(lineGeo, lineMat);
+      linkGroup.add(line);
+
+      // 发光伴线
+      const glowPts2 = curve.getPoints(30);
+      const glowGeo2 = new T.BufferGeometry().setFromPoints(glowPts2);
+      const glowLine2 = new T.Line(glowGeo2, new T.LineBasicMaterial({ 
+        color: linkColor, transparent: true, opacity: 0.15, blending: T.AdditiveBlending, depthWrite: false
+      }));
+      linkGroup.add(glowLine2);
+    }
+  });
+}
+
+// ========== Raycaster 交互 ==========
+const raycaster = new T.Raycaster();
+const mouse = new T.Vector2();
+let hoveredNode = null;
+let mouseDownX = 0, mouseDownY = 0;
+
+function getIntersects(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  return raycaster.intersectObjects(nodeGroup.children);
+}
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  const hits = getIntersects(e);
+  const tooltip = document.getElementById('tooltip');
+  const rect = renderer.domElement.getBoundingClientRect();
+
+  if (hits.length > 0 && hits[0].object.userData.nodeId) {
+    const obj = hits[0].object;
+    if (hoveredNode !== obj) {
+      if (hoveredNode) {
+        const nPrev = NODES.find(n => n.id === hoveredNode.userData.nodeId);
+        hoveredNode.material.emissive = new T.Color(hoveredNode.userData.originalColor);
+        hoveredNode.material.emissiveIntensity = (nPrev && nPrev.type === 'root') ? 1.4 : (nPrev && nPrev.type === 'category') ? 0.75 : 0.65;
+      }
+      hoveredNode = obj;
+      // hover保持原色高亮（不变成白色）
+      obj.material.emissive = new T.Color(obj.userData.originalColor);
+      obj.material.emissiveIntensity = obj.userData.nodeType === "root" ? 2.5 : obj.userData.nodeType === "category" ? 2 : 1.8;
+
+      const node = NODES.find(n => n.id === obj.userData.nodeId);
+      if (node) {
+        tooltip.style.opacity = "1";
+        tooltip.style.left = Math.min(e.clientX + 18, rect.right - 300) + "px";
+        tooltip.style.top = (e.clientY - 16) + "px";
+        tooltip.querySelector(".tip-title").textContent = node.name;
+        tooltip.querySelector(".tip-sub").textContent =
+          node.type === "root" ? "183 份制度文件 · 16 大类体系" :
+          node.type === "category" ? `类别 ${node.code} · ${node.count} 份文档 · 共 ${node.pages || '—'} 页` :
+          `${node.code} · ${node.pages || '—'} 页 · hover大类查看详情`;
+      }
+    }
+    container.style.cursor = obj.userData.nodeType === "category" || obj.userData.nodeType === "root" ? "pointer" : "default";
+  } else {
+    if (hoveredNode) {
+      const nPrev = NODES.find(n => n.id === hoveredNode.userData.nodeId);
+      hoveredNode.material.emissive = new T.Color(hoveredNode.userData.originalColor);
+      hoveredNode.material.emissiveIntensity = (nPrev && nPrev.type === 'root') ? 1.4 : (nPrev && nPrev.type === 'category') ? 0.75 : 0.65;
+      hoveredNode = null;
+    }
+    tooltip.style.opacity = "0";
+    container.style.cursor = "grab";
+  }
+});
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  mouseDownX = e.clientX; mouseDownY = e.clientY;
+});
+
+renderer.domElement.addEventListener('click', (e) => {
+  if (Math.abs(e.clientX - mouseDownX) > 4 || Math.abs(e.clientY - mouseDownY) > 4) return;
+  const hits = getIntersects(e);
+  if (hits.length > 0 && hits[0].object.userData.nodeId) {
+    const obj = hits[0].object;
+    if (obj.userData.nodeType === "category" || obj.userData.nodeType === "root") {
+      const node = NODES.find(n => n.id === obj.userData.nodeId);
+      if (node) {
+        highlightNode(node);
+        openSidebar(node);
+        const pos = node3DPos[node.id];
+        const dist = node.type === "root" ? 900 : 140;
+        animateToTarget(new T.Vector3(pos.x, pos.y, pos.z), dist);
+      }
+    }
+  }
+});
+
+// ========== 高亮 ==========
+function highlightNode(node) {
+  Object.entries(meshMap).forEach(([id, mesh]) => {
+    const n = NODES.find(x => x.id === id);
+    if (!n) return;
+    mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+    mesh.material.emissiveIntensity = n.type === "root" ? 1.4 : n.type === "category" ? 0.75 : 0.65;
+    mesh.material.opacity = 1;
+    mesh.material.transparent = n.type === "doc";
+    if (glowMap[id]) {
+      glowMap[id].material.opacity = n.type === "root" ? 0.7 : n.type === "category" ? 0.45 : 0.38;
+    }
+    if (docLabelMap[id]) docLabelMap[id].material.opacity = 0.55;
+  });
+
+  if (node.type === "root") return;
+
+  const catId = node.type === "category" ? node.id : node.parent;
+  Object.entries(meshMap).forEach(([id, mesh]) => {
+    const n = NODES.find(x => x.id === id);
+    if (!n) return;
+    const isMatch = (id === catId) || (n.parent === catId);
+    if (isMatch) {
+      // 保持原有颜色，大幅提升自发光强度（不变成白色）
+      mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+      mesh.material.emissiveIntensity = n.type === "category" ? 2.8 : 2.5;
+      mesh.material.opacity = 1;
+      mesh.material.transparent = true;
+      if (glowMap[id]) glowMap[id].material.opacity = n.type === "category" ? 0.95 : 0.8;
+      if (docLabelMap[id]) docLabelMap[id].material.opacity = 0.95;
+    } else if (n.type !== "root") {
+      mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+      mesh.material.emissiveIntensity = 0.04;
+      mesh.material.opacity = 0.14;
+      mesh.material.transparent = true;
+      if (glowMap[id]) glowMap[id].material.opacity = 0.02;
+      if (docLabelMap[id]) docLabelMap[id].material.opacity = 0.05;
+    }
+  });
+}
+
+// ========== 搜索 ==========
+function searchGraph(query) {
+  if (!query.trim()) { resetView(); return; }
+  const q = query.toLowerCase();
+  const fb = document.getElementById("search-feedback");
+  let found = 0;
+
+  Object.entries(meshMap).forEach(([id, mesh]) => {
+    const node = NODES.find(n => n.id === id);
+    if (!node) return;
+    const nameMatch = node.name.toLowerCase().includes(q);
+
+    if (nameMatch) {
+      mesh.material.emissive = new T.Color(0x4fc3f7);
+      mesh.material.emissiveIntensity = node.type === "doc" ? 3.5 : 3;
+      mesh.material.opacity = 1;
+      mesh.material.transparent = true;
+      if (glowMap[id]) glowMap[id].material.opacity = node.type === "doc" ? 0.85 : 0.95;
+      if (docLabelMap[id]) docLabelMap[id].material.opacity = 1;
+      found++;
+    } else if (node.type === "category") {
+      const children = NODES.filter(n => n.parent === id);
+      const childMatch = children.some(c => c.name.toLowerCase().includes(q));
+      if (childMatch) {
+        mesh.material.emissive = new T.Color(0x4fc3f7);
+        mesh.material.emissiveIntensity = 2;
+        mesh.material.opacity = 1;
+        mesh.material.transparent = true;
+        if (glowMap[id]) glowMap[id].material.opacity = 0.65;
+        found++;
+      } else {
+        mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+        mesh.material.emissiveIntensity = 0.08;
+        mesh.material.opacity = 0.2;
+        mesh.material.transparent = true;
+        if (glowMap[id]) glowMap[id].material.opacity = 0.03;
+      }
+    } else {
+      mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+      mesh.material.emissiveIntensity = 0.04;
+      mesh.material.opacity = 0.12;
+      mesh.material.transparent = true;
+      if (glowMap[id]) glowMap[id].material.opacity = 0.02;
+      if (docLabelMap[id]) docLabelMap[id].material.opacity = 0.04;
+    }
+  });
+
+  fb.style.opacity = found > 0 ? "1" : "0";
+  if (found > 0) fb.querySelector(".count").textContent = found;
+}
+
+// ========== 侧边栏 ==========
+function openSidebar(node) {
+  const sidebar = document.getElementById("sidebar");
+  const list = document.getElementById("doc-list");
+  const title = sidebar.querySelector("h3");
+  if (node.type === "root") {
+    title.textContent = "全部文档 (183份)";
+    list.innerHTML = CATEGORIES.map(cat =>
+      `<div class="doc-item" style="cursor:pointer" onclick="goToCategory('${cat.id}')">
+        <div class="name" style="color:${cat.color}">${cat.name}</div>
+        <div class="meta">${cat.count} 份文档</div>
+      </div>`
+    ).join("");
+  } else {
+    const cat = CATEGORIES.find(c => c.id === node.id);
+    title.textContent = node.name + ` (${node.count}份)`;
+    list.innerHTML = cat ? cat.children.map(doc =>
+      `<div class="doc-item"><div class="name">${doc.name}</div><div class="meta">${doc.code} · ${doc.pages || '—'} 页</div></div>`
+    ).join("") : "<div class='doc-item'>暂无文档</div>";
+  }
+  sidebar.classList.add("open");
+}
+
+function goToCategory(catId) {
+  const node = NODES.find(n => n.id === catId);
+  if (!node) return;
+  highlightNode(node);
+  openSidebar(node);
+  const pos = node3DPos[node.id];
+  animateToTarget(new T.Vector3(pos.x, pos.y, pos.z), 140);
+}
+window.goToCategory = goToCategory;
+
+function toggleSidebar() { 
+  document.getElementById("sidebar").classList.toggle("open");
+}
+window.toggleSidebar = toggleSidebar;
+
+function resetView() {
+  Object.entries(meshMap).forEach(([id, mesh]) => {
+    const node = NODES.find(n => n.id === id);
+    if (!node) return;
+    mesh.material.emissive = new T.Color(mesh.userData.originalColor);
+    mesh.material.emissiveIntensity = node.type === "root" ? 1.4 : node.type === "category" ? 0.75 : 0.65;
+    mesh.material.opacity = 1;
+    mesh.material.transparent = node.type === "doc";
+    if (glowMap[id]) {
+      glowMap[id].material.opacity = node.type === "root" ? 0.7 : node.type === "category" ? 0.4 : 0.32;
+    }
+    if (docLabelMap[id]) docLabelMap[id].material.opacity = 0.55;
+  });
+  document.getElementById("search-feedback").style.opacity = "0";
+  document.getElementById("search-bar").value = "";
+  animateToTarget(new T.Vector3(0, 0, 0), 900);
+}
+window.resetView = resetView;
+
+// 键盘
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    document.getElementById("sidebar").classList.remove("open");
+    resetView();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); document.getElementById("search-bar").focus(); }
+});
+
+// 双击聚焦
+renderer.domElement.addEventListener('dblclick', (e) => {
+  const hits = getIntersects(e);
+  if (hits.length > 0 && hits[0].object.userData.nodeType === "category") {
+    const node = NODES.find(n => n.id === hits[0].object.userData.nodeId);
+    if (node) {
+      highlightNode(node);
+      openSidebar(node);
+      animateToTarget(new T.Vector3(node3DPos[node.id].x, node3DPos[node.id].y, node3DPos[node.id].z), 120);
+    }
+  }
+});
+
+// 搜索绑定
+document.getElementById("search-bar").addEventListener("input", (e) => searchGraph(e.target.value));
+
+// ========== 动画循环 ==========
+const clock = new T.Clock();
+function animate(time) {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  const elapsed = clock.elapsedTime;
+
+  if (orbit.autoRotate && !isDragging) {
+    orbit.vTheta += orbit.autoRotateSpeed * 0.01 * 0.016;
+  }
+  orbit.theta += orbit.vTheta;
+  orbit.phi += orbit.vPhi;
+  orbit.distance += orbit.vDist;
+  orbit.vTheta *= 0.92;
+  orbit.vPhi *= 0.92;
+  orbit.vDist *= 0.88;
+  orbit.phi = Math.max(0.2, Math.min(Math.PI - 0.2, orbit.phi));
+  orbit.distance = Math.max(120, Math.min(2200, orbit.distance));
+  updateCameraPosition();
+
+  // 流动粒子
+  flowParticles.forEach(p => {
+    p.userData.t += p.userData.speed;
+    if (p.userData.t > 1) p.userData.t -= 1;
+    p.position.copy(p.userData.curve.getPoint(p.userData.t));
+    p.scale.setScalar(0.6 + Math.sin(elapsed * 4 + p.userData.t * 10) * 0.4);
+  });
+
+  // 星空
+  stars.rotation.y += 0.0001;
+  stars.rotation.x += 0.00003;
+
+  // 根节点脉冲
+  const rootMesh = meshMap["root"];
+  if (rootMesh) {
+    const s = 1 + Math.sin(elapsed * 1.6) * 0.07;
+    rootMesh.scale.setScalar(s);
+    if (glowMap["root"]) {
+      const gs = 32 * 5 * s;
+      glowMap["root"].scale.set(gs, gs, 1);
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ========== 响应式 ==========
+window.addEventListener("resize", () => {
+  camera.aspect = W() / H();
+  camera.updateProjectionMatrix();
+  renderer.setSize(W(), H());
+});
+
+// ========== 启动 ==========
+createNodes();
+createLinks();
+requestAnimationFrame(animate);
+
+console.log("%c3D神经网络知识图谱 v2.0 已就绪", "color:#ffd740;font-size:16px;font-weight:bold");
+console.log("  节点:", NODES.length, " | 连线:", LINKS.length, " | 流动粒子:", flowParticles.length);
+console.log("  增强特性: TubeGeometry管状连线 · 多层光晕 · 文档标签 · 竖直参考环");
+</script>
+</body>
+</html>
