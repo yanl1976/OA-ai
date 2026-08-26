@@ -51,6 +51,9 @@ DIST_DIR = os.path.join(KB_ROOT, "web_vue", "dist")  # Vue3 生产构建产物
 DATA_DIR = os.path.join(KB_ROOT, "data")
 INDEX_DIR = os.path.join(KB_DIR, "bm25_index")
 
+# 强制把推导出的 KB_ROOT 注入环境，确保 app/vec_store.py 等子模块
+# 使用同一根目录（其自身也读 KB_ROOT 环境变量），避免外部误设导致索引路径错乱
+os.environ["KB_ROOT"] = KB_ROOT
 sys.path.insert(0, os.path.join(KB_ROOT, "app"))
 
 import admin
