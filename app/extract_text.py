@@ -86,6 +86,7 @@ def _call_llm(prompt: str, text: str) -> str:
             {"role": "user", "content": f"请将以下文档整理为干净的结构化纯文本：\n\n{snippet}"},
         ],
         "temperature": 0.2,
+        "max_tokens": 8192,
     }
 
     import urllib.request
