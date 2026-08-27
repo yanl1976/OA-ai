@@ -5,3 +5,5 @@ rank_bm25==0.2.2
 tqdm==4.66.5
 flask==3.0.3
 gunicorn==22.0.0
+# 语义向量（BGE 中文嵌入，替代旧 feature-hashing）：离线可用，加载失败时自动回退哈希方案
+sentence-transformers==6.0.0

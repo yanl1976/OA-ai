@@ -25,9 +25,11 @@ DB_PATH = os.path.join(DATA_DIR, "kb_admin.db")
 # ============ 权限目录 (固定) ============
 # 每个权限项: (key, name, description, group)
 #   group 用于在权限目录/角色管理界面中分组展示，并给出中文说明。
+# 每项: (key, 名称, 描述, 分组)
+# 分类维度的「浏览/查询/下载」权限是动态的（按分类树节点 × 操作生成，
+# 见 sync_category_permissions，key 形如 kb.cat.<分类id>.view/search/download），
+# 不在此静态列出。文档「类型名 → 分类树根节点」映射见 TYPE_ALIASES。
 PERMISSION_CATALOG = [
-    ("kb.view",          "知识库浏览",   "查看知识库分类树与文档详情", "知识库"),
-    ("kb.search",        "知识库检索",   "使用 BM25 检索文档内容", "知识库"),
     ("graph.view",       "知识图谱",     "查看 3D 神经网络知识图谱", "知识库"),
     ("kb.doc.upload",    "文档上传",     "上传新文档并重建检索索引", "知识库"),
     ("kb.doc.delete",    "文档删除",     "删除/隐藏文档（含上传文档）", "知识库"),
@@ -41,20 +43,36 @@ PERMISSION_CATALOG = [
     ("system.manage",    "系统管理",     "功能开关、索引重建与系统维护", "系统"),
 ]
 
+# 分类权限的三个操作维度
+CAT_ACTIONS = ("view", "search", "download")
+CAT_ACTION_LABELS = {"view": "浏览", "search": "查询", "download": "下载"}
+
+# 文档「类型名 → 分类树根节点名」映射。
+# 文档的 category 字段实际存的是类型名（如「管理标准」「会议纪要」），
+# 而分类树顶层节点名为「管理标准分类」「会议纪要」，二者通过此表对齐。
+# 新增文档类型时：在分类树加对应顶层节点，并在此登记一行即可；
+# 若文档 category 已直接等于分类树某节点名（含子类），则无需映射（原样命中）。
+TYPE_ALIASES = {
+    "管理标准": "管理标准分类",
+    "会议纪要": "会议纪要",
+}
+
 # 新增权限 → 关联权限：存量库中，凡是已拥有「关联权限」之一的角色，自动授予新权限。
-# 这样升级后无需手动重新配置角色即可获得配套权限。
 NEW_PERM_RELATED = {
     "kb.upload.manage": ["kb.doc.delete", "kb.doc.upload"],
 }
 
 # ============ 默认内置角色 ============
+# 分类维度的浏览/查询权限是动态的，由 sync_category_permissions 在分类树建好后
+# 自动授予 admin（全量）以及全新库下的 editor/viewer（全量 view+search）。
+# 这里仅声明非分类维度的静态权限；分类权限在 _seed 阶段叠加。
 DEFAULT_ROLES = {
     "admin":  {"desc": "超级管理员，拥有全部权限", "perms": [p[0] for p in PERMISSION_CATALOG]},
     "editor": {"desc": "内容编辑，可管理分类、上传文档与会议纪要二次生成", "perms": [
-        "kb.view", "kb.search", "kb.category.manage", "kb.doc.upload",
+        "kb.category.manage", "kb.doc.upload",
         "graph.view", "derived.manage"]},
     "viewer": {"desc": "只读访客，仅可浏览与检索", "perms": [
-        "kb.view", "kb.search", "graph.view"]},
+        "graph.view"]},
 }
 
 # 默认管理员
@@ -222,14 +240,20 @@ def _seed(conn, cur):
     perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
     # 存量库自动关联新权限到已拥有相关权限的角色
     _wire_new_permissions(conn, cur, perm_ids)
+    # 建立分类树（幂等）→ 同步分类维度的浏览/查询/下载权限，并迁移旧权限、授权默认角色
+    ensure_category_hierarchy(conn=conn, cur=cur)
+    sync_category_permissions(conn=conn, cur=cur)
+    # 重新读取权限 id 映射（已含动态分类权限）
+    perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
     # 角色
     for rname, meta in DEFAULT_ROLES.items():
         cur.execute("INSERT OR IGNORE INTO roles(name, description, builtin) VALUES (?,?,1)",
                     (rname, meta["desc"]))
         rid = cur.execute("SELECT id FROM roles WHERE name=?", (rname,)).fetchone()["id"]
         for pk in meta["perms"]:
-            cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
-                        (rid, perm_ids[pk]))
+            if pk in perm_ids:
+                cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
+                            (rid, perm_ids[pk]))
     # 默认管理员
     admin_role = cur.execute("SELECT id FROM roles WHERE name='admin'").fetchone()["id"]
     if not cur.execute("SELECT 1 FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone():
@@ -443,13 +467,16 @@ def list_categories(only_enabled: bool = False) -> list:
     return [dict(r) for r in rows]
 
 
-def ensure_category_hierarchy():
+def ensure_category_hierarchy(conn=None, cur=None):
     """建立一级分类『管理标准分类』，并将尚无上级的内置分类挂到其下（幂等）。
 
     同时保证顶层『会议纪要』分类存在（独立于管理标准分类，便于按年代归档）。
+    支持传入已有的 (conn, cur) 以融入外部事务（如 _seed）。
     """
-    conn = _conn()
-    cur = conn.cursor()
+    own = conn is None
+    if own:
+        conn = _conn()
+        cur = conn.cursor()
     row = cur.execute(
         "SELECT id FROM categories WHERE name=? AND parent_id IS NULL",
         ("管理标准分类",)).fetchone()
@@ -479,9 +506,148 @@ def ensure_category_hierarchy():
             "INSERT INTO categories(name, description, sort_order, status, builtin, parent_id) "
             "VALUES (?,?,?,1,0,NULL)",
             ("会议纪要", "公司会议纪要，按年代归档与检索", 1))
-    conn.commit()
-    conn.close()
+    if own:
+        conn.commit()
+        conn.close()
     return top_id
+
+
+def cat_perm_key(cat_id: int, action: str) -> str:
+    """分类权限 key：kb.cat.<分类id>.<view|search|download>。"""
+    return "kb.cat.%d.%s" % (cat_id, action)
+
+
+def doc_category_to_node(category: str or None):
+    """把文档的 category（类型名）映射为分类树中的节点名（经 TYPE_ALIASES）。"""
+    if not category:
+        return None
+    return TYPE_ALIASES.get(category, category)
+
+
+def category_ancestor_ids(conn, category_node_name: str):
+    """返回某分类节点名（含自身）的全部祖先节点 id 列表。"""
+    rows = conn.execute(
+        "SELECT id, name, parent_id FROM categories").fetchall()
+    by_name = {r["name"]: r["id"] for r in rows}
+    by_id = {r["id"]: r["parent_id"] for r in rows}
+    target = by_name.get(category_node_name)
+    if target is None:
+        return []
+    chain, guard = [target], 0
+    pid = by_id.get(target)
+    while pid is not None and guard < 200:
+        chain.append(pid)
+        pid = by_id.get(pid)
+        guard += 1
+    return chain
+
+
+def sync_category_permissions(conn=None, cur=None):
+    """同步分类维度的权限行（每个分类节点 × {浏览,查询,下载}）。
+
+    职责：
+      1. 为分类树中每个节点生成 kb.cat.<id>.{view,search,download} 权限行（INSERT OR IGNORE）。
+      2. 存量迁移：角色若拥有旧全量权限 kb.view → 授予全部节点 view；kb.search → 全部节点 search。
+         迁移后从角色移除旧 key（彻底切到分类维度）。
+      3. 新创建的节点权限默认授予 admin 角色（保持管理员全量可见）；全新库下 editor/viewer
+         也授予全节点 view+search（默认全量只读，后续可由管理员收窄）。
+    支持传入 (conn, cur) 融入外部事务。
+    """
+    own = conn is None
+    if own:
+        conn = _conn()
+        cur = conn.cursor()
+    cats = conn.execute(
+        "SELECT id, name, parent_id FROM categories ORDER BY parent_id IS NULL DESC, sort_order, id").fetchall()
+
+    # 1) 生成分类权限行
+    perm_rows = []
+    for c in cats:
+        for action in CAT_ACTIONS:
+            key = cat_perm_key(c["id"], action)
+            label = CAT_ACTION_LABELS[action]
+            name = "%s · %s" % (c["name"], label)
+            desc = "分类【%s】的%s权限" % (c["name"], label)
+            perm_rows.append((key, name, desc, "分类权限"))
+    for key, name, desc, group in perm_rows:
+        cur.execute(
+            "INSERT OR IGNORE INTO permissions(`key`, name, description, `group`) VALUES (?,?,?,?)",
+            (key, name, desc, group))
+        cur.execute("UPDATE permissions SET name=?, description=?, `group`=? WHERE `key`=?",
+                    (name, desc, group, key))
+    perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
+
+    # 2) 存量迁移：kb.view/kb.search → 全节点 view/search
+    role_rows = cur.execute(
+        "SELECT rp.role_id, rp.permission_id, p.`key` FROM role_permissions rp "
+        "JOIN permissions p ON p.id=rp.permission_id").fetchall()
+    roles_with_view = {r["role_id"] for r in role_rows if r["key"] == "kb.view"}
+    roles_with_search = {r["role_id"] for r in role_rows if r["key"] == "kb.search"}
+    all_node_perms = [cat_perm_key(c["id"], a) for c in cats for a in ("view", "search")]
+    for role_id in set(list(roles_with_view) + list(roles_with_search)):
+        want = set()
+        if role_id in roles_with_view:
+            want.update(cat_perm_key(c["id"], "view") for c in cats)
+        if role_id in roles_with_search:
+            want.update(cat_perm_key(c["id"], "search") for c in cats)
+        for k in want:
+            if k in perm_ids:
+                cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
+                            (role_id, perm_ids[k]))
+    # 移除旧全量 key
+    for old_key in ("kb.view", "kb.search"):
+        if old_key in perm_ids:
+            cur.execute("DELETE FROM role_permissions WHERE permission_id=?", (perm_ids[old_key],))
+            cur.execute("DELETE FROM permissions WHERE id=?", (perm_ids[old_key],))
+
+    # 3) 默认授权：admin 全量；全新库（角色尚未拥有任何 kb.cat.*）的 editor/viewer 授全节点 view+search
+    admin_id = cur.execute("SELECT id FROM roles WHERE name='admin'").fetchone()
+    if admin_id:
+        admin_id = admin_id["id"]
+        for k in [cat_perm_key(c["id"], a) for c in cats for a in CAT_ACTIONS]:
+            if k in perm_ids:
+                cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
+                            (admin_id, perm_ids[k]))
+    for rname in ("editor", "viewer"):
+        rid = cur.execute("SELECT id FROM roles WHERE name=?", (rname,)).fetchone()
+        if not rid:
+            continue
+        rid = rid["id"]
+        has_cat = cur.execute(
+            "SELECT 1 FROM role_permissions rp JOIN permissions p ON p.id=rp.permission_id "
+            "WHERE rp.role_id=? AND p.`key` LIKE 'kb.cat.%'", (rid,)).fetchone()
+        if has_cat:
+            continue  # 已手动配置过，不覆盖
+        for a in ("view", "search"):
+            for k in [cat_perm_key(c["id"], a) for c in cats]:
+                if k in perm_ids:
+                    cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
+                                (rid, perm_ids[k]))
+
+    if own:
+        conn.commit()
+        conn.close()
+
+
+def check_cat_action(permissions: set, category: str or None, action: str) -> bool:
+    """判断某账号是否对「文档所属分类」拥有某操作权限（沿祖先链继承）。
+
+    category 为文档的 category 字段（类型名），经 TYPE_ALIASES 映射到分类树节点，
+    再沿该节点及其全部祖先检查 kb.cat.<id>.<action>。
+    """
+    if action not in CAT_ACTIONS:
+        return False
+    node = doc_category_to_node(category)
+    if node is None:
+        return False
+    conn = _conn()
+    try:
+        ids = category_ancestor_ids(conn, node)
+    finally:
+        conn.close()
+    if not ids:
+        return False
+    return any(cat_perm_key(i, action) in permissions for i in ids)
 
 
 def get_category_descendants(name: str) -> list:
@@ -539,6 +705,7 @@ def create_category(name: str, description: str = "", sort_order: int = 0,
             (name, description, sort_order, parent_id))
         cid = cur.lastrowid
         conn.commit()
+        sync_category_permissions()  # 新分类自动进入权限目录（默认授予 admin）
         return cid
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -602,6 +769,7 @@ def delete_category(cat_id: int):
     conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
     conn.commit()
     conn.close()
+    sync_category_permissions()  # 清理该分类对应的权限行（admin 等角色的关联自动失效）
 
 
 # ============ 功能开关 ============

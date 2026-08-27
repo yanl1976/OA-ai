@@ -13,16 +13,23 @@ import PermissionView from "./components/PermissionView.vue";
 import SystemManage from "./components/SystemManage.vue";
 import MeetingDerived from "./components/MeetingDerived.vue";
 import GraphView from "./components/GraphView.vue";
+import Dashboard from "./components/Dashboard.vue";
+import TagBrowse from "./components/TagBrowse.vue";
+import TrashManage from "./components/TrashManage.vue";
+import AuditLog from "./components/AuditLog.vue";
+import DocDetail from "./components/DocDetail.vue";
+import ChatView from "./components/ChatView.vue";
 
 const user = ref(null);
 const loading = ref(true);
-const current = ref("KbBrowse");
+const current = ref("Dashboard");
 const toast = reactive({ show: false, msg: "", type: "" });
 let toastTimer = null;
 
 // 跨页跳转：从衍生版本页跳回原版文档 / 跳到某衍生版本
 const pendingDocId = ref(null);
 const pendingDerivedId = ref(null);
+const detailDocId = ref("");
 
 function notify(msg, type = "") {
   toast.msg = msg;
@@ -39,10 +46,20 @@ function openDerivedInManage(derivedId) {
   pendingDerivedId.value = derivedId;
   current.value = "MeetingDerived";
 }
+function openDocDetail(docId) {
+  detailDocId.value = docId;
+  current.value = "DocDetail";
+}
+function navigate(key) {
+  if (key === "DocDetail") return;
+  current.value = key;
+}
+window.addEventListener("nav", (e) => navigate(e.detail));
 provide("notify", notify);
 provide("user", user);
 provide("openDocInBrowse", openDocInBrowse);
 provide("openDerivedInManage", openDerivedInManage);
+provide("openDocDetail", openDocDetail);
 provide("pendingDocId", pendingDocId);
 provide("pendingDerivedId", pendingDerivedId);
 
@@ -51,8 +68,11 @@ const groups = [
   {
     title: "知识库",
     items: [
-      { key: "KbBrowse", label: "知识浏览", icon: "📚", perm: "kb.view" },
-      { key: "SearchView", label: "全文检索", icon: "🔍", perm: "kb.search" },
+      { key: "Dashboard", label: "概览首页", icon: "🏠", perm: "cat:view" },
+      { key: "KbBrowse", label: "知识浏览", icon: "📚", perm: "cat:view" },
+      { key: "TagBrowse", label: "标签浏览", icon: "🏷", perm: "cat:view" },
+      { key: "SearchView", label: "全文检索", icon: "🔍", perm: "cat:search" },
+      { key: "ChatView", label: "智能对话", icon: "💬", perm: "cat:search" },
       { key: "UploadView", label: "上传文档", icon: "⬆", perm: "kb.doc.upload" },
       { key: "MeetingDerived", label: "会议纪要二次生成", icon: "✂", perm: "derived.manage" },
     ],
@@ -62,6 +82,7 @@ const groups = [
     items: [
       { key: "CategoryManage", label: "分类管理", icon: "🗂", perm: "kb.category.manage" },
       { key: "UploadManage", label: "上传管理", icon: "🗃", perm: "kb.upload.manage" },
+      { key: "TrashManage", label: "回收站", icon: "🗑", perm: "kb.upload.manage" },
       { key: "UserManage", label: "用户管理", icon: "👤", perm: "user.view" },
       { key: "RoleManage", label: "角色管理", icon: "🎭", perm: "role.manage" },
       { key: "PermissionView", label: "权限目录", icon: "🔐", perm: "permission.view" },
@@ -71,16 +92,24 @@ const groups = [
     title: "系统管理",
     items: [
       { key: "SystemManage", label: "系统设置", icon: "🛠", perm: "system.manage" },
+      { key: "AuditLog", label: "操作日志", icon: "📜", perm: "system.manage" },
     ],
   },
 ];
 
 const visibleItems = computed(() => {
   const perms = user.value?.permissions || [];
+  const hasCatView = perms.some((p) => p.startsWith("kb.cat.") && p.endsWith(".view"));
+  const hasCatSearch = perms.some((p) => p.startsWith("kb.cat.") && p.endsWith(".search"));
   return groups
     .map((g) => ({
       title: g.title,
-      items: g.items.filter((it) => !it.perm || perms.includes(it.perm)),
+      items: g.items.filter((it) => {
+        if (!it.perm) return true;
+        if (it.perm === "cat:view") return hasCatView;
+        if (it.perm === "cat:search") return hasCatSearch;
+        return perms.includes(it.perm);
+      }),
     }))
     .filter((g) => g.items.length);
 });
@@ -103,17 +132,23 @@ onMounted(async () => {
 });
 
 const views = {
+  Dashboard,
   KbBrowse,
+  TagBrowse,
   SearchView,
   UploadView,
   UploadManage,
+  TrashManage,
   CategoryManage,
   UserManage,
   RoleManage,
   PermissionView,
   SystemManage,
   MeetingDerived,
+  AuditLog,
   GraphView,
+  DocDetail,
+  ChatView,
 };
 </script>
 
@@ -150,7 +185,7 @@ const views = {
       </div>
 
       <div class="content">
-        <component :is="views[current]" />
+        <component :is="views[current]" :docId="detailDocId" />
       </div>
     </div>
 

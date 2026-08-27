@@ -15,7 +15,12 @@ data/
 # 知识库运行时产物（install.sh 会自动重建索引）
 knowledge_base/bm25_index/
 knowledge_base/vec_index/
+knowledge_base/upload/
 knowledge_base/uploads/
+
+# 知识库派生/备份数据（非源码，不入库）
+knowledge_base/derived_minutes.json
+knowledge_base/*.bak_*
 
 # 环境配置（真实 .env 含凭证，切勿上传）
 .env
@@ -25,7 +30,8 @@ config/.env
 # 运行时缓存
 .jieba_cache/
 
-# 临时诊断文件
+# 临时调试 / 诊断文件
+_t/
 __diag_out.pdf
 __test_derived.pdf
 

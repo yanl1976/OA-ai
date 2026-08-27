@@ -77,6 +77,55 @@ def _category_ancestors(name: str) -> list:
         return [slugify_category(name)]
 
 
+def category_id_by_name(name: str):
+    """按分类名返回其 id（不在库中返回 None）。"""
+    try:
+        import sqlite3
+        import admin
+        con = sqlite3.connect(admin.DB_PATH, timeout=30)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT id FROM categories WHERE name=?", (name,)).fetchone()
+        con.close()
+        return row["id"] if row else None
+    except Exception:
+        return None
+
+
+def category_subtree_names(name: str) -> list:
+    """返回以 name 为根的整棵分类子树（含自身）的全部分类名列表。
+
+    用于「对话域边界」：给定一个顶层分类（如『管理标准分类』），
+    取其自身及其全部后代子分类名，作为该域允许检索的分类集合。
+    """
+    try:
+        import sqlite3
+        import admin
+        con = sqlite3.connect(admin.DB_PATH, timeout=30)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT id, name, parent_id FROM categories").fetchall()
+        con.close()
+        by_parent = {}
+        by_id = {}
+        for r in rows:
+            by_id[r["id"]] = r["name"]
+            by_parent.setdefault(r["parent_id"], []).append(r["id"])
+        root_id = next((r["id"] for r in rows if r["name"] == name), None)
+        if root_id is None:
+            # 不在库中：当作扁平单节点
+            return [name]
+        # BFS 收集整棵子树
+        out, queue, guard = [], [root_id], 0
+        while queue and guard < 200:
+            cur = queue.pop(0)
+            out.append(by_id.get(cur, name))
+            queue.extend(by_parent.get(cur, []))
+            guard += 1
+        return out
+    except Exception:
+        return [name]
+
+
 def _stored_rel_for(category: str, year, doc_id: str, ext: str) -> str:
     """计算『类别/年代』归类落盘相对路径，类别段包含完整祖先链。
 
@@ -330,6 +379,9 @@ def get_document(doc_id: str) -> dict or None:
         meta["stored"] = bool(_resolve_binary_path(_u)) if _u else False
         meta["storage_path"] = _u.get("stored_path") if _u else None
         meta["mimetype"] = _u.get("mimetype") if _u else None
+        meta["tags"] = _u.get("tags", []) if _u else []
+        meta["updated_at"] = _u.get("updated_at", "") if _u else ""
+        meta["deleted"] = bool(_u.get("deleted")) if _u else False
     else:
         meta["stored"] = False
         meta["storage_path"] = None
@@ -352,6 +404,8 @@ def iter_all_documents() -> list:
                 "source": "raw", "year": _extract_year(d["filename"], text),
             })
     for u in _load_uploads():
+        if u.get("deleted"):
+            continue
         text = u.get("text", "")
         if text and len(text.strip()) > 5:
             docs.append({
@@ -416,15 +470,19 @@ def save_upload(filename: str, category: str, text: str, raw_bytes: bytes = None
              "text": text, "created_at": _now(),
              "stored_path": stored_rel,
              "mimetype": mimetype,
-             "ext": ext, "year": year}
+             "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None}
+    existed = False
     for u in ups:
         if u.get("filename") == filename and u.get("category") == category:
             u.update(entry)
+            existed = True
             break
     else:
         ups.append(entry)
     with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
         json.dump(ups, f, ensure_ascii=False, indent=2)
+    uid, uname = audit_current_user()
+    audit_log("doc.upload", doc_id, "%s -> %s" % (filename, category), uid, uname)
     return doc_id
 
 
@@ -464,11 +522,17 @@ def delete_upload_binary(doc_id: str):
             return
 
 
-def list_uploads(q: str = None, page: int = 1, page_size: int = 50) -> dict:
-    """返回上传文档管理列表（含归类/年代/存储路径/原文件状态），支持关键词与分页。"""
+def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
+                 include_deleted: bool = False) -> dict:
+    """返回上传文档管理列表（含归类/年代/存储路径/原文件状态），支持关键词与分页。
+
+    include_deleted=False（默认）时仅列出活跃文档；回收站页单独调用 list_trash。
+    """
     ups = _load_uploads()
     items = []
     for u in ups:
+        if u.get("deleted") and not include_deleted:
+            continue
         text = u.get("text", "") or ""
         p = _resolve_binary_path(u)
         items.append({
@@ -479,6 +543,10 @@ def list_uploads(q: str = None, page: int = 1, page_size: int = 50) -> dict:
             "pages": u.get("pages", 1),
             "chars": len(re.sub(r"\s", "", text)),
             "created_at": u.get("created_at", ""),
+            "updated_at": u.get("updated_at", ""),
+            "deleted": bool(u.get("deleted")),
+            "deleted_at": u.get("deleted_at", ""),
+            "tags": u.get("tags", []),
             "source": "upload",
             "stored": bool(p),
             "storage_path": u.get("stored_path"),
@@ -497,7 +565,10 @@ def list_uploads(q: str = None, page: int = 1, page_size: int = 50) -> dict:
 
 
 def delete_upload(doc_id: str) -> bool:
-    """删除一条上传文档（移除原始二进制 + user_documents.json 条目并重建索引）。"""
+    """彻底删除一条上传文档（移除原始二进制 + user_documents.json 条目并重建索引）。
+
+    注意：这是硬删除（purge）。上传管理页的『删除』应走 soft_delete_upload（回收站）。
+    """
     ups = _load_uploads()
     new_ups = [u for u in ups if u.get("doc_id") != doc_id]
     if len(new_ups) == len(ups):
@@ -512,7 +583,38 @@ def delete_upload(doc_id: str) -> bool:
         vec_store.rebuild(iter_all_documents())
     except Exception:
         pass
+    uid, uname = audit_current_user()
+    audit_log("doc.purge", doc_id, "彻底删除文档", uid, uname)
     return True
+
+
+def delete_uploads_batch(doc_ids: list) -> dict:
+    """批量删除上传文档（移除二进制 + user_documents.json 条目，重建索引一次）。
+
+    返回 {"deleted": int, "not_found": list}。
+    """
+    doc_ids = [str(x) for x in (doc_ids or [])]
+    if not doc_ids:
+        return {"deleted": 0, "not_found": []}
+    ups = _load_uploads()
+    id_set = set(doc_ids)
+    new_ups = [u for u in ups if u.get("doc_id") not in id_set]
+    not_found = [d for d in doc_ids if not any(u.get("doc_id") == d for u in ups)]
+    deleted = len(ups) - len(new_ups)
+    if deleted == 0:
+        return {"deleted": 0, "not_found": not_found}
+    for d in doc_ids:
+        delete_upload_binary(d)
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(new_ups, f, ensure_ascii=False, indent=2)
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    return {"deleted": deleted, "not_found": not_found}
 
 
 def reclassify_upload(doc_id: str, category: str) -> bool:
@@ -641,3 +743,326 @@ def dedupe_uploads():
 def _now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ============ 操作审计日志 ============
+def _audit_conn():
+    """复用管理库连接（与 admin.py 同库，审计表建在 kb_admin.db）。"""
+    import admin
+    conn = admin._conn()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS audit_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ts TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime')),
+               user_id INTEGER,
+               username TEXT,
+               action TEXT,
+               target TEXT,
+               detail TEXT
+           )""")
+    return conn
+
+
+def audit_log(action: str, target: str = "", detail: str = "", user_id=None, username: str = ""):
+    """记录一条操作审计（忽略异常，永不阻断主流程）。"""
+    try:
+        conn = _audit_conn()
+        conn.execute(
+            "INSERT INTO audit_log (user_id, username, action, target, detail) "
+            "VALUES (?,?,?,?,?)",
+            (user_id, username, action, target, detail))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def audit_current_user() -> tuple:
+    """返回 (user_id, username)，供调用方在已登录上下文中记录审计。
+
+    优先从 Flask session 读取；非请求上下文（如脚本）返回 (None, "")。
+    """
+    try:
+        from flask import session
+        uid = session.get("user_id")
+        if uid:
+            import admin
+            row = admin._conn().execute(
+                "SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+            return uid, (row["username"] if row else "")
+    except Exception:
+        pass
+    return None, ""
+
+
+def list_audit(page: int = 1, page_size: int = 50, action: str = None,
+               q: str = None) -> dict:
+    """分页查询审计日志，支持按动作类型/关键词过滤。"""
+    conn = _audit_conn()
+    where, params = [], []
+    if action:
+        where.append("action=?")
+        params.append(action)
+    if q:
+        where.append("(target LIKE ? OR detail LIKE ? OR username LIKE ?)")
+        params += ["%" + q + "%", "%" + q + "%", "%" + q + "%"]
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+    total = conn.execute("SELECT COUNT(*) c FROM audit_log" + sql_where, params).fetchone()["c"]
+    rows = conn.execute(
+        "SELECT * FROM audit_log" + sql_where +
+        " ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [page_size, (page - 1) * page_size]).fetchall()
+    conn.close()
+    return {"total": total, "page": page, "page_size": page_size,
+            "items": [dict(r) for r in rows]}
+
+
+def audit_actions() -> list:
+    """返回全部不同的动作类型，供前端下拉过滤。"""
+    conn = _audit_conn()
+    rows = conn.execute(
+        "SELECT action, COUNT(*) c FROM audit_log GROUP BY action ORDER BY c DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ============ 回收站（软删除） ============
+def soft_delete_upload(doc_id: str) -> bool:
+    """软删除：标记 deleted=1 并保留原文件与索引条目（仅从『活跃』列表隐藏）。
+
+    真正从检索中剔除需在重建索引时排除 deleted 条目；为简单稳妥，
+    软删除同时重建索引（排除被删条目），但原文件与 json 记录均保留可恢复。
+    """
+    ups = _load_uploads()
+    found = False
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            u["deleted"] = 1
+            u["deleted_at"] = _now()
+            found = True
+            break
+    if not found:
+        return False
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.delete", doc_id, "移入回收站（软删除）", uid, uname)
+    return True
+
+
+def soft_delete_uploads_batch(doc_ids: list) -> dict:
+    doc_ids = [str(x) for x in (doc_ids or [])]
+    if not doc_ids:
+        return {"deleted": 0, "not_found": []}
+    ups = _load_uploads()
+    id_set = set(doc_ids)
+    found = 0
+    for u in ups:
+        if u.get("doc_id") in id_set and not u.get("deleted"):
+            u["deleted"] = 1
+            u["deleted_at"] = _now()
+            found += 1
+    not_found = [d for d in doc_ids if not any(u.get("doc_id") == d for u in ups)]
+    if found == 0:
+        return {"deleted": 0, "not_found": not_found}
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.delete.batch", ",".join(doc_ids), "批量移入回收站", uid, uname)
+    return {"deleted": found, "not_found": not_found}
+
+
+def restore_upload(doc_id: str) -> bool:
+    """从回收站恢复：清除 deleted 标记并重建索引。"""
+    ups = _load_uploads()
+    found = False
+    for u in ups:
+        if u.get("doc_id") == doc_id and u.get("deleted"):
+            u["deleted"] = 0
+            u["deleted_at"] = None
+            found = True
+            break
+    if not found:
+        return False
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.restore", doc_id, "从回收站恢复", uid, uname)
+    return True
+
+
+def purge_upload(doc_id: str) -> bool:
+    """彻底删除：移除原文件 + json 条目 + 重建索引（不可恢复）。"""
+    res = delete_upload(doc_id)
+    if res:
+        uid, uname = audit_current_user()
+        audit_log("doc.purge", doc_id, "回收站彻底删除", uid, uname)
+    return res
+
+
+def purge_uploads_batch(doc_ids: list) -> dict:
+    res = delete_uploads_batch(doc_ids)
+    if res.get("deleted"):
+        uid, uname = audit_current_user()
+        audit_log("doc.purge.batch", ",".join(doc_ids), "回收站批量彻底删除", uid, uname)
+    return res
+
+
+def list_trash(page: int = 1, page_size: int = 50, q: str = None) -> dict:
+    """回收站列表（仅 deleted=1 的上传文档）。"""
+    ups = _load_uploads()
+    items = []
+    for u in ups:
+        if not u.get("deleted"):
+            continue
+        p = _resolve_binary_path(u)
+        items.append({
+            "doc_id": u.get("doc_id"),
+            "filename": u.get("filename", u.get("doc_id")),
+            "category": u.get("category", "未分类"),
+            "year": u.get("year"),
+            "deleted_at": u.get("deleted_at", ""),
+            "stored": bool(p),
+        })
+    items.sort(key=lambda d: str(d.get("deleted_at") or ""), reverse=True)
+    q = q or ""
+    if q:
+        ql = str(q).lower()
+        items = [d for d in items
+                 if ql in str(d["filename"]).lower() or ql in str(d["category"]).lower()]
+    total = len(items)
+    start = (page - 1) * page_size
+    return {"total": total, "page": page, "page_size": page_size,
+            "items": items[start:start + page_size]}
+
+
+def trash_count() -> int:
+    return sum(1 for u in _load_uploads() if u.get("deleted"))
+
+
+# ============ 标签系统 ============
+def set_upload_tags(doc_id: str, tags: list) -> bool:
+    """设置/覆盖某文档的标签列表（去重、去空、截断长度）。"""
+    tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    tags = tags[:20]
+    ups = _load_uploads()
+    found = False
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            u["tags"] = tags
+            found = True
+            break
+    if not found:
+        return False
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def list_tags() -> list:
+    """返回全部标签及文档数（标签云）。"""
+    counts = {}
+    for u in _load_uploads():
+        if u.get("deleted"):
+            continue
+        for t in (u.get("tags") or []):
+            counts[t] = counts.get(t, 0) + 1
+    return [{"tag": t, "count": c} for t, c in sorted(counts.items(), key=lambda x: -x[1])]
+
+
+def docs_by_tag(tag: str, page: int = 1, page_size: int = 50) -> dict:
+    """按标签返回文档（含在分类浏览中复用）。"""
+    ups = _load_uploads()
+    items = []
+    for u in ups:
+        if u.get("deleted"):
+            continue
+        if tag in (u.get("tags") or []):
+            items.append({
+                "doc_id": u.get("doc_id"),
+                "filename": u.get("filename", u.get("doc_id")),
+                "category": u.get("category", "未分类"),
+                "year": u.get("year"),
+                "tags": u.get("tags", []),
+            })
+    items.sort(key=lambda d: d.get("filename") or "", reverse=True)
+    total = len(items)
+    start = (page - 1) * page_size
+    return {"total": total, "page": page, "page_size": page_size,
+            "items": items[start:start + page_size]}
+
+
+# ============ 文档在线编辑（更新提取文本） ============
+def update_upload_text(doc_id: str, text: str) -> bool:
+    """更新文档提取文本（在线编辑），并重建索引。"""
+    ups = _load_uploads()
+    found = False
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            u["text"] = text
+            u["pages"] = max(1, text.count("\n") // 40 + 1)
+            u["updated_at"] = _now()
+            found = True
+            break
+    if not found:
+        return False
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.edit", doc_id, "在线编辑提取文本", uid, uname)
+    return True
+
+
+# ============ 统计概览（门户首页） ============
+def kb_overview() -> dict:
+    """门户首页统计：活跃文档数、分类数、标签数、最近更新、回收站数。"""
+    ups = _load_uploads()
+    active = [u for u in ups if not u.get("deleted")]
+    cats = set(u.get("category", "未分类") for u in active)
+    tags = set()
+    for u in active:
+        tags.update(u.get("tags") or [])
+    recent = sorted(active, key=lambda d: d.get("updated_at") or d.get("created_at") or "",
+                    reverse=True)[:8]
+    recent_items = [{
+        "doc_id": u.get("doc_id"),
+        "filename": u.get("filename", u.get("doc_id")),
+        "category": u.get("category", "未分类"),
+        "updated_at": u.get("updated_at") or u.get("created_at") or "",
+    } for u in recent]
+    return {
+        "doc_count": len(active),
+        "total_count": len(ups),
+        "category_count": len(cats),
+        "tag_count": len(tags),
+        "trash_count": trash_count(),
+        "recent": recent_items,
+    }

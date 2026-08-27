@@ -33,7 +33,7 @@ INDEX_FILE = os.path.join(INDEX_DIR, "bm25_index.pkl")
 META_FILE = os.path.join(INDEX_DIR, "doc_metadata.pkl")
 MANIFEST_FILE = os.path.join(INDEX_DIR, "documents_manifest.json")
 
-CHUNK_SIZE = 600  # 每个文本块的字符数
+CHUNK_SIZE = 1200  # 每个文本块的字符数（与 vec_store 一致，放大粒度降低碎片化）
 
 
 def chunk_text(text, chunk_size=CHUNK_SIZE):
@@ -107,7 +107,12 @@ def build_index():
         tokenized_corpus.append(jieba.lcut_for_search(text))
 
     print("步骤4: 构建 BM25 索引...")
-    bm25 = BM25Okapi(tokenized_corpus)
+    if not tokenized_corpus:
+        # 语料为空（如删光了所有文档）：保存空索引占位，避免 BM25Okapi([]) 抛 ZeroDivisionError
+        bm25 = None
+        print("  语料为空，写入空索引占位（检索将返回空结果）")
+    else:
+        bm25 = BM25Okapi(tokenized_corpus)
 
     print("步骤5: 保存索引文件...")
     os.makedirs(INDEX_DIR, exist_ok=True)

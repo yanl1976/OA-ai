@@ -40,6 +40,9 @@ def load_index():
 def query(question, top_k=TOP_K):
     """检索与问题最相关的文档片段"""
     bm25, chunks = load_index()
+    if bm25 is None:
+        # 空索引占位（知识库无文档）：直接返回空结果，不崩溃
+        return []
     query_tokens = jieba.lcut_for_search(question)
     scores = bm25.get_scores(query_tokens)
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]

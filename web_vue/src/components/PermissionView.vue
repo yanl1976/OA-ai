@@ -28,6 +28,7 @@ onMounted(async () => {
 <template>
   <h2>权限目录</h2>
   <p class="muted">系统内置权限项（含中文说明）。角色在「角色管理」中按需分配这些权限。</p>
+  <p class="muted tip">「分类权限」组按 <b>分类节点 × 操作（浏览/查询/下载）</b> 动态生成：新增分类会自动出现对应权限项，可为每个子类单独授权，上级分类授权默认向下继承。</p>
   <div class="card card-pad">
     <div v-for="g in grouped" :key="g.group" style="margin-bottom: 18px">
       <div class="nav-group-title" style="padding-left: 0">{{ g.group }}</div>

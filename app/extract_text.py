@@ -33,88 +33,45 @@ except ImportError:
 
 import os
 
+# 复用统一 LLM 调用层（MiniMax，OpenAI 兼容）
+try:
+    from .llm import structured_extract, is_configured
+except ImportError:  # 直接以脚本运行时的回退
+    from llm import structured_extract, is_configured
+
 ALLOWED_EXT = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pptx", ".pdf"}
 
 # LLM 配置：默认关闭，可在 .env 中设置 USE_LLM=true 并配置 MINIMAX_API_KEY 启用
 # 启用后，PDF/DOCX 会先用基础解析得到原始文本，再交由大模型做结构化排版
 USE_LLM = os.environ.get("USE_LLM", "false").lower() in ("1", "true", "yes")
-MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
-MINIMAX_API_URL = os.environ.get(
-    "MINIMAX_API_URL",
-    "https://api.minimax.io/v1/text/chatcompletion_v2",
-)
-MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "abab6.5s-chat")
 
 
 # ---------------- LLM 提取 ----------------
-def _call_llm(prompt: str, text: str) -> str:
-    """调用 MiniMax API 进行结构化提取。
+def _call_llm(raw_text: str, text: str) -> str:
+    """调用 MiniMax API 进行结构化提取（委托给统一的 app/llm.py）。
 
     大模型只负责「重新排版」：把 PDF/Word 抽取出的、挤在一起的原始文本，
     按中文文档的自然结构（封面、章节、条款、表格）整理成干净的多行纯文本。
-    不理解/不增删内容，仅做排版还原。
+    严格忠实于原文，绝不增删内容。
     """
-    if not MINIMAX_API_KEY:
-        raise ValueError("MINIMAX_API_KEY not configured")
-
-    url = MINIMAX_API_URL
-    headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    system_prompt = (
-        "你是一个中文文档排版还原工具。输入是 PDF/Word 抽取出的原始文本"
-        "（可能所有内容挤在一起、缺失换行、章节条目粘连）。\n"
-        "你只需重新排版输出，不需要理解或改写内容。\n\n"
-        "排版规则：\n"
-        "1. 封面/红头区域：单位名、文件标题、文号、发布日期、实施日期 各自单独成行。\n"
-        "2. 「2025-8-11发布」和「2025-8-11实施」必须是两行。\n"
-        "3. 章节编号（1、2、2.1、3.1、第一章、第一条、（一））单独成行。\n"
-        "4. 普通正文按自然段落合并（连续的中文句子合并为一段，段间空行）。\n"
-        "5. 表格内容尽量保留行列结构（可用制表符或空格对齐）。\n"
-        "6. 直接输出整理后的纯文本，不要任何说明文字、不要 Markdown 代码块标记。\n"
-    )
-
-    # 长文档分段提交，避免超出模型上下文；这里取前 16000 字符（约 8K 中文）
-    snippet = text[:16000]
-
-    payload = {
-        "model": MINIMAX_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请将以下文档整理为干净的结构化纯文本：\n\n{snippet}"},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 8192,
-    }
-
-    import urllib.request
-    import urllib.error
-
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP Error: {e.code} - {e.read().decode()}")
-
-    if "choices" in result and result["choices"]:
-        return result["choices"][0]["message"]["content"]
-    if "reply" in result:  # 兼容部分 MiniMax 返回结构
-        return result["reply"]
-    raise RuntimeError(f"LLM API error: {result}")
+    return structured_extract(text)
 
 
-def _extract_with_llm(raw: bytes, filename: str) -> str:
+def _extract_with_llm(raw: bytes, filename: str, category: str = None) -> str:
     """使用 LLM 提取文档内容。"""
-    # 先用基础方法提取原始文本
-    raw_text = _decode_pdf(raw) if filename.lower().endswith('.pdf') else _decode_text(raw)
+    # 先用基础方法提取原始文本（兜底基准）；标准类走保守模式保留全部文字
+    raw_text = _decode_pdf(raw, category=category) if filename.lower().endswith('.pdf') else _decode_text(raw)
 
-    # 调用 LLM 进行结构化
-    structured_text = _call_llm("", raw_text)
+    # 调用 LLM 进行结构化（严格忠实原文）
+    structured_text = _call_llm(raw_text, raw_text)
+
+    # 兜底：若 LLM 结果明显短于原始（可能丢内容），回退原始文本，保证不丢信息
+    import re as _re
+    def _norm(s):
+        return _re.sub(r"\s+", "", s)
+    if _norm(structured_text) and len(_norm(structured_text)) < 0.98 * len(_norm(raw_text)):
+        # LLM 结果相对原始丢失超过 2%，视为不可靠，回退到保守原始提取，保证不丢内容
+        return raw_text
     return structured_text
 
 
@@ -492,19 +449,23 @@ def merge_lines_to_paragraphs(lines) -> list:
     return [p for p in header_paras + body_paras if p.strip()]
 
 
-def _decode_pdf_pymupdf(raw: bytes) -> str:
+def _decode_pdf_pymupdf(raw: bytes, category: str = None) -> str:
     """PDF 底层解码（主引擎）：使用 PyMuPDF 按文本块提取，保留阅读顺序。
 
     PyMuPDF 的 get_text("blocks") 会按 (x0,y0,x1,y1, text, block_no, block_type)
     返回文本块，配合 sort=True 按阅读顺序（从上到下、从左到右）排序，对多栏
     / 表格 / 复杂排版远比逐行坐标提取鲁棒。图像型 PDF（无文本层）会返回空，
     由调用方给出扫描件告警。
+
+    category 为「管理标准」类时，采用保守模式：保留所有文字块（含图注尺寸、
+    页码、位置码等），仅跳过图片块，确保与 PDF 文字层差异最小、不丢内容。
     """
     try:
         import fitz  # PyMuPDF
     except ImportError:
         raise RuntimeError("服务端未安装 PyMuPDF（pymupdf），无法解析 PDF")
 
+    conservative = bool(category) and ("标准" in category or "standard" in (category or "").lower())
     try:
         doc = fitz.open(stream=raw, filetype="pdf")
     except Exception as e:
@@ -522,10 +483,14 @@ def _decode_pdf_pymupdf(raw: bytes) -> str:
             txt = (b[4] or "").strip()
             if not txt:
                 continue
-            # 过滤位置码：格式如 2-1-5-1
+            if conservative:
+                # 保守模式：仅跳过图片块（block_type=1 已由 len(b)<5 之外处理），
+                # 不过滤任何文字块，保留页码/位置码/图注尺寸等，保证零内容丢失
+                page_lines.append(txt)
+                continue
+            # 常规模式：过滤位置码（格式如 2-1-5-1）与纯页码短行
             if re.fullmatch(r"\d+-\d+-\d+-\d+", txt):
                 continue
-            # 过滤纯页码行
             if re.fullmatch(r"[\d\s\-—/．.]+", txt) and len(txt) <= 6:
                 continue
             page_lines.append(txt)
@@ -584,10 +549,10 @@ def _post_clean_pdf_text(text: str) -> str:
     return text
 
 
-def _decode_pdf(raw: bytes) -> str:
+def _decode_pdf(raw: bytes, category: str = None) -> str:
     """PDF 底层解码：优先 PyMuPDF（更强、已默认安装），缺失时回退 pdfplumber。"""
     try:
-        return _decode_pdf_pymupdf(raw)
+        return _decode_pdf_pymupdf(raw, category=category)
     except RuntimeError as e:
         # PyMuPDF 缺失或失败，尝试 pdfplumber
         return _decode_pdf_pdfplumber(raw)
@@ -713,95 +678,34 @@ def _strip_std_tail_noise(s: str) -> str:
 
 @register("standard")
 def process_standard(text):
-    """管理标准：剔除页脚标准编号噪声，按封面/章节/条款/表格结构化，保留章节与表格内容。"""
+    """管理标准：仅做换行切分与轻微去噪，严格保留全部文字内容（含图注尺寸、页码、
+    位置码、标准编号行），确保与 PDF 文字层差异最小、不丢内容。
+    """
     # 先把 PDF 抽到一行的长文本切开（标准编号/日期/章节/条款/表格），再逐行处理
     text = _segment_standard_lines(text)
     out = []
-    # 封面区：首次出现顶层章节编号（如 "1 范围"、"2 总则"）之前，所有行逐行独立成段
-    # 正文区：章节编号后断段，其他并入当前段
-    in_cover = True
     cur = ""
 
     def flush():
         nonlocal cur
-        s = _strip_std_tail_noise(cur)
-        if s:
-            out.append(s)
+        if cur.strip():
+            out.append(cur.strip())
         cur = ""
 
     for ln in text.split("\n"):
         s = ln.strip()
         if not s:
             continue
-        # 丢弃位置码（如 2-1-5-1）或纯数字行（如单独的 "2"）
-        # 位置码：多个数字用 -/. 连接；纯数字行：只有数字
-        # 位置码通常包含多个数字和多个分隔符，如 2-1-5-1（长度>5）
-        # 但日期行如 2022-11-28 需要保留
-        if re.fullmatch(r"[\d\s\-—/．.]+", s) and len(s) >= 4 and re.search(r"[\-—/]", s):
-            # 如果是日期格式（2022-11-28），保留
-            if re.match(r"\d{4}-\d{1,2}-\d{1,2}$", s):
-                pass  # 保留日期行
-            else:
-                continue  # 过滤位置码
-        if re.fullmatch(r"\d+", s):
-            continue
-        # 封面区：去除行首粘连的页码数字（如抽取为 "1天水电气…"）
-        if in_cover:
-            s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s).strip()
-        # 去除行尾页码/图号噪声
-        s = _strip_std_tail_noise(s)
-        if not s:
-            continue
-        # 丢弃页脚标准编号噪声行（Q/CT ...V..-1-1-1 这种带页码的）
-        if _STD_FOOTER_RE.match(s):
-            continue
-        # 检测是否进入正文区：遇到顶层章节编号如 "1 范围"、"2 总则"
-        # 匹配 "数字 + 空格 + 汉字标题" 模式（原始PDF抽取通常有空格）
-        if in_cover and re.match(r"^\s*\d{1,3}\s+[\u4e00-\u9fff]", s):
-            # 封面结束，flush 封面剩余内容，开始正文
-            if cur:
-                out.append(cur)
-                cur = ""
-            in_cover = False
-        if in_cover:
-            # 封面区：逐行独立成段（清理版本号后直接输出）
-            s = re.sub(r"\.V\d+$", "", s)
-            out.append(s)
-            continue
-        # 正文区处理
-        # 正文区额外过滤：单独出现的标准编号行（如 Q/CT 304-2022.V01）
-        if re.match(r"^Q/[A-Z]{1,5}\s*\d+[-—]\d{4}(?:\.\w+)?$", s):
-            continue
-        # 顶层章节编号如 "1 范围"、"2 总则" -> 断段，独立成段
-        # 章节标题独立成段后，立即flush，避免和正文合并
+        # 仅去除行首粘连的页码数字（如抽取为 "1天水电气…"），其余文字完整保留
+        s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s).strip()
+        # 不删除任何内容行（位置码/图注坐标/标准编号/页码均保留，保证与原文一致）
         if re.match(r"^\s*\d{1,3}\s+[\u4e00-\u9fff]", s):
-            flush()
-            # 章节标题独立成段
-            out.append(s)
-            cur = ""
-            continue
-        # 次级条款编号如 2.1、3.2.1 -> 断段，独立成段
-        if _STD_CLAUSE_RE.match(s) or _STD_TABLE_CAP_RE.match(s):
+            # 顶层章节编号（如 "1 范围"）：断段，章节标题独立成段
             flush()
             out.append(s)
-            cur = ""
             continue
-        # 中文章节编号如 "第一章"、"第一条" -> 断段，独立成段
-        if re.match(r"^第[一二三四五六七八九十百千零\d]+[章节条]", s) or re.match(r"^[（(][一二三四五六七八九十百千零]+[）)]", s):
-            flush()
-            out.append(s)
-            cur = ""
-            continue
-        # 普通续行并入当前条款（中文行内连接不加空格）
-        # 但如果是日期行（2022-11-28格式），或者当前行/上一行包含 发布/实施，需要断段
-        is_date = re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", s)
-        cur_has_date = cur and re.search(r"\d{4}-\d{1,2}-\d{1,2}$", cur)
-
-        if cur and not is_date and not cur_has_date and ("发布" not in s) and ("发布" not in cur) and ("实施" not in s) and ("实施" not in cur):
-            cur = cur + s
-        else:
-            flush()
-            cur = s
+        # 其他行并入当前段
+        cur = (cur + " " + s).strip() if cur else s
     flush()
     return "\n\n".join(out)
 
@@ -863,11 +767,11 @@ def extract(raw: bytes, filename: str, category: str = None):
     # LLM 提取模式
     if USE_LLM and filename.lower().endswith(('.pdf', '.docx')):
         try:
-            text = _extract_with_llm(raw, filename)
+            text = _extract_with_llm(raw, filename, category)
             return text, None
         except Exception as e:
             warn = f"LLM 提取失败，回退到基础提取: {e}"
-            # 回退到基础提取
+            # 回退到基础提取（标准类走保守模式，保留全部文字，避免丢内容）
 
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
@@ -886,7 +790,7 @@ def extract(raw: bytes, filename: str, category: str = None):
         text = _extract_pptx(raw)
         warn = None
     elif ext == ".pdf":
-        text = _decode_pdf(raw)
+        text = _decode_pdf(raw, category=category)
         warn = None
         if not text.strip():
             warn = "PDF 未提取到文本（可能为扫描件/图片型 PDF）"

@@ -81,6 +81,32 @@ export const api = {
   reclassifyDocument: (id, category) =>
     api.put("/api/kb/document/" + id, { category }),
   deleteUpload: (id) => api.del("/api/kb/uploads/" + id),
+  deleteUploadsBatch: (docIds) => api.del("/api/kb/uploads/batch", { doc_ids: docIds }),
+  // 回收站
+  listTrash: (params = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") q.set(k, v);
+    });
+    return api.get("/api/kb/trash?" + q.toString());
+  },
+  restoreUpload: (docId) => api.post("/api/kb/trash/" + docId),
+  purgeUpload: (docId) => api.del("/api/kb/trash/" + docId),
+  purgeUploadsBatch: (docIds) => api.del("/api/kb/trash/batch", { doc_ids: docIds }),
+  // 标签
+  listTags: () => api.get("/api/kb/tags"),
+  setDocTags: (docId, tags) => api.put("/api/kb/document/" + docId + "/tags", { tags }),
+  docsByTag: (tag, params = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") q.set(k, v);
+    });
+    return api.get("/api/kb/tag/" + encodeURIComponent(tag) + "/documents?" + q.toString());
+  },
+  // 文档在线编辑
+  updateDocText: (docId, text) => api.put("/api/kb/document/" + docId + "/text", { text }),
+  // 门户概览
+  kbOverview: () => api.get("/api/kb/overview"),
 
   permissions: () => api.get("/api/admin/permissions"),
   roles: () => api.get("/api/admin/roles"),
@@ -117,4 +143,18 @@ export const api = {
     "/api/derived/" + id + "/source-pdf" + (inline ? "?inline=1" : ""),
   // 衍生版本父子血缘（来源纪要 + 祖先链 + 下游子版本）
   derivedLineage: (id) => api.get("/api/derived/" + id + "/lineage"),
+
+  // ============ 对话式智能问答 ============
+  chatScope: () => api.get("/api/kb/chat/scope"),
+  chatSessions: () => api.get("/api/kb/chat/sessions"),
+  chatCreateSession: (title) => api.post("/api/kb/chat/sessions", { title }),
+  chatSessionMessages: (sid) => api.get("/api/kb/chat/session/" + sid),
+  chatDeleteSession: (sid) => api.del("/api/kb/chat/session/" + sid),
+  chatRenameSession: (sid, title) => api.post("/api/kb/chat/session/" + sid + "/rename", { title }),
+  chatSend: (sessionId, question, topK) =>
+    api.post("/api/kb/chat", {
+      session_id: sessionId || undefined,
+      question,
+      top_k: topK,
+    }),
 };

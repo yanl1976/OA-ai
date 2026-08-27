@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, inject } from "vue";
 import { api } from "../api.js";
+const emit = defineEmits(["uploaded"]);
 
 const notify = inject("notify");
 const cats = ref([]);
@@ -121,6 +122,8 @@ async function upload() {
     const results = r.results || [];
     const okList = results.filter((x) => x.ok);
     const failList = results.filter((x) => !x.ok);
+    // 真实进度：已处理数（成功+失败）
+    progress.value = { done: results.length, total: files.value.length };
     if (failList.length && okList.length) {
       notify("部分上传成功：" + okList.length + " 个成功，" + failList.length + " 个失败", "warn");
     } else if (failList.length) {
@@ -132,12 +135,15 @@ async function upload() {
       notify("上传成功（" + okList.length + " 个）：" + catMsg + "，已按类别与年份归档", "ok");
     }
     if (failList.length) {
-      // 失败文件保留，便于用户查看；成功文件从列表移除
-      files.value = files.value.filter((_, i) => results[i] && !results[i].ok);
+      // 失败文件保留，便于用户查看：按文件名匹配，避免 results 索引错位
+      const failNames = new Set(failList.map((x) => x.filename));
+      files.value = files.value.filter((f) => failNames.has(f.name));
     } else {
       files.value = [];
     }
     localStorage.setItem(LS_KEY, category.value);
+    await loadCats();   // 刷新分类下拉（可能新建了自动分类）
+    emit("uploaded");    // 通知外壳刷新侧栏分类树/文档计数
   } catch (e) {
     notify(e.message, "err");
   } finally {

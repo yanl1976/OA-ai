@@ -61,6 +61,8 @@ import kb_store
 import search as kb_search_mod
 import vec_store
 import derived_store
+import chat_store
+import llm
 import sqlite3
 import zipfile
 import tempfile
@@ -222,9 +224,12 @@ def auth_me():
 
 # ===================== 知识库 API =====================
 @app.route("/api/kb/categories")
-@login_required("kb.view")
+@login_required()
 def kb_categories():
+    perms = set(admin.get_user_permissions(session.get("user_id")))
     cats = admin.list_categories(only_enabled=True)
+    # 静默过滤无浏览(view)权限的分类节点（含其子树）
+    cats = [c for c in cats if admin.check_cat_action(perms, c["name"], "view")]
     counts = kb_store.category_doc_counts()
     # 构建 parent -> children 映射，将子分类文档数聚合到父级
     children_map = {}
@@ -244,8 +249,11 @@ def kb_categories():
 
 
 @app.route("/api/kb/categories_all")
-@login_required("kb.view")
+@login_required()
 def kb_categories_all():
+    perms = set(admin.get_user_permissions(session.get("user_id")))
+    if "kb.category.manage" not in perms and "role.manage" not in perms:
+        return jsonify({"error": "权限不足"}), 403
     cats = admin.list_categories(only_enabled=False)
     counts = kb_store.category_doc_counts()
     for c in cats:
@@ -254,8 +262,9 @@ def kb_categories_all():
 
 
 @app.route("/api/kb/documents")
-@login_required("kb.view")
+@login_required()
 def kb_documents():
+    perms = set(admin.get_user_permissions(session.get("user_id")))
     category = request.args.get("category")
     q = request.args.get("q", "").strip()
     year = request.args.get("year")
@@ -265,30 +274,45 @@ def kb_documents():
         kids = admin.get_category_descendants(category)
         if kids:
             category = [category] + kids
+        # 校验所选分类的浏览权限（沿祖先）
+        if not admin.check_cat_action(perms, admin.doc_category_to_node(category[0]) if isinstance(category, list) else admin.doc_category_to_node(category), "view"):
+            return jsonify({"documents": [], "total": 0, "page": 1, "page_size": 20, "categories": []})
     try:
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
     except ValueError:
         page, page_size = 1, 20
     res = kb_store.list_documents(category, q, year, page, page_size)
+    # 按分类浏览权限过滤（静默过滤无权限类型）
+    docs = [d for d in res.get("documents", [])
+            if admin.check_cat_action(perms, d.get("category"), "view")]
+    total = len(docs)
+    res["documents"] = docs
+    res["total"] = total
     return jsonify(res)
 
 
 @app.route("/api/kb/document")
-@login_required("kb.view")
+@login_required()
 def kb_document():
+    perms = set(admin.get_user_permissions(session.get("user_id")))
     doc_id = request.args.get("doc_id", "")
     if not doc_id:
         return jsonify({"error": "缺少 doc_id"}), 400
     doc = kb_store.get_document(doc_id)
     if not doc:
         return jsonify({"error": "文档不存在"}), 404
+    if not admin.check_cat_action(perms, doc.get("category"), "view"):
+        return jsonify({"error": "无权浏览该分类文档"}), 403
+    doc["can_view"] = True
+    doc["can_download"] = admin.check_cat_action(perms, doc.get("category"), "download")
     return jsonify({"document": doc})
 
 
 @app.route("/api/kb/search")
-@login_required("kb.search")
+@login_required()
 def kb_search():
+    perms = set(admin.get_user_permissions(session.get("user_id")))
     if not admin.get_feature("search_enabled", 1):
         return jsonify({"error": "检索功能已关闭"}), 403
     q = request.args.get("q", "").strip()
@@ -297,6 +321,9 @@ def kb_search():
     try:
         top_k = int(request.args.get("top_k", 20))
         results = kb_search_mod.hybrid_search(q, top_k)
+        # 按分类查询(search)权限过滤（静默过滤无权限类型）
+        results = [r for r in results
+                   if admin.check_cat_action(perms, r.get("category"), "search")]
         return jsonify({"query": q, "count": len(results), "results": results})
     except FileNotFoundError as e:
         return jsonify({"error": str(e), "hint": "请先运行 app/rag_build_index.py 构建索引"}), 500
@@ -642,11 +669,148 @@ def kb_doc_reclassify(doc_id):
 @app.route("/api/kb/uploads/<doc_id>", methods=["DELETE"])
 @login_required("kb.upload.manage")
 def kb_upload_delete(doc_id):
-    """上传文件管理：删除指定上传文档。"""
-    ok = kb_store.delete_upload(doc_id)
+    """上传文件管理：删除指定上传文档（软删除，移入回收站可恢复）。"""
+    ok = kb_store.soft_delete_upload(doc_id)
     if not ok:
         return jsonify({"error": "文档不存在"}), 404
     return jsonify({"ok": True})
+
+
+@app.route("/api/kb/uploads/batch", methods=["DELETE"])
+@login_required("kb.upload.manage")
+def kb_upload_delete_batch():
+    """上传文件管理：批量删除上传文档（软删除，移入回收站可恢复）。body: {"doc_ids": [...]}。"""
+    data = request.get_json(silent=True) or {}
+    doc_ids = data.get("doc_ids")
+    if not isinstance(doc_ids, list) or not doc_ids:
+        return jsonify({"error": "doc_ids 必须为非空数组"}), 400
+    result = kb_store.soft_delete_uploads_batch(doc_ids)
+    return jsonify({"ok": True, **result})
+
+
+# ===================== 回收站 =====================
+@app.route("/api/kb/trash")
+@login_required("kb.upload.manage")
+def kb_trash_list():
+    """回收站列表（软删除文档）。"""
+    q = request.args.get("q", "").strip()
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 50))
+    except ValueError:
+        page, page_size = 1, 50
+    return jsonify(kb_store.list_trash(page=page, page_size=page_size, q=q))
+
+
+@app.route("/api/kb/trash/<doc_id>", methods=["POST"])
+@login_required("kb.upload.manage")
+def kb_trash_restore(doc_id):
+    """从回收站恢复文档。"""
+    ok = kb_store.restore_upload(doc_id)
+    if not ok:
+        return jsonify({"error": "文档不在回收站或不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/kb/trash/<doc_id>", methods=["DELETE"])
+@login_required("kb.upload.manage")
+def kb_trash_purge(doc_id):
+    """回收站彻底删除文档（不可恢复）。"""
+    ok = kb_store.purge_upload(doc_id)
+    if not ok:
+        return jsonify({"error": "文档不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/kb/trash/batch", methods=["DELETE"])
+@login_required("kb.upload.manage")
+def kb_trash_purge_batch():
+    """回收站批量彻底删除。body: {"doc_ids": [...]}。"""
+    data = request.get_json(silent=True) or {}
+    doc_ids = data.get("doc_ids")
+    if not isinstance(doc_ids, list) or not doc_ids:
+        return jsonify({"error": "doc_ids 必须为非空数组"}), 400
+    result = kb_store.purge_uploads_batch(doc_ids)
+    return jsonify({"ok": True, **result})
+
+
+# ===================== 标签 =====================
+@app.route("/api/kb/tags")
+@login_required()
+def kb_tags():
+    """标签云：返回全部标签及文档数。"""
+    return jsonify({"tags": kb_store.list_tags()})
+
+
+@app.route("/api/kb/document/<doc_id>/tags", methods=["PUT"])
+@login_required("kb.upload.manage")
+def kb_doc_tags(doc_id):
+    """设置文档标签。body: {"tags": ["标签1", "标签2"]}。"""
+    data = request.get_json(silent=True) or {}
+    tags = data.get("tags")
+    if not isinstance(tags, list):
+        return jsonify({"error": "tags 必须为数组"}), 400
+    ok = kb_store.set_upload_tags(doc_id, tags)
+    if not ok:
+        return jsonify({"error": "文档不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/kb/tag/<tag>/documents")
+@login_required()
+def kb_tag_docs(tag):
+    """按标签返回文档列表。"""
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 50))
+    except ValueError:
+        page, page_size = 1, 50
+    return jsonify(kb_store.docs_by_tag(tag, page, page_size))
+
+
+# ===================== 文档在线编辑 =====================
+@app.route("/api/kb/document/<doc_id>/text", methods=["PUT"])
+@login_required("kb.upload.manage")
+def kb_doc_edit_text(doc_id):
+    """在线编辑文档提取文本。body: {"text": "..."}。"""
+    data = request.get_json(silent=True) or {}
+    text = data.get("text")
+    if text is None:
+        return jsonify({"error": "text 不能为空"}), 400
+    ok = kb_store.update_upload_text(doc_id, text)
+    if not ok:
+        return jsonify({"error": "文档不存在"}), 404
+    return jsonify({"ok": True})
+
+
+# ===================== 审计日志 =====================
+@app.route("/api/admin/audit")
+@login_required("system.manage")
+def adm_audit():
+    """操作审计日志（分页 + 过滤）。"""
+    q = request.args.get("q", "").strip()
+    action = request.args.get("action", "").strip() or None
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 50))
+    except ValueError:
+        page, page_size = 1, 50
+    return jsonify(kb_store.list_audit(page, page_size, action, q))
+
+
+@app.route("/api/admin/audit/actions")
+@login_required("system.manage")
+def adm_audit_actions():
+    """审计动作类型列表（用于过滤下拉）。"""
+    return jsonify({"actions": kb_store.audit_actions()})
+
+
+# ===================== 门户首页概览 =====================
+@app.route("/api/kb/overview")
+@login_required()
+def kb_overview():
+    """门户首页统计概览。"""
+    return jsonify(kb_store.kb_overview())
 
 
 # ===================== 系统管理 API =====================
@@ -962,7 +1126,7 @@ def derived_lineage(derived_id):
 
 
 @app.route("/api/kb/document/<doc_id>/pdf")
-@login_required("kb.view")
+@login_required()
 def kb_doc_pdf(doc_id):
     """文档预览/下载。
 
@@ -972,9 +1136,15 @@ def kb_doc_pdf(doc_id):
     """
     import urllib.parse
     from flask import Response
+    perms = set(admin.get_user_permissions(session.get("user_id")))
     doc = kb_store.get_document(doc_id)
     if not doc:
         return jsonify({"error": "文档不存在"}), 404
+    if not admin.check_cat_action(perms, doc.get("category"), "view"):
+        return jsonify({"error": "无权浏览该分类文档"}), 403
+    # 下载（非内联预览）需要 download 权限；内联预览仅需 view
+    if request.args.get("inline") != "1" and not admin.check_cat_action(perms, doc.get("category"), "download"):
+        return jsonify({"error": "无权下载该分类文档（无下载权限）"}), 403
     # 优先预览原始上传文件
     path, mimetype = kb_store.get_upload_binary(doc_id)
     if path:
@@ -1028,14 +1198,24 @@ def derived_pdf_preview(derived_id):
 def api_query():
     if not admin.get_feature("api_public", 0):
         u = _current_user()
-        if not u or "kb.search" not in admin.get_user_permissions(u["id"]):
+        if not u:
             return jsonify({"error": "需要登录或开启开放检索"}), 401
+        perms = set(admin.get_user_permissions(u["id"]))
+        if not any(admin.check_cat_action(perms, c["name"], "search")
+                   for c in admin.list_categories(only_enabled=False)):
+            return jsonify({"error": "需要登录或开启开放检索"}), 401
+    else:
+        perms = set(admin.get_user_permissions(session.get("user_id"))) if session.get("user_id") else set()
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "缺少参数 q"}), 400
     try:
         top_k = int(request.args.get("top_k", 20))
         results = kb_search_mod.hybrid_search(q, top_k)
+        # 按分类查询(search)权限过滤（静默过滤无权限类型）
+        if perms:
+            results = [r for r in results
+                       if admin.check_cat_action(perms, r.get("category"), "search")]
         return jsonify({"query": q, "count": len(results), "results": results})
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 500
@@ -1055,6 +1235,206 @@ def _seed_categories_from_source():
                 admin.seed_categories(names)
     except Exception as e:  # noqa: BLE001
         print("[警告] 分类种子注入失败:", e)
+
+
+# ===================== 对话式智能问答 =====================
+def _build_chat_prompt(question: str, contexts: list, scope_names: list) -> str:
+    """构造系统指令：强调边界、引用、汇报式中文回答。"""
+    scope_desc = "、".join(scope_names) if scope_names else "全部知识库"
+    ctx_block = "\n\n---\n\n".join(
+        "【文档《%s》（分类：%s）】\n%s" % (c["filename"], c.get("category") or "—", c.get("content") or c.get("text") or "")
+        for c in contexts
+    ) or "（无相关文档）"
+    system = (
+        "你是企业知识库智能助手，只能依据下方【参考文档】中的内容回答用户问题。\n\n"
+        "【对话范围边界】\n"
+        "你当前仅被授权依据「%s」相关文档作答。\n"
+        "若用户问题超出该范围（涉及其他分类或未收录内容），你必须明确说明："
+        "『该问题超出我当前可对话的知识范围（仅限%s），无法作答。』"
+        "不得编造、不得越权猜测。\n\n"
+        "【严格基于参考文档】\n"
+        "1. 只能引用下方【参考文档】给出的事实、条款、数据；严禁凭自身知识补充、扩写或改写"
+        "参考文档中没有的内容（包括但不限于额外添加文档未提及的标准条目、定义、数值）。\n"
+        "2. 若参考文档中相关内容不完整，仅就已有内容作答，并说明『参考文档仅提供了上述片段，"
+        "其余部分未收录』，不得脑补。\n\n"
+        "【回答规范·汇报式分析】\n"
+        "用简体中文作答，采用汇报式结构：\n"
+        "一、问题理解（简要复述用户意图）\n"
+        "二、依据与事实（引用参考文档中的具体条款/数据，注明来源文档名）\n"
+        "三、分析结论（归纳要点、对比、风险提示等）\n"
+        "四、建议（可执行的操作建议）\n"
+        "若参考文档不足以回答，须如实说明『依据现有资料不足以得出确切结论』，不要臆测。\n\n"
+        "【引用要求】\n"
+        "凡涉及具体事实、数据、条款，必须标注出处文档名（如：《XXX标准》）。\n\n"
+        "下方为本次检索到的参考文档（已限定在你被授权的范围内）：\n%s"
+        % (scope_desc, scope_desc, ctx_block)
+    )
+    return system
+
+
+def _retrieve_for_chat(question: str, perms: set, top_k: int = 4) -> list:
+    """检索并按对话分类权限（search）过滤；返回 top_k 个命中文档（含 text/regions）。"""
+    raw = kb_search_mod.hybrid_search(question, top_k=top_k * 4)
+    filtered = [r for r in raw if admin.check_cat_action(perms, r.get("category"), "search")]
+    return filtered[:top_k]
+
+
+def _chat_scope_names(perms: set) -> list:
+    """返回当前用户拥有 search 权限的顶层类型名（经反别名映射回文档类型名）。"""
+    cats = admin.list_categories(only_enabled=False)
+    tops = [c for c in cats if c.get("parent_id") is None]
+    scope = []
+    for t in tops:
+        # 该顶层或其任一后代有 search 权限，即视为可对话类型
+        subtree = [t["name"]] + (admin.get_category_descendants(t["name"]) or [])
+        if any(admin.check_cat_action(perms, n, "search") for n in subtree):
+            # 反别名：节点名 → 文档类型名
+            label = t["name"]
+            for k, v in admin.TYPE_ALIASES.items():
+                if v == label:
+                    label = k
+                    break
+            scope.append(label)
+    return scope
+
+
+@app.route("/api/kb/chat/scope")
+@login_required()
+def kb_chat_scope():
+    """返回当前用户可对话的范围（类型名列表），供前端展示边界提示。"""
+    perms = set(admin.get_user_permissions(session.get("user_id")))
+    return jsonify({"domains": _chat_scope_names(perms)})
+
+
+@app.route("/api/kb/chat/sessions", methods=["GET", "POST"])
+@login_required()
+def kb_chat_sessions():
+    """列出 / 新建会话。"""
+    uid = session.get("user_id")
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        title = (data.get("title") or "新对话").strip()[:80] or "新对话"
+        sid = chat_store.create_session(uid, title)
+        return jsonify({"ok": True, "session_id": sid})
+    return jsonify({"sessions": chat_store.list_sessions(uid)})
+
+
+@app.route("/api/kb/chat/session/<int:sid>", methods=["GET", "DELETE"])
+@login_required()
+def kb_chat_session(sid):
+    """获取某会话消息 / 删除会话（自定义删除）。"""
+    uid = session.get("user_id")
+    if not chat_store.get_session(sid, uid):
+        return jsonify({"error": "会话不存在"}), 404
+    if request.method == "DELETE":
+        chat_store.delete_session(sid, uid)
+        return jsonify({"ok": True})
+    return jsonify({"messages": chat_store.list_messages(sid)})
+
+
+@app.route("/api/kb/chat/session/<int:sid>/rename", methods=["POST"])
+@login_required()
+def kb_chat_session_rename(sid):
+    """重命名会话。"""
+    uid = session.get("user_id")
+    if not chat_store.get_session(sid, uid):
+        return jsonify({"error": "会话不存在"}), 404
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()[:80]
+    if not title:
+        return jsonify({"error": "标题不能为空"}), 400
+    chat_store.rename_session(sid, uid, title)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/kb/chat", methods=["POST"])
+@login_required()
+def kb_chat():
+    """发送一条消息并获取智能回答（支持多轮，会话长期保存）。
+
+    入参：{ session_id?, question, top_k? }
+      - 不传 session_id 则自动新建会话。
+      - 返回 { session_id, answer, refs, scope }
+    """
+    if not admin.get_feature("chat_enabled", 1):
+        return jsonify({"error": "对话功能已关闭"}), 403
+    if not llm.is_configured():
+        return jsonify({"error": "LLM 未配置（MINIMAX_API_KEY）"}), 503
+
+    uid = session.get("user_id")
+    data = request.get_json(silent=True) or {}
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "缺少参数 question"}), 400
+    top_k = int(data.get("top_k", 5))
+    top_k = max(1, min(10, top_k))
+
+    # 1) 对话边界：按账号分类 search 权限
+    perms = set(admin.get_user_permissions(uid))
+    scope_names = _chat_scope_names(perms)
+    if not scope_names:
+        return jsonify({"error": "当前账号无可对话的分类权限（需分类的查询权限）"}), 403
+
+    # 2) 会话：复用或新建
+    sid = data.get("session_id")
+    if sid:
+        if not chat_store.get_session(int(sid), uid):
+            return jsonify({"error": "会话不存在"}), 404
+    else:
+        first_title = question[:40]
+        sid = chat_store.create_session(uid, first_title)
+
+    # 3) 检索（按分类 search 权限过滤）
+    hits = _retrieve_for_chat(question, perms, top_k=top_k)
+
+    # 4) 组装多轮历史（仅用户/助手文本，不含系统）
+    history = []
+    for m in chat_store.list_messages(sid):
+        if m["role"] in ("user", "assistant"):
+            history.append({"role": m["role"], "content": m["content"]})
+    history.append({"role": "user", "content": question})
+
+    # 5) 调 LLM：系统指令 + 历史 + 当前问题
+    try:
+        answer = llm.chat(
+            [{"role": "system", "content": _build_chat_prompt(question, hits, scope_names)}]
+            + history
+        )
+    except Exception as e:
+        return jsonify({"error": "LLM 调用失败: %s" % e}), 502
+
+    # 6) 持久化消息
+    refs = [{
+        "doc_id": h["doc_id"],
+        "filename": h.get("filename"),
+        "category": h.get("category"),
+        "score": h.get("score"),
+        "snippet": (h.get("snippet") or "")[:300],
+        "content": h.get("content") or h.get("text") or "",
+        "char_start": h.get("char_start"),
+        "char_end": h.get("char_end"),
+        "regions": h.get("regions", []),
+    } for h in hits]
+    chat_store.add_message(sid, "user", question)
+    chat_store.add_message(sid, "assistant", answer, refs)
+
+    # 7) 审计
+    try:
+        _row = admin._conn().execute(
+            "SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+        _uname = _row["username"] if _row else ""
+    except Exception:
+        _uname = ""
+    kb_store.audit_log("kb.chat", target="session:%d" % sid, detail=question,
+                       user_id=uid, username=_uname)
+
+    return jsonify({
+        "ok": True,
+        "session_id": sid,
+        "answer": answer,
+        "refs": refs,
+        "scope": scope_names,
+    })
 
 
 if __name__ == "__main__":
