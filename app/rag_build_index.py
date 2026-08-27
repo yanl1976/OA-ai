@@ -116,10 +116,15 @@ def build_index():
 
     print("步骤5: 保存索引文件...")
     os.makedirs(INDEX_DIR, exist_ok=True)
-    with open(INDEX_FILE, "wb") as f:
+    # 原子写：先写临时文件再 replace，避免检索线程（每次 load_index 读 pkl）读到半成品
+    _tmp = INDEX_FILE + ".tmp"
+    with open(_tmp, "wb") as f:
         pickle.dump(bm25, f)
-    with open(META_FILE, "wb") as f:
+    os.replace(_tmp, INDEX_FILE)
+    _tmp = META_FILE + ".tmp"
+    with open(_tmp, "wb") as f:
         pickle.dump(all_chunks, f)
+    os.replace(_tmp, META_FILE)
     with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 

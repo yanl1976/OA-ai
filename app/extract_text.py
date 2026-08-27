@@ -1192,15 +1192,17 @@ def extract(raw: bytes, filename: str, category: str = None):
         if _raw0 is not None:
             kind = detect_kind(_raw0)
 
-    # 会议纪要与管理标准均走规则后处理（process_minutes / process_standard），不使用 LLM。
-    # 实证：本库管理标准 PDF（尤其图片型扫描件 OCR）经 LLM 排版后，表格/章节号/段落号
-    # 常被打乱、挤成一坨，质量不如规则版；而 process_standard 按「标准条款结构」断段，
-    # 能稳定还原章节层级、条款编号、表格标题，且不丢内容、零成本、无幻觉。
-    # 其它文档（无分类或非标准/纪要）仍按 .env 的 USE_LLM 决定走 LLM 还是规则兜底。
+    # 会议纪要 / 管理标准 / 规章制度(合规指引) 均走规则后处理，不使用 LLM。
+    # 实证：本库管理标准 / 合规指引 PDF 经 LLM 排版后，表格/章节号/段落号常被打乱、
+    # 挤成一坨，质量不如规则版；规则后处理按「标准/规章条款结构」断段，能稳定还原
+    # 章节层级、条款编号、表格标题，且不丢内容、零成本、无幻觉、无联网延迟。
+    # 其它文档（无分类或非标准/纪要/规章）才按 .env 的 USE_LLM 决定走 LLM 还是规则兜底。
+    # 注：USE_LLM 走 MiniMax 接口单次联网耗时高达数十秒（实测 94s/篇），是「提取慢」的
+    # 根因，故凡能走规则后处理的类型一律强制走规则，绝不联网。
     use_llm = (
         USE_LLM
         and filename.lower().endswith(('.pdf', '.docx'))
-        and kind not in ("minutes", "standard")  # 纪要/标准强制走规则
+        and kind not in ("minutes", "standard", "regulation")  # 纪要/标准/规章强制走规则
     )
     if use_llm:
         try:

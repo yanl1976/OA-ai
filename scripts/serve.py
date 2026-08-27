@@ -87,11 +87,15 @@ _WORKER_STARTED = False
 
 
 def _rebuild_indexes():
-    """全量重建 BM25 + 向量索引（后台调用，不阻塞请求线程）。"""
+    """重建 BM25 索引（后台调用）。
+
+    向量索引已改为单篇增量 upsert（见 _do_extract_task），此处只全量重建 BM25
+    （BM25 不支持单篇增量，必须全量重算）。BM25 保存已做原子写，检索线程安全。
+    函数本身不阻塞调用方；worker 在队列空闲时异步触发，不卡提取任务。
+    """
     try:
         import rag_build_index
         rag_build_index.build_index()
-        vec_store.rebuild(kb_store.iter_all_documents())
         return True
     except Exception as e:  # noqa: BLE001
         print("[background] 索引重建失败: %s" % e)
@@ -111,15 +115,41 @@ def _drain_extract_queue():
     return dropped
 
 
+def _bm25_rebuild_async():
+    """异步后台线程：全量重建 BM25（不阻塞提取 worker 取下一个任务）。"""
+    def _run():
+        _rebuild_indexes()
+        _INDEX_DIRTY.clear()
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _vec_rebuild_async():
+    """异步后台线程：全量重建向量索引（批量重提后调用，仅 1 次全量编码+1 次文件重写）。
+
+    相比逐篇 upsert_document（每篇都 vstack + 原子重写整个 npy 文件），全量 rebuild
+    只重写 1 次，批量场景下可把向量开销从 O(N 次文件重写) 降到 O(1)。
+    """
+    def _run():
+        try:
+            docs = list(kb_store.iter_all_documents())
+            docs = [d for d in docs if d and d.get("content")]
+            n = vec_store.rebuild(docs)
+            print("[background] 向量全量重建完成: %d 篇 / %d chunks" % (len(docs), n))
+        except Exception as e:  # noqa: BLE001
+            print("[background] 向量全量重建失败: %s" % e)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _extract_worker():
     while True:
         try:
             task = _EXTRACT_Q.get(timeout=1.0)
         except _queue.Empty:
-            # 队列空：若期间有脏文档，做一次全量重建后清标记
+            # 队列空：若有脏文档，异步触发一次向量全量重建 + BM25 全量重建
+            # （批量重提时逐篇只标记脏，此处统一 1 次重建，避免 N 次全量文件重写）
             if _INDEX_DIRTY.is_set():
-                _rebuild_indexes()
-                _INDEX_DIRTY.clear()
+                _vec_rebuild_async()
+                _bm25_rebuild_async()
             # 中止信号：清空剩余（理论上已空）并复位，避免再次入队时仍生效
             if _EXTRACT_ABORT.is_set():
                 _EXTRACT_ABORT.clear()
@@ -130,7 +160,7 @@ def _extract_worker():
             continue
         try:
             _do_extract_task(task)
-            _INDEX_DIRTY.set()   # 标记有脏文档，待队列空时重建
+            # 向量已在 _do_extract_task 内增量 upsert；BM25 仅标记脏，空闲时异步重建
         except Exception as e:  # noqa: BLE001
             print("[background] 提取任务失败 %s: %s" % (task.get("filename"), e))
         finally:
@@ -151,15 +181,27 @@ def _do_extract_task(task):
         return
     with open(bin_path, "rb") as f:
         raw = f.read()
-    text, warn = extract_text.extract(raw, filename)
-    if not text.strip():
-        warn = (("%s；" % warn) if warn else "") + "未提取到文本内容"
-    # 分类：显式 hint 优先；否则按文件名+正文自动识别
+    # 分类：显式 hint 优先；否则按文件名+正文自动识别（在提取前确定，直接传给
+    # extract()，避免 extract() 因拿不到 category 而回退嗅探、被 USE_LLM 误伤走 LLM 慢路径）
     if cat_hint:
         cat = cat_hint
     else:
-        cat = _auto_classify(filename, text) or "未分类"
-    text = extract_text.post_process(text, cat)
+        # 先快速解码一次正文仅用于分类嗅探（轻量，不联网）；落盘分类 init_cat
+        # 若已是有效标准/纪要/合规类，直接复用，无需重新嗅探。
+        _ext0 = os.path.splitext(filename)[1].lower()
+        _probe = None
+        if _ext0 == ".pdf":
+            _probe = extract_text._decode_pdf(raw, category=init_cat)
+        elif _ext0 == ".docx":
+            _probe = extract_text._extract_docx(raw)
+        if init_cat and init_cat != "未分类":
+            cat = init_cat
+        else:
+            cat = _auto_classify(filename, _probe) or "未分类"
+    text, warn = extract_text.extract(raw, filename, category=cat)
+    if not text.strip():
+        warn = (("%s；" % warn) if warn else "") + "未提取到文本内容"
+    # 已按 cat 完成规则后处理，无需再次 post_process（避免二次规则排版）
     year = kb_store._extract_year(filename, text)
     # 后台分类与初始落盘分类不同（如 raw 阶段未指定、靠正文识别出会议纪要），
     # 移动归档文件到正确类别目录，保持磁盘归档与分类一致
@@ -169,7 +211,25 @@ def _do_extract_task(task):
         except Exception as e:  # noqa: BLE001
             print("[background] 重归类失败 %s: %s" % (doc_id, e))
     kb_store.update_upload_text_async(doc_id, text, cat, year)
-    print("[background] 已提取: %s (%s)" % (filename, cat))
+    # 向量索引策略（兼顾单篇即时可搜 + 批量高效）：
+    # - 队列里还有后续任务（批量重提/批量上传）-> 只标记脏、不立即 upsert，避免 N 篇
+    #   逐篇 vstack + 全量 npy 原子重写（O(N 次文件重写）的巨大浪费）；待队列空闲时
+    #   一次性 vec_store.rebuild（全量，仅 1 次文件重写）+ BM25 全量重建。
+    # - 队列已空（本篇是最后/单独一篇，如单篇上传、单篇重提）-> 立即增量 upsert 这一篇，
+    #   用户可在数秒内检索到，无需等全库重建。
+    if _EXTRACT_Q.qsize() > 0:
+        _INDEX_DIRTY.set()
+        print("[background] 已提取文本: %s (%s)，批量中，待队列空闲后统一重建向量+BM25" % (filename, cat))
+    else:
+        try:
+            doc = kb_store.get_document(doc_id)
+            if doc:
+                n = vec_store.upsert_document(doc)
+                _INDEX_DIRTY.set()  # BM25 仍全量，空闲时统一重建
+                print("[background] 向量增量更新(单篇): %s (+%d chunks)" % (filename, n))
+        except Exception as e:  # noqa: BLE001
+            print("[background] 向量增量失败 %s: %s" % (filename, e))
+            _INDEX_DIRTY.set()
 
 
 def start_extract_worker():

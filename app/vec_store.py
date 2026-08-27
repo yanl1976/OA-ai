@@ -23,6 +23,7 @@ import re
 import pickle
 import tempfile
 import logging
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vec_store")
@@ -162,6 +163,7 @@ class VecIndex:
         self.dim = get_embedder().dim
         self.vectors = np.zeros((0, self.dim), dtype=np.float32)
         self.meta = []  # 每个 chunk 的元信息
+        self._lock = threading.Lock()  # 保护 vectors/meta 的并发读写（worker upsert vs 检索 search）
 
     # ---------- 构建 ----------
     def _make_chunk_meta(self, doc, chunk_text, cstart, cend, idx):
@@ -195,64 +197,70 @@ class VecIndex:
 
     def rebuild(self, documents):
         """全量重建索引。documents: list[dict]。"""
-        all_chunks = []
-        for doc in documents:
-            all_chunks.extend(self._doc_chunks(doc))
-        self.meta = [m for m, _ in all_chunks]
-        self.vectors = self._recompute(all_chunks)
-        self.save()
+        with self._lock:
+            all_chunks = []
+            for doc in documents:
+                all_chunks.extend(self._doc_chunks(doc))
+            self.meta = [m for m, _ in all_chunks]
+            self.vectors = self._recompute(all_chunks)
+            self.save()
         return len(self.meta)
 
     def upsert_document(self, doc):
         """增量新增或替换某文档的所有 chunk。"""
-        doc_id = doc.get("doc_id")
-        self.remove_document(doc_id)
-        new = self._doc_chunks(doc)
-        if not new:
-            return 0
-        add_meta = [m for m, _ in new]
-        add_vecs = self._recompute(new)
-        self.meta = self.meta + add_meta
-        if self.vectors.shape[0] == 0:
-            self.vectors = add_vecs
-        else:
-            self.vectors = np.vstack([self.vectors, add_vecs])
-        self.save()
+        with self._lock:
+            doc_id = doc.get("doc_id")
+            self.remove_document(doc_id)
+            new = self._doc_chunks(doc)
+            if not new:
+                return 0
+            add_meta = [m for m, _ in new]
+            add_vecs = self._recompute(new)
+            self.meta = self.meta + add_meta
+            if self.vectors.shape[0] == 0:
+                self.vectors = add_vecs
+            else:
+                self.vectors = np.vstack([self.vectors, add_vecs])
+            self.save()
         return len(new)
 
     def remove_document(self, doc_id):
-        if self.vectors.shape[0] == 0 or doc_id is None:
-            return
-        keep = [i for i, m in enumerate(self.meta) if m.get("doc_id") != doc_id]
-        if len(keep) == len(self.meta):
-            return
-        self.meta = [self.meta[i] for i in keep]
-        self.vectors = self.vectors[keep]
-        self.save()
+        with self._lock:
+            if self.vectors.shape[0] == 0 or doc_id is None:
+                return
+            keep = [i for i, m in enumerate(self.meta) if m.get("doc_id") != doc_id]
+            if len(keep) == len(self.meta):
+                return
+            self.meta = [self.meta[i] for i in keep]
+            self.vectors = self.vectors[keep]
+            self.save()
 
     # ---------- 检索 ----------
     def search(self, query: str, top_k: int = 30):
-        if self.vectors.shape[0] == 0:
-            return []
-        qvec = get_embedder().encode_query(query)
-        if qvec is None or np.linalg.norm(qvec) == 0:
-            return []
-        sims = self.vectors @ qvec  # (N,)，已归一化→点积即余弦
-        k = min(top_k, sims.shape[0])
-        idxs = np.argpartition(-sims, range(k))[:k]
-        idxs = idxs[np.argsort(-sims[idxs])]
-        return [(self.meta[i], float(sims[i])) for i in idxs if sims[i] > 0]
+        with self._lock:
+            if self.vectors.shape[0] == 0:
+                return []
+            qvec = get_embedder().encode_query(query)
+            if qvec is None or np.linalg.norm(qvec) == 0:
+                return []
+            sims = self.vectors @ qvec  # (N,)，已归一化→点积即余弦
+            k = min(top_k, sims.shape[0])
+            idxs = np.argpartition(-sims, range(k))[:k]
+            idxs = idxs[np.argsort(-sims[idxs])]
+            return [(self.meta[i], float(sims[i])) for i in idxs if sims[i] > 0]
 
     # ---------- 持久化 ----------
     def save(self):
         os.makedirs(VEC_DIR, exist_ok=True)
-        with open(VEC_FILE, "wb") as f:
+        tmp = VEC_FILE + ".tmp"
+        with open(tmp, "wb") as f:
             pickle.dump({
                 "vectors": self.vectors,
                 "meta": self.meta,
                 "embedder_type": self.embedder_type,
                 "dim": self.dim,
             }, f)
+        os.replace(tmp, VEC_FILE)  # 原子替换，避免检索线程读到半成品
 
     def load(self):
         if not os.path.exists(VEC_FILE):
