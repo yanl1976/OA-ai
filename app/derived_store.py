@@ -236,26 +236,43 @@ def parse_minutes(text: str) -> dict:
     # 直接把红头行保存为 header_lines，供 PDF 生成时按行取
     header["header_lines"] = hlines
 
-    # 兼容旧逻辑：尝试从行中提取字段
+    # 兼容旧逻辑：从红头行中按「内容特征」识别字段（不依赖固定行序，避免
+    # 无文号/变体排版时整体错位）。优先使用 _split_header_line 产出的有序行，
+    # 但兜底按内容归位，确保 org/doc_no/office/meeting_name/meeting_seq 正确。
     if hlines:
-        header["org"] = hlines[0] if len(hlines) > 0 else ""
-        header["doc_no"] = hlines[1] if len(hlines) > 1 else ""
-        if len(hlines) > 2:
-            office_line = hlines[2]
-            dm = re.search(r"\d{4}\s*年", office_line)
-            if dm:
-                header["office_name"] = office_line[:dm.start()].strip()
-                header["office_date"] = re.sub(r"\s+", "", office_line[dm.start():])
-            else:
-                header["office_name"] = office_line
-                header["office_date"] = ""
-            header["office_line"] = office_line
-        else:
-            header["office_name"] = ""
-            header["office_date"] = ""
-            header["office_line"] = ""
-        header["meeting_name"] = hlines[3] if len(hlines) > 3 else ""
-        header["meeting_seq"] = hlines[4] if len(hlines) > 4 else ""
+        _is_docno = lambda x: ("〔" in x and "〕" in x) or ("号" in x and "〔" in x)
+        _is_office = lambda x: ("办公室" in x or "综管办" in x or re.search(r"\d{4}\s*年", x) is not None)
+        _is_meetname = lambda x: "会议纪要" in x
+        _is_seq = lambda x: ("次" in x and ("（" in x or "(" in x))
+        _is_org = lambda x: any(k in x for k in ("集团", "公司", "研究所", "研究院", "局", "部", "委员会")) and not _is_office(x) and not _is_meetname(x)
+        for ln in hlines:
+            if _is_seq(ln):
+                header["meeting_seq"] = ln.strip()
+            elif _is_meetname(ln):
+                header["meeting_name"] = ln.strip()
+            elif _is_docno(ln):
+                header["doc_no"] = ln.strip()
+            elif _is_office(ln):
+                office_line = ln.strip()
+                dm = re.search(r"\d{4}\s*年", office_line)
+                if dm:
+                    header["office_name"] = office_line[:dm.start()].strip()
+                    header["office_date"] = re.sub(r"\s+", "", office_line[dm.start():])
+                else:
+                    header["office_name"] = office_line
+                    header["office_date"] = ""
+                header["office_line"] = office_line
+            elif _is_org(ln) and not header.get("org"):
+                header["org"] = ln.strip()
+        # 若 office_line 未识别但存在落款候选（含年月日），兜底
+        if not header.get("office_line"):
+            for ln in hlines:
+                if re.search(r"\d{4}\s*年", ln) and "会议纪要" not in ln:
+                    dm = re.search(r"\d{4}\s*年", ln)
+                    header["office_name"] = ln[:dm.start()].strip()
+                    header["office_date"] = re.sub(r"\s+", "", ln[dm.start():])
+                    header["office_line"] = ln.strip()
+                    break
 
     body = body_lines
     # 红头已按行清晰解析（>=4 行）时，直接信任 header_lines 映射结果，
@@ -427,6 +444,49 @@ def parse_minutes(text: str) -> dict:
     }
 
 
+def _format_attendees(text: str, per_row: int = 5) -> str:
+    """把「出席人员：XXX、YYY、…、ZZZ。」按每行 per_row 人整齐排版。
+
+    会议纪要出席/列席名单通常十几人到几十人，整段塞一行既不美观也不便于阅读。
+    本函数在「XX人员：」之后、姓名列表中间，每 per_row 人插入换行 + 两个全角
+    空格缩进（与正文段落「如下：」后的缩进风格一致），使前端（pre-wrap）和
+    PDF（<br/>）均能整齐呈现。
+
+    处理规则：
+    - 仅在「XX人员：」之后的姓名段内分行，「XX人员：」本身与首行同行；
+    - 按中文顿号（、）/逗号（含半角,）拆分姓名单元；
+    - 末尾标点（。；）保留在最后一人后；
+    - 若总人数 ≤ per_row，不强制换行（保持单行即可）。
+    """
+    if not text:
+        return text
+    # 识别「XX人员：」开头：宽松匹配出席/列席/参会/参加等
+    m = re.match(r"^(\s*(?:出席|列席|参加|参会)人员\s*[:：]\s*)(.*)$", text, re.DOTALL)
+    if not m:
+        return text
+    header, body = m.group(1), m.group(2).strip()
+    # 保留末尾标点
+    trail = ""
+    if body and body[-1] in "。；！？":
+        trail = body[-1]
+        body = body[:-1]
+    # 按中文/英文逗号、顿号拆分姓名单元
+    names = [n.strip() for n in re.split(r"[、,,]\s*", body) if n.strip()]
+    if len(names) <= per_row:
+        return text  # 人数少，原样输出
+    rows = []
+    for i in range(0, len(names), per_row):
+        chunk = names[i:i + per_row]
+        rows.append("、".join(chunk))
+    # 首行接 header，后续行用「　　」（两个全角空格）缩进对齐
+    lines = [header + rows[0]]
+    for r in rows[1:]:
+        lines.append("　　" + r)
+    if trail:
+        lines[-1] = lines[-1] + trail
+    return "\n".join(lines)
+
+
 def _indent_after_lead(text: str) -> str:
     """规范「如下：」引导句的排版。
 
@@ -475,16 +535,12 @@ def render_minutes(struct: dict) -> str:
     if not struct:
         return ""
     parts = []
-    # 优先使用 header_lines（按行解析的红头）
-    hlines = struct.get("header_lines") or []
-    if hlines:
-        parts.extend(hlines)
-    else:
-        # 兼容旧逻辑
-        for key in ("org", "doc_no", "office_line", "meeting_name", "meeting_seq"):
-            v = (struct.get(key) or "").strip()
-            if v:
-                parts.append(v)
+    # 红头按标准版式顺序输出（单位 → 文号 → 落款 → 会议名称 → 会议次数），
+    # 不依赖 header_lines 的内部顺序，确保落款/日期/会议次数不混排且排版规范。
+    for key in ("org", "doc_no", "office_line", "meeting_name", "meeting_seq"):
+        v = (struct.get(key) or "").strip()
+        if v:
+            parts.append(v)
     intro = (struct.get("intro") or "").strip()
     if intro:
         parts.append(intro)
@@ -500,10 +556,10 @@ def render_minutes(struct: dict) -> str:
             parts.append(d)
     p = (struct.get("present") or "").strip()
     if p:
-        parts.append(p)
+        parts.append(_format_attendees(p))
     a = (struct.get("absent") or "").strip()
     if a:
-        parts.append(a)
+        parts.append(_format_attendees(a))
     return "\n".join(parts)
 
 

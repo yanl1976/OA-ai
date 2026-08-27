@@ -207,22 +207,16 @@ async function parseSource(text) {
     const st = pr.struct;
     if (st && st.structured) {
       tpl.value = st;
-      // 优先使用 header_lines（按行解析的红头）填充输入框
+      // 优先使用后端按内容特征解析出的结构化字段（org/doc_no/office_*/meeting_name/
+      // meeting_seq），与 PDF 渲染路径（tpl.meeting_seq）保持一致，避免预览为空。
+      // 仅在结构化字段缺失时，才回退到 header_lines 按内容特征定位（不依赖固定行序）。
       const hlines = st.header_lines || [];
-      if (hlines.length > 0) {
-        meta.org = hlines[0] || "";  // 第1行：单位名称
-        meta.doc_no = hlines[1] || "";  // 第2行：文号
-        meta.office_line = hlines[2] || "";  // 第3行：落款
-        meta.meeting_name = hlines[3] || "";  // 第4行：会议名称
-        meta.meeting_seq = hlines[4] || "";    // 第5行：会议次数
-      } else {
-        // 兼容旧逻辑
-        meta.org = st.org || "";
-        meta.doc_no = st.doc_no || "";
-        meta.office_line = st.office_line || "";
-        meta.meeting_name = st.meeting_name || "";
-        meta.meeting_seq = st.meeting_seq || "";
-      }
+      const seqFromHlines = (hlines.find((x) => /[（(][^（）()]*?次[）)]/.test(x)) || "").trim();
+      meta.org = st.org || hlines[0] || "";
+      meta.doc_no = st.doc_no || hlines[1] || "";
+      meta.office_line = st.office_line || hlines[2] || "";
+      meta.meeting_name = st.meeting_name || hlines[3] || "";
+      meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
       meta.intro = st.intro || "";
       meta.present = st.present || ""; meta.absent = st.absent || "";
       selItems.value = new Set(st.items.map((_, i) => i));
@@ -292,21 +286,14 @@ async function editDerived(d) {
   tab.value = "generate";
   const restoreFromTemplate = (st) => {
     tpl.value = st;
-    // 优先使用 header_lines 填充输入框
+    // 与 parseSource 保持一致：优先用结构化字段，缺失时回退 header_lines 按内容特征定位
     const hlines = st.header_lines || [];
-    if (hlines.length > 0) {
-      meta.org = hlines[0] || "";
-      meta.doc_no = hlines[1] || "";
-      meta.office_line = hlines[2] || "";
-      meta.meeting_name = hlines[3] || "";
-      meta.meeting_seq = hlines[4] || "";
-    } else {
-      meta.org = st.org || "";
-      meta.doc_no = st.doc_no || "";
-      meta.office_line = st.office_line || "";
-      meta.meeting_name = st.meeting_name || "";
-      meta.meeting_seq = st.meeting_seq || "";
-    }
+    const seqFromHlines = (hlines.find((x) => /[（(][^（）()]*?次[）)]/.test(x)) || "").trim();
+    meta.org = st.org || hlines[0] || "";
+    meta.doc_no = st.doc_no || hlines[1] || "";
+    meta.office_line = st.office_line || hlines[2] || "";
+    meta.meeting_name = st.meeting_name || hlines[3] || "";
+    meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
     meta.intro = st.intro || "";
     meta.present = st.present || ""; meta.absent = st.absent || "";
     selItems.value = new Set((d.selected_blocks || []).filter((i) => i < st.items.length));
@@ -529,7 +516,7 @@ onMounted(async () => {
               <div class="field"><label>会议名称</label>
                 <input class="input" v-model="meta.meeting_name" placeholder="总经理办公会会议纪要" /></div>
               <div class="field"><label>会议次数</label>
-                <input class="input" v-model="meta.meeting_seq" placeholder="（2024 年第二十八次）" /></div>
+                <input class="input" v-model="meta.meeting_seq" placeholder="（源文件未标注则留空）" /></div>
             </div>
             <div class="field"><label>导语</label>
               <textarea class="input" rows="2" v-model="meta.intro"></textarea></div>

@@ -183,84 +183,42 @@ def build_derived_pdf(meta: dict) -> bytes:
 
     # ===== 模板版式：忠实还原标准会议纪要红头文件 =====
     if structured:
-        # 优先使用 header_lines（按行解析的红头），直接按行渲染
-        header_lines = tpl.get("header_lines") or []
-        if header_lines:
-            # 第1行：单位名（红头，居中红色）
-            if len(header_lines) > 0:
-                story.append(Paragraph(_esc(header_lines[0]), s_red_org))
-            # 第2行：文号（居中黑色）
-            if len(header_lines) > 1:
-                story.append(Paragraph(_esc(header_lines[1]), s_docno))
-            # 第3行：落款（办公室+日期，左/右分开）
-            if len(header_lines) > 2:
-                ol = header_lines[2]
-                dm = re.search(r"\d{4}\s*年", ol)
-                if dm:
-                    office_name = ol[:dm.start()].strip()
-                    office_date = re.sub(r"\s+", "", ol[dm.start():])
-                else:
-                    office_name = ol
-                    office_date = ""
-                if office_name or office_date:
-                    off_tbl = Table([[Paragraph(_esc(office_name), s_office),
-                                      Paragraph(_esc(office_date), s_office_r)]],
-                                   colWidths=[FRAME_W * 0.45, FRAME_W * 0.55])
-                    off_tbl.setStyle(TableStyle([
-                        ("ALIGN", (0, 0), (0, 0), "LEFT"),
-                        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                        ("TOPPADDING", (0, 0), (-1, -1), 0),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                    ]))
-                    story.append(off_tbl)
-            # 红色分隔线
-            story.append(HRFlowable(width="100%", thickness=2.0, color=RED,
-                                    spaceBefore=4, spaceAfter=12))
-            # 第4行：会议名称
-            if len(header_lines) > 3:
-                story.append(Paragraph(_esc(header_lines[3]), s_mname))
-            # 第5行：会议次数
-            if len(header_lines) > 4:
-                story.append(Paragraph(_esc(header_lines[4]), s_seq))
-        else:
-            # 兼容旧逻辑：无 header_lines 时回退到字段渲染
-            if (tpl.get("org") or "").strip():
-                story.append(Paragraph(_esc(tpl["org"]), s_red_org))
-            if (tpl.get("doc_no") or "").strip():
-                story.append(Paragraph(_esc(tpl["doc_no"]), s_docno))
-            office_name = (tpl.get("office_name") or "").strip()
-            office_date = (tpl.get("office_date") or "").strip()
-            if (not office_name and not office_date) and (tpl.get("office_line") or "").strip():
-                ol = tpl["office_line"].strip()
-                dm = re.search(r"\d{4}\s*年", ol)
-                if dm:
-                    office_name = ol[:dm.start()].strip()
-                    office_date = ol[dm.start():].strip()
-                else:
-                    office_name = ol
-            if office_name or office_date:
-                off_tbl = Table([[Paragraph(_esc(office_name), s_office),
-                                  Paragraph(_esc(office_date), s_office_r)]],
-                               colWidths=[FRAME_W * 0.45, FRAME_W * 0.55])
-                off_tbl.setStyle(TableStyle([
-                    ("ALIGN", (0, 0), (0, 0), "LEFT"),
-                    ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                    ("TOPPADDING", (0, 0), (-1, -1), 0),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ]))
-                story.append(off_tbl)
-            story.append(HRFlowable(width="100%", thickness=2.0, color=RED,
-                                    spaceBefore=4, spaceAfter=12))
-            if (tpl.get("meeting_name") or "").strip():
-                story.append(Paragraph(_esc(tpl["meeting_name"]), s_mname))
-            if (tpl.get("meeting_seq") or "").strip():
-                story.append(Paragraph(_esc(tpl["meeting_seq"]), s_seq))
+        # 统一基于解析字段渲染（org/doc_no/office_*/meeting_name/meeting_seq），
+        # 不再依赖 header_lines 的内部行序，避免落款/日期/次数错位混排。
+        if (tpl.get("org") or "").strip():
+            story.append(Paragraph(_esc(tpl["org"]), s_red_org))
+        if (tpl.get("doc_no") or "").strip():
+            story.append(Paragraph(_esc(tpl["doc_no"]), s_docno))
+        office_name = (tpl.get("office_name") or "").strip()
+        office_date = (tpl.get("office_date") or "").strip()
+        if (not office_name and not office_date) and (tpl.get("office_line") or "").strip():
+            ol = tpl["office_line"].strip()
+            dm = re.search(r"\d{4}\s*年", ol)
+            if dm:
+                office_name = ol[:dm.start()].strip()
+                office_date = ol[dm.start():].strip()
+            else:
+                office_name = ol
+        if office_name or office_date:
+            off_tbl = Table([[Paragraph(_esc(office_name), s_office),
+                              Paragraph(_esc(office_date), s_office_r)]],
+                           colWidths=[FRAME_W * 0.45, FRAME_W * 0.55])
+            off_tbl.setStyle(TableStyle([
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            story.append(off_tbl)
+        story.append(HRFlowable(width="100%", thickness=2.0, color=RED,
+                                spaceBefore=4, spaceAfter=12))
+        if (tpl.get("meeting_name") or "").strip():
+            story.append(Paragraph(_esc(tpl["meeting_name"]), s_mname))
+        if (tpl.get("meeting_seq") or "").strip():
+            story.append(Paragraph(_esc(tpl["meeting_seq"]), s_seq))
         # 导语/议题/出席列席
         if (tpl.get("intro") or "").strip():
             story.append(Paragraph(_esc_br(tpl["intro"]), s_intro))

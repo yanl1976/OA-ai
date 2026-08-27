@@ -203,6 +203,10 @@ _PARAGRAPH_START = re.compile(
 )
 # 句末标点（当前行以此结尾视为段落结束）
 _END_PUNCT = set("。！？；：”’）】」…：…")
+# 强结构名单行（出席/列席人员）：其后续行（可能因 PDF 块边界产生空行）应
+# 直接拼接为单行姓名，不应断段——区域化排版的一部分（与 derived_store.py 的
+# 出席/列席解析逻辑保持一致，把语义判断前置到提取阶段）。
+_ATTEND_LINE_RE = re.compile(r"^\s*(出席|列席|参加|参会)人员\s*[:：]")
 
 
 def _split_header_line(s: str) -> tuple:
@@ -247,47 +251,81 @@ def _split_header_line(s: str) -> tuple:
     seq_in_s = re.search(r"[（(]\s*\d{4}\s*年[^（）()]{0,40}次\s*[）)]", s)
     tail = s[seq_in_s.end():].strip() if seq_in_s else ""
 
-    # 2) 落款办公室 + 日期：…办公室/综管办 … 年…月…日
+    # 2) 落款办公室 + 日期 + 会议名称：三条独立锚点，区间互斥分段
+    #    支持：办公室在日期前/后、会议名称在日期前/后、无办公室简版。
     dm = re.search(r"\d{4}年\d{1,2}月\d{1,2}日", sn)
     okw = re.search(r"(?:办公室|综管办)", sn)
-    if not (dm and okw and okw.start() < dm.start()):
-        return [s], tail
-    # 会议名称位于日期之后、会议次数之前（先于 office_line 入栈，反转后落在 office 之后）
+    if not dm:
+        return [s], tail  # 无日期则无法稳定锚定落款，退回整行
+    # 会议名称：取最后一个「会议纪要」，向前扩展直到遇到非会议修饰词的字符
+    # （支持会议名称在日期前或后两种排版；无会议名时跳过，仅拆落款+次数）。
     meet_idx = sn.rfind("会议纪要")
-    if meet_idx < 0 or meet_idx < dm.end():
-        return [s], tail
-    meeting_name = sn[dm.end(): meet_idx + 4]
-    result.append(meeting_name)
+    meeting_name = ""
+    if meet_idx >= 0:
+        _MEET_WORDS = set("会议纪要坚持办公总经理")  # 向左扩界用的会议修饰词（不含单位结尾词）
+        ms = meet_idx
+        while ms > 0 and sn[ms - 1] in _MEET_WORDS:
+            ms -= 1
+        meet_start, meet_end = ms, meet_idx + 4
+        meeting_name = sn[meet_start: meet_end]
+    else:
+        # 无会议名：落款起点从日期起（单位行留空，避免日期被误当单位行重复）
+        meet_start, meet_end = dm.start(), dm.start()
 
-    # 落款办公室名应包含前缀（如"天传所集团综管办"），向前扩展直到"号"等文号边界
-    office_start = okw.start()
-    search_seg = sn[max(0, office_start - 30):office_start]
-    hao_pos = search_seg.rfind("号")
-    if hao_pos >= 0:
-        office_start = max(0, office_start - 30) + hao_pos + 1
-    office_line = sn[office_start: dm.end()]
-    result.append(office_line)
+    # 落款区间：覆盖「办公室 + 日期」，但终点不含会议名称
+    #   - 有办公室：起点 = 办公室前最近的单位名结尾词；终点 = max(办公室尾, 日期尾)
+    #   - 无办公室：落款行 = 日期本身
+    if okw:
+        office_start = okw.start()
+        search_seg = sn[max(0, office_start - 40):office_start]
+        unit_end = -1
+        for kw in ("号", "集团", "公司", "研究所", "研究院", "局", "院", "委员会", "部"):
+            p = search_seg.rfind(kw)
+            if p >= 0:
+                unit_end = p + len(kw)
+                break
+        if unit_end >= 0:
+            office_start = max(0, office_start - 40) + unit_end
+        office_end = max(okw.end(), dm.end())
+        # 若会议名称在日期之后（meet_start >= office_end），落款终点只到 office_end（不含会议名）
+        if meet_start >= office_end:
+            office_end = min(office_end, meet_start)
+        office_line = sn[office_start: office_end]
+    else:
+        office_line = dm.group(0)  # 无办公室关键字，落款行仅含日期
+        office_start = dm.start()
+    # 若会议名称在落款之前（meet_end <= office_start），落款起点从日期起（会议名已单独成行）
+    if meet_end <= office_start:
+        office_line = sn[dm.start(): max(okw.end() if okw else dm.end(), dm.end())]
 
-    # 3) 单位名 + 部门纪要 + 文号：日期之前的部分
-    #    形如 …集团有限公司纪要天研司会议纪要〔2024〕59号
-    rest = sn[:office_start]
+    # 单位/文号区间：sn 开头 到 min(落款起点, 会议名起点)
+    unit_cut = min(office_start, meet_start)
+    rest = sn[:unit_cut]
     docm = re.search(r"〔[^〕]{0,20}〕\d+号", rest)
-    if not docm:
-        return [s], tail
-    jiyao_idx = rest.rfind("会议纪要", 0, docm.start())  # 部门"会议纪要"起始
-    if jiyao_idx < 0:
-        return [s], tail
-    unit_jiyao = rest.rfind("纪要", 0, jiyao_idx)        # 单位名末尾"纪要"
-    if unit_jiyao < 0:
-        return [s], tail
-    dept_line = rest[unit_jiyao + 2: docm.end()]   # 天研司会议纪要〔…〕号
-    unit_line = rest[:unit_jiyao + 2]              # 天水电气传动研究所集团有限公司纪要
-    result.append(dept_line)
-    result.append(unit_line)
+    if docm:
+        jiyao_idx = rest.rfind("会议纪要", 0, docm.start())
+        if jiyao_idx < 0:
+            return [s], tail
+        unit_jiyao = rest.rfind("纪要", 0, jiyao_idx)
+        if unit_jiyao < 0:
+            return [s], tail
+        dept_line = rest[unit_jiyao + 2: docm.end()]
+        unit_line = rest[:unit_jiyao + 2]
+        result.append(dept_line)
+        result.append(unit_line)
+    else:
+        if rest.strip():
+            result.append(rest.strip())
+    # 收集顺序（reverse 前）：[次数, 会议名, 落款, 单位/文号]
+    # 追加会议名与落款，使 reverse 后变为 [单位, 文号, 落款, 会议名, 次数]
+    # （与 parse_minutes 第241-258行消费 hlines 的顺序一致）
+    if meeting_name:
+        result.append(meeting_name)
+    result.append(office_line)
 
     result.reverse()
     final = [r for r in result if r.strip()]
-    if len(final) < 4:
+    if len(final) < 2:
         return [s], tail
     return final, tail
 
@@ -395,6 +433,10 @@ def _clean_pdf_text(text: str) -> str:
         ln = raw_ln[1:] if is_pagebreak else raw_ln
         s = _strip_noise(ln)
         if s == "":
+            # 名单行（出席/列席人员：）未以句号结尾时，其后续姓名可能因 PDF
+            # 块边界产生空行——此处不立即断段，保持 cur 等待续行拼接为单行姓名。
+            if cur and _ATTEND_LINE_RE.match(cur) and not cur.rstrip().endswith("。"):
+                continue
             if cur:
                 paras.append(cur)
                 cur = ""

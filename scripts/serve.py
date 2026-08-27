@@ -734,20 +734,6 @@ def kb_uploads_list():
     return jsonify(kb_store.list_uploads(q, page, page_size))
 
 
-@app.route("/api/kb/uploads/<doc_id>", methods=["DELETE"])
-@login_required("kb.upload.manage")
-def kb_upload_delete(doc_id):
-    """上传文件管理：单条软删除（移入回收站，保留可恢复），与批量接口语义一致。
-
-    注：前端 UploadManage.vue 的「删除」按钮调此接口（DELETE /api/kb/uploads/<id>），
-    此前后端未注册该路由导致 404、前端 load() 不执行、页面不刷新。
-    """
-    ok = kb_store.soft_delete_upload(doc_id)
-    if not ok:
-        return jsonify({"error": "文档不存在"}), 404
-    return jsonify({"ok": True})
-
-
 @app.route("/api/kb/upload-status")
 @login_required("kb.upload")
 def kb_upload_status():
