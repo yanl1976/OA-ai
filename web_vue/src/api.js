@@ -82,6 +82,8 @@ export const api = {
     api.put("/api/kb/document/" + id, { category }),
   deleteUpload: (id) => api.del("/api/kb/uploads/" + id),
   deleteUploadsBatch: (docIds) => api.del("/api/kb/uploads/batch", { doc_ids: docIds }),
+  // 上传后查询后台识别进度（轮询），ids 为逗号分隔的 doc_id 列表
+  uploadStatus: (ids) => api.get("/api/kb/upload-status?ids=" + encodeURIComponent(ids.join(","))),
   // 回收站
   listTrash: (params = {}) => {
     const q = new URLSearchParams();

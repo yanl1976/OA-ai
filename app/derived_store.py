@@ -58,7 +58,7 @@ _OFFICE_RE = re.compile(r"办公室.+?\d{4}\s*年")
 _DATE_RE = re.compile(r"\d{4}\s*年.*?日")
 _SEQ_RE = re.compile(r"（.+?次）")
 _ATTEND_RE = re.compile(r"^\s*(出\s*席|列\s*席)\s*人员\s*[:：]?")
-_ITEM_HEAD_RE = re.compile(r"^\s*([0-9]{1,2}|[一二三四五六七八九十百零]+)\s*[\.、．]")
+_ITEM_HEAD_RE = re.compile(r"^\s*((?:[0-9]{1,2}(?![\d]))|[一二三四五六七八九十百零]+)\s*[\.、．]")
 
 
 def _now() -> str:
@@ -331,7 +331,12 @@ def parse_minutes(text: str) -> dict:
     # 剩余行 = 正文区（导语/议题/出席列席）
     body = body_lines
 
-    # 6) 取出席/列席人员（支持姓名跨多行续写：续行无句号且非议题头/出席列席头）
+    # 6) 取出席/列席人员（支持姓名跨多行续写）
+    # 续行截止条件：遇到议题头、或另一个出席/列席头。
+    # 注意：名单本身可能整行以句号结尾（如「…牛晓滨  。」），不能仅凭句号截断，
+    # 否则会丢失最后一行姓名。仅当续行含会议类动词（会议/听取/报告/审议等）时，
+    # 才视为名单已结束、该行为独立正文。
+    _MEETING_VERB_RE = re.compile(r"(会议|听取|报告|审议|研究|讨论|决定|通过|形成|指出|强调|要求|部署|安排)")
     present, absent = [], []
     cleaned = []
     i = 0
@@ -343,11 +348,16 @@ def parse_minutes(text: str) -> dict:
             j = i + 1
             while j < len(body):
                 nxt = body[j]
-                if _ITEM_HEAD_RE.match(nxt) or nxt.endswith("。") or _ATTEND_RE.match(nxt):
+                if _ITEM_HEAD_RE.match(nxt) or _ATTEND_RE.match(nxt):
+                    break
+                # 句号结尾：若含会议类动词则视为正文（截止），否则仍是姓名列表续接
+                if nxt.endswith("。") and _MEETING_VERB_RE.search(nxt):
                     break
                 buf.append(nxt)
                 j += 1
-            (present if m.group(1).strip().startswith("出") else absent).append("\n".join(buf))
+            (present if m.group(1).strip().startswith("出") else absent).append(
+                "".join(x for x in buf if x.strip())
+            )
             i = j
             continue
         cleaned.append(ln)
@@ -417,6 +427,49 @@ def parse_minutes(text: str) -> dict:
     }
 
 
+def _indent_after_lead(text: str) -> str:
+    """规范「如下：」引导句的排版。
+
+    会议纪要中「具体分配如下：」「内容如下：」这类引导句后，紧接的
+    实质性内容（如「直接责任人……承担10%……」）应另起一段并首行缩进
+    2 个全角空格，而非直接接在冒号后成为同一段的续写。
+
+    本函数把「如下：」后非空白、且当前未另起段落的内容，拆分为
+    「引导句尾行」+「换行 + 两个全角空格 + 续写内容」，使前端
+    （pre-wrap）与 PDF（<br/>）均呈现正确缩进。
+
+    注意：仅当「如下：」后还有内容且其后未以换行开头时才处理；若原
+    文本已是「如下：\\n　　内容」则不重复添加。
+    """
+    if not text:
+        return text
+    # 找到所有「如下：/如下:」
+    out_parts = []
+    last = 0
+    for m in re.finditer(r"如下[：:]", text):
+        end = m.end()
+        out_parts.append(text[last:end])
+        last = end
+        rest = text[end:]
+        # 去掉开头空白（若已换行则保留换行，仅补缩进）
+        if rest.startswith("\n"):
+            # 已是换行，确保换行后有两空格缩进
+            stripped = rest.lstrip("\n")
+            if not stripped.startswith("　　"):
+                out_parts.append("\n　　")
+                out_parts.append(stripped)
+            else:
+                out_parts.append(rest)
+        else:
+            # 直接接内容：插入换行 + 两空格缩进
+            out_parts.append("\n　　" + rest)
+            last = len(text)
+            break
+    if last < len(text):
+        out_parts.append(text[last:])
+    return "".join(out_parts)
+
+
 def render_minutes(struct: dict) -> str:
     """将模板结构化字段重排为标准纪要纯文本（用于存储/检索/回退展示）。"""
     if not struct:
@@ -441,7 +494,7 @@ def render_minutes(struct: dict) -> str:
             parts.append(t)
         b = (it.get("body") or "").strip()
         if b:
-            parts.append(b)
+            parts.append(_indent_after_lead(b))
         d = (it.get("decision") or "").strip()
         if d:
             parts.append(d)

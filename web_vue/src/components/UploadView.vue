@@ -144,12 +144,53 @@ async function upload() {
     localStorage.setItem(LS_KEY, category.value);
     await loadCats();   // 刷新分类下拉（可能新建了自动分类）
     emit("uploaded");    // 通知外壳刷新侧栏分类树/文档计数
+    // 上传完成的文件进入后台提取队列（异步识别+索引），轮询展示识别进度
+    const ids = okList.map((x) => x.doc_id).filter(Boolean);
+    if (ids.length) pollRecognition(ids);
   } catch (e) {
     notify(e.message, "err");
   } finally {
     uploading.value = false;
     progress.value = { done: 0, total: 0 };
   }
+}
+
+// ---- 上传后后台识别进度（轻量轮询，不阻塞上传完成提示）----
+const recognizing = ref(false);
+const recogDone = ref(0);
+const recogTotal = ref(0);
+let _recogTimer = null;
+
+async function pollRecognition(ids) {
+  if (_recogTimer) { clearTimeout(_recogTimer); _recogTimer = null; }
+  recognizing.value = true;
+  recogTotal.value = ids.length;
+  recogDone.value = 0;
+  const MAX_POLLS = 40;   // 最多轮询 ~60s（1.5s 一次），超时则停止轮询（后台仍在跑，可去管理页看状态）
+  let polls = 0;
+  const tick = async () => {
+    if (!recognizing.value) return;
+    try {
+      const r = await api.uploadStatus(ids);
+      const results = r.results || [];
+      const done = results.filter((x) => x.indexed).length;
+      recogDone.value = done;
+      if (done >= ids.length) {
+        recognizing.value = false;
+        notify("后台识别完成，已可检索", "ok");
+        emit("uploaded");
+        return;
+      }
+    } catch (e) { /* 忽略单次轮询错误，继续 */ }
+    polls += 1;
+    if (polls >= MAX_POLLS) {
+      recognizing.value = false;
+      notify("后台仍在识别（" + recogDone.value + "/" + ids.length + "），稍后可在「上传管理」查看状态", "warn");
+      return;
+    }
+    _recogTimer = setTimeout(tick, 1500);
+  };
+  tick();
 }
 
 // ---- 批量目录上传（zip 压缩包）----
@@ -225,6 +266,9 @@ onMounted(loadCats);
     <p class="file-hint" v-if="uploading && progress.total">
       正在处理 {{ progress.done }} / {{ progress.total }}
     </p>
+    <p class="recog-hint" v-if="recognizing">
+      <span class="spin">🔄</span> 后台识别中：{{ recogDone }} / {{ recogTotal }}（识别完成后即可检索，可先去「上传管理」查看）
+    </p>
   </div>
 
   <div class="card card-pad" style="max-width: 560px; margin-top: 18px">
@@ -289,4 +333,7 @@ onMounted(loadCats);
 .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fsize { color: var(--muted, #888); font-size: 12px; }
 .link { color: var(--primary, #2b7de9); cursor: pointer; text-decoration: underline; }
+.recog-hint { margin-top: 8px; color: #b9770e; font-size: 13px; }
+.recog-hint .spin { display: inline-block; animation: recog-spin 1.2s linear infinite; }
+@keyframes recog-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 </style>

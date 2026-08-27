@@ -642,6 +642,7 @@ def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
             "stored": bool(p),
             "storage_path": u.get("stored_path"),
             "mimetype": u.get("mimetype"),
+            "indexed": bool(u.get("indexed")),
         })
     items.sort(key=lambda d: d.get("created_at") or "", reverse=True)
     if q:

@@ -139,7 +139,7 @@ onMounted(() => { loadCats(); load(); });
   <div class="card card-pad">
     <table class="table">
       <thead>
-        <tr><th style="width:40px"><input type="checkbox" v-model="allChecked" title="全选本页" /></th><th>文件名</th><th>归类</th><th>标签</th><th>年代</th><th>字数</th><th>原文件</th><th>上传时间</th><th>操作</th></tr>
+        <tr><th style="width:40px"><input type="checkbox" v-model="allChecked" title="全选本页" /></th><th>文件名</th><th>归类</th><th>标签</th><th>年代</th><th>字数</th><th>原文件</th><th>识别状态</th><th>上传时间</th><th>操作</th></tr>
       </thead>
       <tbody>
         <tr v-for="d in items" :key="d.doc_id">
@@ -166,6 +166,10 @@ onMounted(() => { loadCats(); load(); });
             <span v-if="d.stored" class="badge role" :title="d.storage_path">已归档</span>
             <span v-else class="badge danger" title="原始二进制文件缺失，预览将回退为文本重排 PDF">原文件不存在</span>
           </td>
+          <td class="mid">
+            <span v-if="d.indexed" class="badge role" title="后台已提取文本并入索引，可检索">✅ 已识别</span>
+            <span v-else class="badge warn" title="后台正在提取文本/建索引，稍候即可检索">🔄 识别中</span>
+          </td>
           <td class="mid muted">{{ (d.created_at || "").slice(0, 19).replace("T", " ") }}</td>
           <td class="mid">
             <template v-if="reclassId === d.doc_id">
@@ -179,7 +183,7 @@ onMounted(() => { loadCats(); load(); });
             </template>
           </td>
         </tr>
-        <tr v-if="!items.length"><td colspan="8" class="loading">暂无上传文件</td></tr>
+        <tr v-if="!items.length"><td colspan="9" class="loading">暂无上传文件</td></tr>
       </tbody>
     </table>
 

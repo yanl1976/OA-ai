@@ -69,6 +69,22 @@ def _esc_br(s: str) -> str:
     return _esc(s).replace("\n", "<br/>")
 
 
+def _split_indent_paras(text: str) -> list:
+    """按换行拆分正文体为多个段落，供 PDF 逐段渲染（每段自带首行缩进）。
+
+    - 以 \n 切分；
+    - 去掉每行行首的「两个全角空格」缩进（缩进交给 ParagraphStyle 的
+      firstLineIndent，避免双重缩进）；
+    - 空行跳过，避免生成空白段落。
+    """
+    paras = []
+    for ln in (text or "").split("\n"):
+        ln = ln.strip("　 ")  # 去掉全角/半角行首空白
+        if ln:
+            paras.append(ln)
+    return paras
+
+
 def _fit_size(text: str, fontname: str, base: float, max_w: float) -> float:
     """若文本宽度超过 max_w，则按比例缩小字号以保证单行显示（红头不允许换行）。"""
     from reportlab.pdfbase import pdfmetrics
@@ -258,9 +274,11 @@ def build_derived_pdf(meta: dict) -> bytes:
                     title = re.sub(r"^\s*(?:[一二三四五六七八九十]+、|\d+[.．、])\s*", "", title)
                 story.append(Paragraph(_esc(title), s_item_title))
             if (it.get("body") or "").strip():
-                story.append(Paragraph(_esc_br(it["body"]), s_item_body))
+                for para in _split_indent_paras(it["body"]):
+                    story.append(Paragraph(_esc_br(para), s_item_body))
             if (it.get("decision") or "").strip():
-                story.append(Paragraph(_esc_br(it["decision"]), s_item_body))
+                for para in _split_indent_paras(it["decision"]):
+                    story.append(Paragraph(_esc_br(para), s_item_body))
         if (tpl.get("present") or "").strip():
             story.append(Paragraph(_esc_br(tpl["present"]), s_attend))
         if (tpl.get("absent") or "").strip():

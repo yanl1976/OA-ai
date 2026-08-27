@@ -734,6 +734,45 @@ def kb_uploads_list():
     return jsonify(kb_store.list_uploads(q, page, page_size))
 
 
+@app.route("/api/kb/uploads/<doc_id>", methods=["DELETE"])
+@login_required("kb.upload.manage")
+def kb_upload_delete(doc_id):
+    """上传文件管理：单条软删除（移入回收站，保留可恢复），与批量接口语义一致。
+
+    注：前端 UploadManage.vue 的「删除」按钮调此接口（DELETE /api/kb/uploads/<id>），
+    此前后端未注册该路由导致 404、前端 load() 不执行、页面不刷新。
+    """
+    ok = kb_store.soft_delete_upload(doc_id)
+    if not ok:
+        return jsonify({"error": "文档不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/kb/upload-status")
+@login_required("kb.upload")
+def kb_upload_status():
+    """轻量查询若干上传文档的识别进度（供前端轮询展示后台提取状态）。
+
+    返回 {results: [{doc_id, indexed, category}]}，indexed=1 表示后台已提取文本并
+    入索引、可检索；=0 表示仍在后台队列中等待/识别中。
+    """
+    ids = request.args.get("ids", "").strip()
+    doc_ids = [x for x in ids.split(",") if x]
+    ups = {u.get("doc_id"): u for u in kb_store._load_uploads()}
+    results = []
+    for d in doc_ids:
+        u = ups.get(d)
+        if u:
+            results.append({
+                "doc_id": d,
+                "indexed": bool(u.get("indexed")),
+                "category": u.get("category", "未分类"),
+            })
+        else:
+            results.append({"doc_id": d, "indexed": False, "category": None})
+    return jsonify({"results": results})
+
+
 @app.route("/api/kb/document/<doc_id>", methods=["PUT"])
 @login_required("kb.upload.manage")
 def kb_doc_reclassify(doc_id):
