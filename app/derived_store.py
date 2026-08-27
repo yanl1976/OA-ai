@@ -654,13 +654,21 @@ def update_derived(derived_id: str, data: dict) -> dict or None:
 
 def delete_derived(derived_id: str) -> bool:
     items = _load()
-    new_items = [d for d in items if d.get("id") != derived_id]
-    if len(new_items) == len(items):
+    target = next((d for d in items if d.get("id") == derived_id), None)
+    if not target:
         return False
+    pdf_path = target.get("pdf_path")   # 先取出 pdf_path，再删记录（否则 _save 后读不到）
+    new_items = [d for d in items if d.get("id") != derived_id]
     _save(new_items)
     # 一并清理关联的二次生成 PDF 文件
-    try:
-        delete_derived_pdf(derived_id)
-    except Exception:
-        pass
+    if pdf_path:
+        p = os.path.join(KB_DIR, pdf_path)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+            od = os.path.dirname(p)
+            if od.startswith(PDF_ROOT) and os.path.isdir(od) and not os.listdir(od):
+                os.rmdir(od)
+        except Exception:
+            pass
     return True

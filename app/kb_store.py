@@ -267,6 +267,8 @@ def _all_browse_docs() -> list:
     for d in docs:
         seen.add(d.get("doc_id"))
     for u in _load_uploads():
+        if u.get("deleted"):
+            continue  # 软删除（回收站）文档不在知识浏览中展示
         if u["doc_id"] not in seen:
             docs.append(_upload_to_doc(u))
             seen.add(u["doc_id"])
@@ -486,6 +488,95 @@ def save_upload(filename: str, category: str, text: str, raw_bytes: bytes = None
     return doc_id
 
 
+def _save_uploads(ups: list):
+    """原子写入 uploads.json（先写临时文件再 rename，避免并发/崩溃损坏）。"""
+    tmp = UPLOAD_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ups, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, UPLOAD_FILE)
+
+
+def _doc_id_for(filename: str, category: str, raw_bytes: bytes) -> str:
+    """稳定的 doc_id：仅依赖 文件名+分类+原始字节数（与提取文本长度无关），
+    使「先落盘(raw) → 后补文本(update)」两次写入指向同一条 entry。"""
+    return "up_%d" % (abs(hash(filename + "|" + category + "|" + str(len(raw_bytes)))) % (10 ** 12))
+
+
+def save_upload_raw(filename: str, category: str, raw_bytes: bytes) -> str:
+    """仅落盘原始二进制 + 占位 entry（text 暂空），极快，供上传接口同步返回。
+
+    真正的文本提取/结构化（extract + post_process）由后台任务异步补写，
+    见 update_upload_text()。返回稳定 doc_id。
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(UPLOAD_FILES_DIR, exist_ok=True)
+    ext = os.path.splitext(filename)[1].lower()
+    doc_id = _doc_id_for(filename, category, raw_bytes)
+    year = _extract_year(filename, "")
+    stored_rel = None
+    mimetype = None
+    if raw_bytes is not None:
+        rel = _stored_rel_for(category, year, doc_id, ext)
+        abs_path = os.path.join(UPLOAD_DIR, rel)
+        try:
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "wb") as f:
+                f.write(raw_bytes)
+            if os.path.exists(abs_path) and os.path.getsize(abs_path) == len(raw_bytes):
+                stored_rel = rel
+                mimetype = mimetype_for_ext(ext)
+            else:
+                try:
+                    if os.path.exists(abs_path):
+                        os.remove(abs_path)
+                except Exception:
+                    pass
+        except Exception:
+            stored_rel = None
+    ups = _load_uploads()
+    entry = {"doc_id": doc_id, "filename": filename, "category": category,
+             "pages": 1, "label": filename,
+             "text": "", "created_at": _now(),
+             "stored_path": stored_rel,
+             "mimetype": mimetype,
+             "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None,
+             "indexed": 0}   # indexed=0 标记尚未经后台提取/建索引
+    existed = False
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            u.update(entry)
+            existed = True
+            break
+    else:
+        ups.append(entry)
+    _save_uploads(ups)
+    uid, uname = audit_current_user()
+    audit_log("doc.upload", doc_id, "%s -> %s (raw, 待后台提取)" % (filename, category), uid, uname)
+    return doc_id
+
+
+def update_upload_text_async(doc_id: str, text: str, category: str = None, year: int = None) -> bool:
+    """后台任务补写提取文本与结构化结果，并标记已索引（不在此处重建索引）。
+
+    与 update_upload_text（在线编辑，同步重建索引）分离：后台提取由 worker
+    在队列空闲时统一全量重建，避免每个文件各重建一次。
+    按 doc_id 定位 entry（与 save_upload_raw 同公式），补充 text/pages/year，
+    若后台重新判定了分类（category 非空且与原值不同）也一并更新。
+    """
+    ups = _load_uploads()
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            u["text"] = text
+            u["pages"] = max(1, text.count("\n") // 40 + 1)
+            if category is not None and category != u.get("category"):
+                u["category"] = category
+            u["year"] = year if year is not None else u.get("year")
+            u["indexed"] = 1
+            _save_uploads(ups)
+            return True
+    return False
+
+
 def get_upload_binary(doc_id: str):
     """返回上传文档的原始二进制 (abs_path, mimetype)，无则返回 (None, None)。
 
@@ -576,6 +667,9 @@ def delete_upload(doc_id: str) -> bool:
     delete_upload_binary(doc_id)
     with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
         json.dump(new_ups, f, ensure_ascii=False, indent=2)
+    # 一并清理该上传文档关联的「二次生成纪要」派生记录与 PDF（提取文件），
+    # 避免删除源码后仍残留衍生内容（知识浏览“衍生文档”/派生 PDF）。
+    _purge_derived_for_doc(doc_id)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -586,6 +680,17 @@ def delete_upload(doc_id: str) -> bool:
     uid, uname = audit_current_user()
     audit_log("doc.purge", doc_id, "彻底删除文档", uid, uname)
     return True
+
+
+def _purge_derived_for_doc(doc_id: str):
+    """删除某上传文档关联的全部派生纪要记录与二次生成 PDF（按 source_doc_id）。"""
+    try:
+        import derived_store
+        items = derived_store.list_derived(source_doc_id=doc_id)
+        for d in items:
+            derived_store.delete_derived(d.get("id"))
+    except Exception as e:  # noqa: BLE001
+        print("[delete] 清理派生纪要失败 %s: %s" % (doc_id, e))
 
 
 def delete_uploads_batch(doc_ids: list) -> dict:
@@ -605,6 +710,7 @@ def delete_uploads_batch(doc_ids: list) -> dict:
         return {"deleted": 0, "not_found": not_found}
     for d in doc_ids:
         delete_upload_binary(d)
+        _purge_derived_for_doc(d)
     with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
         json.dump(new_ups, f, ensure_ascii=False, indent=2)
     try:

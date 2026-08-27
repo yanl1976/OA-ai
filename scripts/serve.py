@@ -70,8 +70,98 @@ import io
 import shutil
 import extract_text
 import pdf_make
+import threading
+import queue as _queue
+import time
 
 app = Flask(__name__, static_folder=None)
+
+# ===================== 后台异步提取 / 建索引 =====================
+# 上传接口只做「落盘 + 立即返回」，文件文本提取(extract+post_process) 与
+# 索引重建(BM25+向量) 由后台 worker 线程串行处理，避免前端因大文件/全量重建
+# 重建而长时间阻塞在「上传中」。
+_EXTRACT_Q = _queue.Queue()
+_INDEX_DIRTY = threading.Event()      # 有待建索引的脏文档
+_WORKER_STARTED = False
+
+
+def _rebuild_indexes():
+    """全量重建 BM25 + 向量索引（后台调用，不阻塞请求线程）。"""
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        vec_store.rebuild(kb_store.iter_all_documents())
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("[background] 索引重建失败: %s" % e)
+        return False
+
+
+def _extract_worker():
+    while True:
+        try:
+            task = _EXTRACT_Q.get(timeout=1.0)
+        except _queue.Empty:
+            # 队列空：若期间有脏文档，做一次全量重建后清标记
+            if _INDEX_DIRTY.is_set():
+                _rebuild_indexes()
+                _INDEX_DIRTY.clear()
+            continue
+        try:
+            _do_extract_task(task)
+            _INDEX_DIRTY.set()   # 标记有脏文档，待队列空时重建
+        except Exception as e:  # noqa: BLE001
+            print("[background] 提取任务失败 %s: %s" % (task.get("filename"), e))
+        finally:
+            _EXTRACT_Q.task_done()
+
+
+def _do_extract_task(task):
+    """执行单个文件的文本提取 + 结构化，并补写 entry。"""
+    filename = task["filename"]
+    init_cat = task.get("category") or "未分类"
+    doc_id = task["doc_id"]
+    cat_hint = task.get("cat_hint") or ""
+    # 读取原始二进制
+    bin_path, _mime = kb_store.get_upload_binary(doc_id)
+    if not bin_path or not os.path.exists(bin_path):
+        print("[background] 找不到原始文件，跳过: %s" % doc_id)
+        kb_store.update_upload_text_async(doc_id, "", init_cat)
+        return
+    with open(bin_path, "rb") as f:
+        raw = f.read()
+    text, warn = extract_text.extract(raw, filename)
+    if not text.strip():
+        warn = (("%s；" % warn) if warn else "") + "未提取到文本内容"
+    # 分类：显式 hint 优先；否则按文件名+正文自动识别
+    if cat_hint:
+        cat = cat_hint
+    else:
+        cat = _auto_classify(filename, text) or "未分类"
+    text = extract_text.post_process(text, cat)
+    year = kb_store._extract_year(filename, text)
+    # 后台分类与初始落盘分类不同（如 raw 阶段未指定、靠正文识别出会议纪要），
+    # 移动归档文件到正确类别目录，保持磁盘归档与分类一致
+    if cat != init_cat:
+        try:
+            kb_store.reclassify_upload(doc_id, cat)
+        except Exception as e:  # noqa: BLE001
+            print("[background] 重归类失败 %s: %s" % (doc_id, e))
+    kb_store.update_upload_text_async(doc_id, text, cat, year)
+    print("[background] 已提取: %s (%s)" % (filename, cat))
+
+
+def start_extract_worker():
+    global _WORKER_STARTED
+    if _WORKER_STARTED:
+        return
+    _WORKER_STARTED = True
+    t = threading.Thread(target=_extract_worker, daemon=True)
+    t.start()
+
+
+# 应用启动时拉起后台 worker（Flask 可能在 reload/多 worker 下重复调用，用标记防重）
+start_extract_worker()
 
 # ---------- 会话密钥（稳定持久化） ----------
 SECRET_FILE = os.path.join(DATA_DIR, "secret.key")
@@ -451,39 +541,39 @@ def kb_upload():
                             "error": "不支持的文件格式: %s（支持 txt/md/csv/docx/xlsx/pptx/pdf）" % ext})
             continue
         raw = file.read()
-        try:
-            text, warn = extract_text.extract(raw, fname)
-        except Exception as e:  # noqa: BLE001
-            results.append({"filename": fname, "ok": False, "error": "解析失败: %s" % e})
-            continue
-        if not text.strip():
-            warn = (("%s；" % warn) if warn else "") + "未提取到文本内容"
-        # 分类确定：用户显式选择优先；否则按文件名+正文自动识别（会议纪要/管理标准等，严格分流）
+        # 分类：用户显式选择优先（作为后台 hint，不重分）；否则留空，后台按正文自动识别
         if req_cat:
             cat = req_cat
+            cat_explicit = True
         else:
-            cat = _auto_classify(fname, text) or "未分类"
-        # 按文档类型做专属结构化提取（会议纪要/管理标准/默认），提升检索与预览质量
-        text = extract_text.post_process(text, cat)
-        # 保存抽取文本用于检索；同时保留原始上传二进制，使「PDF 预览」能直接展示原文件
-        doc_id = kb_store.save_upload(fname, cat, text, raw_bytes=raw)
+            cat = "未分类"        # 暂占位，后台用正文重分类
+            cat_explicit = False
+        # 仅落盘原始二进制 + 占位 entry（极快），文本提取与索引重建交给后台线程，
+        # 上传接口立即返回，避免大文件 / 全量索引重建阻塞前端。
+        try:
+            doc_id = kb_store.save_upload_raw(fname, cat, raw)
+        except Exception as e:  # noqa: BLE001
+            results.append({"filename": fname, "ok": False, "error": "保存失败: %s" % e})
+            continue
+        _EXTRACT_Q.put({
+            "filename": fname,
+            "category": cat,
+            "doc_id": doc_id,
+            "cat_hint": cat if cat_explicit else "",
+        })
         results.append({"filename": fname, "ok": True, "doc_id": doc_id,
-                        "category": cat, "warn": warn})
+                        "category": cat if cat_explicit else "(识别中)",
+                        "warn": "已保存，后台识别中"})
 
     ok_count = sum(1 for r in results if r.get("ok"))
     if ok_count == 0:
         return jsonify({"ok": False, "results": results,
                         "error": "所有文件均处理失败"}), 400
 
-    # 统一重建一次索引（含全部新上传文档）：BM25 + 向量双索引，避免逐文件重建
-    try:
-        import rag_build_index
-        rag_build_index.build_index()
-        vec_store.rebuild(kb_store.iter_all_documents())
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"ok": True, "results": results,
-                        "warn": "文档已保存（%d 个），但重建索引失败: %s" % (ok_count, e)})
-    return jsonify({"ok": True, "results": results, "count": ok_count})
+    # 不再同步重建索引：后台 worker 在队列空闲时统一重建 BM25+向量索引，
+    # 上传接口立即返回「上传成功」，识别与可检索在后台稍后完成。
+    return jsonify({"ok": True, "results": results, "count": ok_count,
+                    "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"})
 
 
 def _ensure_category(name: str, parent_id):
@@ -623,19 +713,11 @@ def kb_doc_delete(doc_id):
         return jsonify({"error": "文档不存在"}), 404
     if doc.get("source") != "upload":
         return jsonify({"error": "原始库文档不可删除，仅可删除上传文档"}), 400
-    # 同时删除关联的原始二进制文件，避免孤儿文件
-    kb_store.delete_upload_binary(doc_id)
-    up_file = os.path.join(KB_DIR, "uploads", "user_documents.json")
-    if os.path.exists(up_file):
-        ups = json.load(open(up_file, encoding="utf-8"))
-        ups = [u for u in ups if u["doc_id"] != doc_id]
-        json.dump(ups, open(up_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    try:
-        import rag_build_index
-        rag_build_index.build_index()
-        vec_store.rebuild(kb_store.iter_all_documents())
-    except Exception:
-        pass
+    # 彻底删除：移除原始二进制 + 上传条目 + 关联派生纪要 + 重建检索索引
+    # （派生清理在 kb_store.delete_upload 内统一处理，避免派生文件残留）
+    ok = kb_store.delete_upload(doc_id)
+    if not ok:
+        return jsonify({"error": "文档不存在"}), 404
     return jsonify({"ok": True})
 
 
