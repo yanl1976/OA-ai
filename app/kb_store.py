@@ -1173,3 +1173,95 @@ def kb_overview() -> dict:
         "trash_count": trash_count(),
         "recent": recent_items,
     }
+
+
+# ============ 系统初始化（清除文档 / 提取内容 / 重建索引） ============
+def _rebuild_index() -> None:
+    """统一重建 BM25 + 向量索引（封装多处重复逻辑）。"""
+    import rag_build_index
+    import vec_store
+    rag_build_index.build_index()
+    vec_store.rebuild(iter_all_documents())
+
+
+def clear_all_documents(include_trash: bool = True) -> dict:
+    """清除全部文档：删除原始二进制 + 清空 user_documents.json + 重建空索引。
+
+    默认同时清空回收站（include_trash=True），使知识库回到完全空白状态。
+    返回统计 {removed_files, removed_entries}。
+    """
+    ups = _load_uploads()
+    removed_files = 0
+    kept = []
+    for u in ups:
+        if not include_trash and u.get("deleted"):
+            kept.append(u)
+            continue
+        p = _resolve_binary_path(u)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+                removed_files += 1
+            except Exception:
+                pass
+    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+        json.dump(kept, f, ensure_ascii=False, indent=2)
+    removed_entries = len(ups) - len(kept)
+    try:
+        _rebuild_index()
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.init.clear", "-", "清空全部文档(含回收站=%s) 删除文件%d条/条目%d条"
+              % (include_trash, removed_files, removed_entries), uid, uname)
+    return {"removed_files": removed_files, "removed_entries": removed_entries}
+
+
+def reextract_all_documents() -> dict:
+    """对所有活跃上传文档重新做文本提取（extract + 结构化），并重建索引。
+
+    适用于提取规则升级后批量重抽。返回 {total, ok, failed, errors}。
+    """
+    ups = _load_uploads()
+    active = [u for u in ups if not u.get("deleted")]
+    total = len(active)
+    ok = 0
+    failed = 0
+    errors = []
+    for u in active:
+        doc_id = u.get("doc_id")
+        p = _resolve_binary_path(u)
+        if not p or not os.path.exists(p):
+            failed += 1
+            errors.append({"doc_id": doc_id, "filename": u.get("filename"), "error": "原始文件缺失"})
+            continue
+        try:
+            with open(p, "rb") as f:
+                raw = f.read()
+            text, warn = extract_text.extract(raw, u.get("filename", ""), u.get("category"))
+            if warn:
+                errors.append({"doc_id": doc_id, "filename": u.get("filename"), "warn": warn})
+            update_upload_text_async(doc_id, text, u.get("category"), u.get("year"))
+            ok += 1
+        except Exception as e:
+            failed += 1
+            errors.append({"doc_id": doc_id, "filename": u.get("filename"), "error": str(e)})
+    try:
+        _rebuild_index()
+    except Exception:
+        pass
+    uid, uname = audit_current_user()
+    audit_log("doc.init.extract", "-", "重新提取全部文档 总%d/成功%d/失败%d" % (total, ok, failed), uid, uname)
+    return {"total": total, "ok": ok, "failed": failed, "errors": errors[:50]}
+
+
+def rebuild_index_only() -> dict:
+    """仅重建 BM25 + 向量索引（不改动文档与文本）。返回 {docs} 已索引文档数。"""
+    try:
+        _rebuild_index()
+    except Exception as e:
+        return {"docs": 0, "error": str(e)}
+    docs = len(iter_all_documents())
+    uid, uname = audit_current_user()
+    audit_log("doc.init.index", "-", "重建索引 文档数%d" % docs, uid, uname)
+    return {"docs": docs}

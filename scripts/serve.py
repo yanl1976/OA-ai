@@ -890,6 +890,42 @@ def kb_doc_edit_text(doc_id):
     return jsonify({"ok": True})
 
 
+# ===================== 系统初始化（清除文档 / 提取内容 / 重建索引） =====================
+@app.route("/api/admin/init/clear", methods=["POST"])
+@login_required("kb.upload.manage")
+def admin_init_clear():
+    """清空全部文档（含回收站）+ 重建空索引。"""
+    data = request.get_json(silent=True) or {}
+    include_trash = data.get("include_trash", True)
+    try:
+        res = kb_store.clear_all_documents(include_trash=bool(include_trash))
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"error": "清除文档失败: %s" % e}), 500
+
+
+@app.route("/api/admin/init/extract", methods=["POST"])
+@login_required("kb.upload.manage")
+def admin_init_extract():
+    """对所有活跃上传文档重新提取文本并重建索引。"""
+    try:
+        res = kb_store.reextract_all_documents()
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"error": "提取内容失败: %s" % e}), 500
+
+
+@app.route("/api/admin/init/index", methods=["POST"])
+@login_required("kb.upload.manage")
+def admin_init_index():
+    """仅重建 BM25 + 向量索引。"""
+    try:
+        res = kb_store.rebuild_index_only()
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"error": "重建索引失败: %s" % e}), 500
+
+
 # ===================== 审计日志 =====================
 @app.route("/api/admin/audit")
 @login_required("system.manage")

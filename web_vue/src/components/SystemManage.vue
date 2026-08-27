@@ -64,9 +64,60 @@ async function reindex() {
   }
 }
 
+// ============ 系统初始化（清除文档 / 提取内容 / 重建索引） ============
+const busyClear = ref(false);
+const busyExtract = ref(false);
+const busyIndex = ref(false);
+
+async function initClear() {
+  if (!confirm("确定清空全部文档（含回收站）并重建空索引？此操作不可恢复。")) return;
+  busyClear.value = true;
+  try {
+    const r = await api.initClear(true);
+    notify("已清空全部文档（删除文件 %d 条 / 条目 %d 条）".replace("%d", r.removed_files).replace("%d", r.removed_entries), "ok");
+    await load();
+    activeCard.value = null;
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyClear.value = false;
+  }
+}
+
+async function initExtract() {
+  busyExtract.value = true;
+  try {
+    const r = await api.initExtract();
+    if (r.failed) {
+      notify("重提取完成：成功 %d / 失败 %d".replace("%d", r.ok).replace("%d", r.failed), "warn");
+    } else {
+      notify("重提取完成：成功 %d 篇".replace("%d", r.ok), "ok");
+    }
+    await load();
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyExtract.value = false;
+  }
+}
+
+async function initIndex() {
+  busyIndex.value = true;
+  try {
+    const r = await api.initIndex();
+    notify("索引重建完成，已索引 %d 篇".replace("%d", r.docs), "ok");
+    await load();
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyIndex.value = false;
+  }
+}
+
 const cards = [
   { key: "features", icon: "⚙", title: "功能开关", desc: "开启或关闭系统功能模块" },
   { key: "index", icon: "🔎", title: "检索索引", desc: "全文检索向量索引状态与重建" },
+  { key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引" },
   { key: "stats", icon: "📊", title: "数据统计", desc: "文档、用户与分类统计概览" },
   { key: "info", icon: "💡", title: "系统信息", desc: "运行环境与版本信息" },
 ];
@@ -79,6 +130,7 @@ function statusText(key) {
     const ok = health.value && health.value.status === "ok";
     return ok ? "运行正常" : "需关注";
   }
+  if (key === "init") return "3 项操作";
   return "";
 }
 
@@ -144,6 +196,43 @@ onMounted(load);
       <button class="btn primary" :disabled="reindexing" @click="reindex">
         {{ reindexing ? "重建中…" : "重建索引" }}
       </button>
+    </template>
+  </Modal>
+
+  <!-- 系统初始化 -->
+  <Modal :show="activeCard === 'init'" title="系统初始化" @close="activeCard = null">
+    <p class="muted">一键执行知识库初始化操作。请按需单独执行，避免误清空已上传文档。</p>
+    <div class="init-actions">
+      <div class="init-item">
+        <div class="init-meta">
+          <div class="init-name">清除文档</div>
+          <div class="muted" style="font-size: 12px">删除全部已上传文档（含回收站）并重建空索引，不可恢复。</div>
+        </div>
+        <button class="btn danger sm" :disabled="busyClear" @click="initClear">
+          {{ busyClear ? "清除中…" : "执行清除" }}
+        </button>
+      </div>
+      <div class="init-item">
+        <div class="init-meta">
+          <div class="init-name">提取内容</div>
+          <div class="muted" style="font-size: 12px">对所有已上传文档重新运行文本提取与结构化，并重建索引（提取规则升级后适用）。</div>
+        </div>
+        <button class="btn warning sm" :disabled="busyExtract" @click="initExtract">
+          {{ busyExtract ? "提取中…" : "重新提取" }}
+        </button>
+      </div>
+      <div class="init-item">
+        <div class="init-meta">
+          <div class="init-name">重建索引</div>
+          <div class="muted" style="font-size: 12px">仅重新构建 BM25 与向量索引，不改动文档与提取文本。</div>
+        </div>
+        <button class="btn primary sm" :disabled="busyIndex" @click="initIndex">
+          {{ busyIndex ? "重建中…" : "重建索引" }}
+        </button>
+      </div>
+    </div>
+    <template #actions>
+      <button class="btn" @click="activeCard = null">关闭</button>
     </template>
   </Modal>
 

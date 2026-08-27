@@ -223,6 +223,11 @@ a { color: var(--primary); text-decoration: none; }
 .feat-meta { min-width: 0; }
 .feat-name code { background: #f1f5f9; padding: 2px 7px; border-radius: 6px; font-size: 12.5px; }
 
+.init-actions { display: flex; flex-direction: column; gap: 10px; }
+.init-item { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.init-meta { min-width: 0; }
+.init-name { font-weight: 600; margin-bottom: 2px; }
+
 .info-rows { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
 .info-row { display: flex; justify-content: space-between; align-items: center; padding: 11px 4px; border-bottom: 1px dashed var(--line); font-size: 14px; }
 .info-row b { font-weight: 600; }

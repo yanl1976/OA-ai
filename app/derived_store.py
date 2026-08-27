@@ -439,22 +439,22 @@ def parse_minutes(text: str) -> dict:
         "header_lines": header.get("header_lines", []),  # 红头原始行列表
         "intro": intro,
         "items": items,
-        "present": "\n".join(present),
-        "absent": "\n".join(absent),
+        # 同一名单可能因 PDF 块边界（空行）被切成多段：合并为单段（去内部换行/
+        # 空白），真正的按区域换行（每行 per_row 人）由 _format_attendees 统一施加，
+        # 避免「张\n峰」这类孤立换行残留。
+        "present": "".join(x.strip() for x in present if x.strip()),
+        "absent": "".join(x.strip() for x in absent if x.strip()),
     }
 
 
 def _format_attendees(text: str, per_row: int = 5) -> str:
-    """把「出席人员：XXX、YYY、…、ZZZ。」按每行 per_row 人整齐排版。
-
-    会议纪要出席/列席名单通常十几人到几十人，整段塞一行既不美观也不便于阅读。
-    本函数在「XX人员：」之后、姓名列表中间，每 per_row 人插入换行 + 两个全角
-    空格缩进（与正文段落「如下：」后的缩进风格一致），使前端（pre-wrap）和
-    PDF（<br/>）均能整齐呈现。
+    """把「出席人员：XXX、YYY、…、ZZZ。」按每行 per_row 人整齐排版，姓名之间
+    用两个全角空格分隔（与红头出席/列席名单原版式一致），续行缩进 4 个全角
+    空格对齐首行姓名起点。
 
     处理规则：
     - 仅在「XX人员：」之后的姓名段内分行，「XX人员：」本身与首行同行；
-    - 按中文顿号（、）/逗号（含半角,）拆分姓名单元；
+    - 按中文顿号（、）/逗号（含半角,）拆分姓名单元，渲染时以两个全角空格连接；
     - 末尾标点（。；）保留在最后一人后；
     - 若总人数 ≤ per_row，不强制换行（保持单行即可）。
     """
@@ -465,6 +465,12 @@ def _format_attendees(text: str, per_row: int = 5) -> str:
     if not m:
         return text
     header, body = m.group(1), m.group(2).strip()
+    # 名单内部可能因 PDF 块边界产生换行（如「张\n峰」）或残留全角空格
+    # （\u3000，Python \s 不匹配），先归一化为单行，否则会被当成一个姓名
+    # 单元或残留孤立缩进，渲染出随意换行。姓名之间统一只允许顿号/逗号分隔，
+    # 换行/半角空格/全角空格一律去除。
+    body = body.replace("\n", "").replace("\r", "").replace("\u3000", "")
+    body = re.sub(r"\s+", "", body)
     # 保留末尾标点
     trail = ""
     if body and body[-1] in "。；！？":
@@ -472,16 +478,20 @@ def _format_attendees(text: str, per_row: int = 5) -> str:
         body = body[:-1]
     # 按中文/英文逗号、顿号拆分姓名单元
     names = [n.strip() for n in re.split(r"[、,,]\s*", body) if n.strip()]
+    # 姓名之间用两个全角空格分隔（红头原版式），不再用顿号
+    joined = "　　".join(names)
     if len(names) <= per_row:
-        return text  # 人数少，原样输出
+        # 人数少，原样输出——但必须用归一化后的字符串（去掉内部换行），
+        # 否则「张\n峰」这类 PDF 块边界换行会残留。
+        return header + joined + trail
     rows = []
     for i in range(0, len(names), per_row):
-        chunk = names[i:i + per_row]
-        rows.append("、".join(chunk))
-    # 首行接 header，后续行用「　　」（两个全角空格）缩进对齐
+        rows.append("　　".join(names[i:i + per_row]))
+    # 首行接 header，后续行用「　　　　」（4 个全角空格）缩进，使姓名对齐
+    # 首行姓名起点（标签「XX人员：」占约 5 字宽）。
     lines = [header + rows[0]]
     for r in rows[1:]:
-        lines.append("　　" + r)
+        lines.append("　　　　" + r)
     if trail:
         lines[-1] = lines[-1] + trail
     return "\n".join(lines)

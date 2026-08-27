@@ -170,7 +170,7 @@ def build_derived_pdf(meta: dict) -> bytes:
                                  textColor=colors.black)
     s_attend = ParagraphStyle("att", fontName=_font("fangsong"), fontSize=15.9,
                               leading=24, alignment=TA_LEFT, spaceBefore=6,
-                              firstLineIndent=FIRST_INDENT, wordWrap="CJK",
+                              firstLineIndent=0, wordWrap="CJK",
                               textColor=colors.black)
 
     buf = io.BytesIO()
@@ -237,10 +237,13 @@ def build_derived_pdf(meta: dict) -> bytes:
             if (it.get("decision") or "").strip():
                 for para in _split_indent_paras(it["decision"]):
                     story.append(Paragraph(_esc_br(para), s_item_body))
+        # 出席/列席名单：按红头原版式排版（姓名两全角空格分隔、每行 5 人、
+        # 续行 4 全角空格缩进对齐姓名起点），与前端预览一致。
+        from derived_store import _format_attendees as _fmt_att
         if (tpl.get("present") or "").strip():
-            story.append(Paragraph(_esc_br(tpl["present"]), s_attend))
+            story.append(Paragraph(_esc_br(_fmt_att(tpl["present"])), s_attend))
         if (tpl.get("absent") or "").strip():
-            story.append(Paragraph(_esc_br(tpl["absent"]), s_attend))
+            story.append(Paragraph(_esc_br(_fmt_att(tpl["absent"])), s_attend))
 
         doc.build(story)
         return buf.getvalue()

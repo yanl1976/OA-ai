@@ -95,6 +95,11 @@ export const api = {
   restoreUpload: (docId) => api.post("/api/kb/trash/" + docId),
   purgeUpload: (docId) => api.del("/api/kb/trash/" + docId),
   purgeUploadsBatch: (docIds) => api.del("/api/kb/trash/batch", { doc_ids: docIds }),
+  // 系统初始化（清除文档 / 提取内容 / 重建索引）
+  initClear: (includeTrash) =>
+    api.post("/api/admin/init/clear", { include_trash: includeTrash !== false }),
+  initExtract: () => api.post("/api/admin/init/extract"),
+  initIndex: () => api.post("/api/admin/init/index"),
   // 标签
   listTags: () => api.get("/api/kb/tags"),
   setDocTags: (docId, tags) => api.put("/api/kb/document/" + docId + "/tags", { tags }),
