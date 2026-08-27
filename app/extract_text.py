@@ -775,7 +775,8 @@ _CATEGORY_KIND_MAP = {
     "07.科技管理类": "standard", "08.人力资源类": "standard", "09.财审类": "standard",
     "10.营销管理类": "standard", "11.采购管理类": "standard", "12.生产管理类": "standard",
     "13.质量管理类": "standard", "14.安全环保管理类": "standard", "15.安保物业类": "standard",
-    "16.合规管理类": "standard",
+    # 16.合规管理类：多为「指引/办法/规定」类（章/条结构），非数字多级编号标准条款
+    "16.合规管理类": "regulation",
 }
 
 
@@ -802,6 +803,9 @@ def detect_kind(text):
     # 会议纪要优先：含『会议纪要』且含决议/出席要素 -> minutes
     if "会议纪要" in head and re.search(r"会议决定|出席人员|列席人员|主持人|会议时间", body):
         return "minutes"
+    # 规章制度/指引：含『第X章』且『第X条』（章/条结构，区别于标准类的数字多级编号）
+    if re.search(r"第[0-9零一二三四五六七八九十百千]+章", head) and re.search(r"第[0-9零一二三四五六七八九十百千]+条", body):
+        return "regulation"
     # 管理标准：含『管理标准/工作标准/技术标准』字样（不强制 Q/ 编号，企标常无编号）
     # 或正文出现典型标准条款结构（范围/规范性引用文件/术语和定义 连续出现）
     if re.search(r"管理标准|工作标准|技术标准", head):
@@ -1032,6 +1036,84 @@ def process_standard(text):
             cur = (cur + " " + s).strip() if cur else s
     flush()
     return "\n\n".join(out)
+
+
+# ---------------- 规章制度/指引 后处理器（章、条、项结构） ----------------
+# 适用于「二级文件/指引/制度/规定/办法/规程」类：层级为 第X章 / 第X条 / （一）（二） / 一、二、
+_REG_CHAP_RE = re.compile(r"^\s*第[0-9零一二三四五六七八九十百千]+章")
+_REG_ART_RE = re.compile(r"^\s*第[0-9零一二三四五六七八九十百千]+条")
+_REG_ITEM_RE = re.compile(r"^\s*[（(][0-9零一二三四五六七八九十]+[)）]")
+_REG_SUB_RE = re.compile(r"^\s*[一二三四五六七八九十]+、")
+# 流内文档编号噪声（如 2022GLBF-HGGL / 2022GLBF-HGGL 出现在正文流里）
+_REG_DOCNO_INLINE_RE = re.compile(r"\b\d{4}[A-Z]{2,}-[A-Z]{2,}\b")
+# 开头单位名 + 文件类型 + 编号 行（封面副标题噪声）
+_REG_COVER_RE = re.compile(r"^天水电气传动研究所集团有限公司[^\n]*?(指引|制度|规定|办法|规程|标准)[^\n]*$")
+
+
+def _split_regulation_line(s):
+    """把一行内粘连的多个『章/条/项/子项』切分为独立片段（OCR 同行粘连）。"""
+    parts = []
+    # 以 第X章 / 第X条 / （一） / 一、 为边界切分（章也作为边界，避免章与条粘连同一段）
+    for seg in re.split(r"(?=(?:第[0-9零一二三四五六七八九十百千]+[章条])|(?:[（(][0-9零一二三四五六七八九十]+[)）])|(?:[一二三四五六七八九十]+、))", s):
+        seg = seg.strip()
+        if seg:
+            parts.append(seg)
+    return parts
+
+
+@register("regulation")
+def process_regulation(text):
+    """规章制度/指引：章、条、项（一）、子项一、 分层独立成段，清除流内编号噪声。"""
+    # 清流内文档编号噪声（页眉页脚已在 _clean_pdf_layout 处理，此处处理正文流中的编号串）
+    text = _REG_DOCNO_INLINE_RE.sub("", text)
+    paras = []
+    cur_block = None  # 当前条款/项缓冲（用于把条款正文合并到条号下）
+
+    def flush_block():
+        nonlocal cur_block
+        if cur_block:
+            paras.append(cur_block)
+            cur_block = None
+
+    for raw in text.split("\n"):
+        ln = raw.strip()
+        if not ln:
+            # 空行：若当前有缓冲且以句末标点结尾则断段，否则继续合并
+            continue
+        # 封面单位名行跳过
+        if _REG_COVER_RE.match(ln):
+            continue
+        # 行内粘连切分（OCR 把多章/条/项挤在一行）；单行无多层级时切分返回原样，无副作用
+        segs = _split_regulation_line(ln)
+        for s in segs:
+            if not s:
+                continue
+            if _REG_CHAP_RE.match(s):
+                # 章标题独立成段
+                cur_block = None
+                paras.append(s)
+            elif _REG_ART_RE.match(s):
+                # 条：独立成段（条号 + 正文）
+                flush_block()
+                cur_block = s
+            elif _REG_ITEM_RE.match(s):
+                # 项（一）：作为当前条下的子段落，独立成段
+                if cur_block:
+                    flush_block()
+                paras.append(s)
+            elif _REG_SUB_RE.match(s):
+                # 子项 一、：独立成段
+                if cur_block:
+                    flush_block()
+                paras.append(s)
+            else:
+                # 普通正文：并入当前条/项缓冲（合并为连贯段落）
+                if cur_block:
+                    cur_block = cur_block + " " + s
+                else:
+                    cur_block = s
+    flush_block()
+    return "\n\n".join(paras)
 
 
 # ---------------- 会议纪要 后处理器（复用既有红头/议题结构化逻辑） ----------------

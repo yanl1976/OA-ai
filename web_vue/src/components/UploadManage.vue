@@ -96,8 +96,27 @@ async function load() {
 }
 
 function search() { page.value = 1; load(); }
-function goPage(p) { page.value = p; load(); }
+function goPage(p) { page.value = Math.min(Math.max(1, p), totalPages()); load(); }
 const totalPages = () => Math.max(1, Math.ceil(total.value / pageSize));
+
+// 页码序列：1、2、3、4…末页 一字排开，超长时折叠为 [1, …, cur-1,cur,cur+1, …, last]
+const pageList = computed(() => {
+  const tp = totalPages();
+  if (tp <= 7) return Array.from({ length: tp }, (_, i) => i + 1);
+  const cur = page.value;
+  const out = new Set([1, tp, cur]);
+  if (cur - 1 > 1) out.add(cur - 1);
+  if (cur + 1 < tp) out.add(cur + 1);
+  const arr = Array.from(out).sort((a, b) => a - b);
+  const res = [];
+  let prev = 0;
+  for (const n of arr) {
+    if (n - prev > 1) res.push("…");
+    res.push(n);
+    prev = n;
+  }
+  return res;
+});
 
 function openDoc(d) { openDocDetail(d.doc_id); }
 
@@ -227,10 +246,17 @@ onUnmounted(() => stopPolling());
       </tbody>
     </table>
 
-    <div class="pager toolbar" v-if="totalPages() > 1">
-      <button class="btn sm" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
-      <span class="muted">第 {{ page }} / {{ totalPages() }} 页</span>
-      <button class="btn sm" :disabled="page >= totalPages()" @click="goPage(page + 1)">下一页</button>
+    <div class="pager" v-if="totalPages() > 1">
+      <button class="pg" :class="{ cur: page === 1 }" :disabled="page === 1"
+              @click="goPage(1)">首页</button>
+      <button class="pg" v-for="p in pageList" :key="p"
+              :class="{ cur: p === page, gap: p === '…' }"
+              :disabled="p === '…' || p === page"
+              @click="p !== '…' && goPage(p)">
+        {{ p === '…' ? '…' : p }}
+      </button>
+      <button class="pg" :class="{ cur: page === totalPages() }" :disabled="page === totalPages()"
+              @click="goPage(totalPages())">页末</button>
     </div>
   </div>
 
@@ -248,6 +274,14 @@ onUnmounted(() => stopPolling());
 </template>
 
 <style scoped>
+.pager { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center;
+  margin-top: 18px; }
+.pg { min-width: 34px; padding: 5px 10px; border: 1px solid #dcdcdc; background: #fff; color: #555;
+  border-radius: 6px; cursor: pointer; font-size: 13px; line-height: 1; transition: all .15s; }
+.pg:hover:not(:disabled):not(.cur) { border-color: var(--primary); color: var(--primary); }
+.pg.cur { background: var(--primary); color: #fff; border-color: var(--primary); cursor: default; }
+.pg.gap { border: none; background: transparent; cursor: default; min-width: 18px; padding: 5px 2px; }
+.pg:disabled { cursor: default; }
 .link { color: var(--primary); cursor: pointer; text-decoration: underline; }
 .link:hover { color: var(--primary-d); }
 .mini-tag { display: inline-block; background: #f0f4f8; color: #555; border-radius: 4px;
