@@ -278,6 +278,7 @@ class VecIndex:
             "chunks": int(self.vectors.shape[0]),
             "dim": self.dim,
             "embedder": self.embedder_type,
+            "loaded": True,
             "docs": len({m.get("doc_id") for m in self.meta}),
         }
 
@@ -312,4 +313,15 @@ def search(query, top_k=30):
 
 
 def stats():
+    """索引状态（轻量，不会触发模型加载）。
+
+    系统设置页等仅用于展示「索引是否就绪 / 文档数」，不应为展示而加载整个
+    语义向量模型（BGE 模型首次加载需联网下载权重，约数十秒，是设置页卡顿根因）。
+    仅当索引已被检索路径加载过（_INDEX 非 None）才返回真实 chunks/docs；
+    否则只基于文件存在性返回就绪状态，避免任何模型加载。
+    """
+    if _INDEX is None:
+        ready = os.path.exists(VEC_FILE)
+        return {"ready": ready, "chunks": None, "docs": None,
+                "loaded": False, "embedder": "bge"}
     return get_index().stats()

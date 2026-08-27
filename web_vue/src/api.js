@@ -99,6 +99,9 @@ export const api = {
   initClear: (includeTrash) =>
     api.post("/api/admin/init/clear", { include_trash: includeTrash !== false }),
   initExtract: () => api.post("/api/admin/init/extract"),
+  initExtractOne: (docId) => api.post("/api/admin/init/extract-one", { doc_id: docId }),
+  initClearExtract: () => api.post("/api/admin/init/clear-extract"),
+  initAbort: () => api.post("/api/admin/init/abort"),
   initIndex: () => api.post("/api/admin/init/index"),
   // 标签
   listTags: () => api.get("/api/kb/tags"),

@@ -82,6 +82,7 @@ app = Flask(__name__, static_folder=None)
 # 重建而长时间阻塞在「上传中」。
 _EXTRACT_Q = _queue.Queue()
 _INDEX_DIRTY = threading.Event()      # 有待建索引的脏文档
+_EXTRACT_ABORT = threading.Event()   # 中止提取信号：set 后丢弃队列剩余任务
 _WORKER_STARTED = False
 
 
@@ -97,6 +98,19 @@ def _rebuild_indexes():
         return False
 
 
+def _drain_extract_queue():
+    """清空提取队列（丢弃尚未执行的任务）。Queue 无原生 clear，逐个取走。"""
+    dropped = 0
+    while not _EXTRACT_Q.empty():
+        try:
+            _EXTRACT_Q.get_nowait()
+            _EXTRACT_Q.task_done()
+            dropped += 1
+        except _queue.Empty:
+            break
+    return dropped
+
+
 def _extract_worker():
     while True:
         try:
@@ -106,6 +120,13 @@ def _extract_worker():
             if _INDEX_DIRTY.is_set():
                 _rebuild_indexes()
                 _INDEX_DIRTY.clear()
+            # 中止信号：清空剩余（理论上已空）并复位，避免再次入队时仍生效
+            if _EXTRACT_ABORT.is_set():
+                _EXTRACT_ABORT.clear()
+            continue
+        # 收到中止信号：丢弃本任务，不执行提取
+        if _EXTRACT_ABORT.is_set():
+            _EXTRACT_Q.task_done()
             continue
         try:
             _do_extract_task(task)
@@ -185,6 +206,26 @@ def login_required(perm=None):
                 perms = admin.get_user_permissions(uid)
                 if perm not in perms:
                     return jsonify({"error": "权限不足", "need": perm}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def admin_required():
+    """仅超级管理员（role.name == 'admin'）可访问。"""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            uid = session.get("user_id")
+            if not uid:
+                return jsonify({"error": "未登录"}), 401
+            conn = admin._conn()
+            row = conn.execute(
+                "SELECT r.name AS role_name FROM users u LEFT JOIN roles r ON u.role_id=r.id WHERE u.id=?",
+                (uid,)).fetchone()
+            conn.close()
+            if not row or row["role_name"] != "admin":
+                return jsonify({"error": "仅管理员可执行此操作"}), 403
             return fn(*args, **kwargs)
         return wrapper
     return decorator
@@ -608,10 +649,14 @@ def _cat_name_by_id(cid):
 def kb_upload_zip():
     """上传整个目录（打包为 zip）：按 zip 内部文件夹名自动建子类，文件归入对应分类+年份目录。
 
+    与普通文件上传采用完全相同的「两步」机制：
+    - 第一步（本接口内、极快）：按 zip 目录建分类树，仅落盘原始二进制 + 占位 entry，
+      不提取文本、不重建索引，立即返回「已保存，后台识别中」；
+    - 第二步（后台 worker）：与普通上传共用 _EXTRACT_Q，逐个提取文本 + 自动分类 + 索引。
+
     - 父分类由表单 `parent` 指定（默认「管理标准分类」）；zip 内的每一级目录都建成该父分类下的子类，
       已存在同名子类则复用，不重复创建。
     - 若 zip 根只有一个共同顶层目录（如用户把「管理标准」整体打包），则剥离该层，子类从第二级开始。
-    - 统一重建一次索引。
     """
     if not admin.get_feature("upload_enabled", 1):
         return jsonify({"error": "上传功能已关闭"}), 403
@@ -672,16 +717,22 @@ def kb_upload_zip():
                                 "error": "不支持格式 %s（已跳过）" % ext})
                 continue
             data = zf.read(n)
+            # 第一步：仅落盘原始二进制 + 占位 entry（与普通上传一致，极快）
             try:
-                text, warn = extract_text.extract(data, base, category=final_cat_name)
+                doc_id = kb_store.save_upload_raw(base, final_cat_name, data)
             except Exception as e:  # noqa: BLE001
-                results.append({"filename": n, "ok": False, "error": "解析失败: %s" % e})
+                results.append({"filename": n, "ok": False, "error": "保存失败: %s" % e})
                 continue
-            if not text.strip():
-                warn = (("%s；" % warn) if warn else "") + "未提取到文本内容"
-            doc_id = kb_store.save_upload(base, final_cat_name, text, raw_bytes=data)
+            # 第二步：入队，后台 worker 与普通上传共用 _EXTRACT_Q 完成提取+分类+索引
+            # cat_hint 传 zip 目录分类名，保留目录结构、不自动重分类
+            _EXTRACT_Q.put({
+                "filename": base,
+                "category": final_cat_name,
+                "doc_id": doc_id,
+                "cat_hint": final_cat_name,
+            })
             results.append({"filename": n, "ok": True, "doc_id": doc_id,
-                            "category": final_cat_name, "warn": warn})
+                            "category": final_cat_name, "warn": "已保存，后台识别中"})
     except zipfile.BadZipFile:
         return jsonify({"error": "不是有效的 zip 文件"}), 400
     finally:
@@ -692,16 +743,11 @@ def kb_upload_zip():
     if ok_count == 0:
         return jsonify({"ok": False, "results": results, "error": "所有文件均处理失败",
                         "created_categories": created_cats}), 400
-    try:
-        import rag_build_index
-        rag_build_index.build_index()
-        vec_store.rebuild(kb_store.iter_all_documents())
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"ok": True, "results": results, "count": ok_count,
-                        "created_categories": created_cats,
-                        "warn": "文档已保存（%d 个），但重建索引失败: %s" % (ok_count, e)})
+
+    # 与普通上传一致：不在此同步建索引，交给后台 worker 在队列空闲时统一重建。
     return jsonify({"ok": True, "results": results, "count": ok_count,
-                    "created_categories": created_cats})
+                    "created_categories": created_cats,
+                    "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"})
 
 
 @app.route("/api/kb/document/<doc_id>", methods=["DELETE"])
@@ -892,7 +938,7 @@ def kb_doc_edit_text(doc_id):
 
 # ===================== 系统初始化（清除文档 / 提取内容 / 重建索引） =====================
 @app.route("/api/admin/init/clear", methods=["POST"])
-@login_required("kb.upload.manage")
+@admin_required()
 def admin_init_clear():
     """清空全部文档（含回收站）+ 重建空索引。"""
     data = request.get_json(silent=True) or {}
@@ -905,25 +951,136 @@ def admin_init_clear():
 
 
 @app.route("/api/admin/init/extract", methods=["POST"])
-@login_required("kb.upload.manage")
+@admin_required()
 def admin_init_extract():
-    """对所有活跃上传文档重新提取文本并重建索引。"""
+    """对所有活跃上传文档重新提取文本（后台异步执行，立即返回）。
+
+    仅把每个活跃文档的 doc_id 入队 _EXTRACT_Q，由后台 worker 逐个重提取文本 +
+    队列空闲时统一重建索引；接口本身不阻塞，前端可立即关闭弹窗继续操作。
+    """
     try:
-        res = kb_store.reextract_all_documents()
-        return jsonify({"ok": True, **res})
+        docs = kb_store.iter_active_uploads()
+        queued = 0
+        ids = []
+        for d in docs:
+            if not d.get("doc_id"):
+                continue
+            # cat_hint 传原分类，保留分类、只更新文本与索引（与上传两步法同源）
+            _EXTRACT_Q.put({
+                "filename": d.get("filename", d["doc_id"]),
+                "category": d.get("category", "未分类"),
+                "doc_id": d["doc_id"],
+                "cat_hint": d.get("category", "未分类"),
+            })
+            ids.append(d["doc_id"])
+            queued += 1
+        # 立即复位这批文档的识别状态与字数（indexed=0, text=""），使上传管理页
+        # 即时从「已识别/字数」变为「未识别/0」，直观反映「提取中」；后台 worker
+        # 跑完再逐篇写回。注意：复位在入队之后、保存之前，避免覆盖已入队任务的回填。
+        reset_n = kb_store.mark_extracting(ids)
+        return jsonify({
+            "ok": True,
+            "queued": queued,
+            "reset": reset_n,
+            "note": "已提交后台重新提取 %d 篇，状态与字数已立即清空，完成后自动重建索引" % queued,
+        })
     except Exception as e:
-        return jsonify({"error": "提取内容失败: %s" % e}), 500
+        return jsonify({"error": "提交重新提取失败: %s" % e}), 500
+
+
+@app.route("/api/admin/init/extract-one", methods=["POST"])
+@admin_required()
+def admin_init_extract_one():
+    """对单个文档重新提取文本（后台异步执行，立即返回）。
+
+    请求体 {"doc_id": "..."}。仅把该文档入队 _EXTRACT_Q，由后台 worker 提取 +
+    队列空闲时统一重建索引；接口不阻塞。提取前立即复位该篇状态与字数（indexed=0,
+    text=""），使上传管理页即时反映「提取中」，worker 跑完再写回。
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        doc_id = data.get("doc_id")
+        if not doc_id:
+            return jsonify({"error": "缺少 doc_id"}), 400
+        ups = kb_store._load_uploads()
+        target = next((u for u in ups if u.get("doc_id") == doc_id and not u.get("deleted")), None)
+        if not target:
+            return jsonify({"error": "文档不存在或已删除"}), 404
+        _EXTRACT_Q.put({
+            "filename": target.get("filename", doc_id),
+            "category": target.get("category", "未分类"),
+            "doc_id": doc_id,
+            "cat_hint": target.get("category", "未分类"),
+        })
+        reset_n = kb_store.mark_extracting([doc_id])
+        return jsonify({
+            "ok": True,
+            "doc_id": doc_id,
+            "reset": reset_n,
+            "note": "已提交后台重新提取 1 篇，状态与字数已立即清空，完成后自动重建索引",
+        })
+    except Exception as e:
+        return jsonify({"error": "提交单篇提取失败: %s" % e}), 500
+
+
+@app.route("/api/admin/init/clear-extract", methods=["POST"])
+@admin_required()
+def admin_init_clear_extract():
+    """清空全部文档的提取内容（indexed=0, text=\"\"），保留文件与条目本身。
+
+    用于「仅清除已提取文本、不再重提」的场景（如提取规则升级前先清空以便肉眼核对
+    旧版排版问题），上传管理页状态立即变为「未识别」、字数归 0，且不触发后台提取
+    或索引重建。需配合前端重新提取才会恢复可检索内容。
+    """
+    try:
+        n = kb_store.clear_extract()
+        return jsonify({
+            "ok": True,
+            "cleared": n,
+            "note": "已清空 %d 篇文档的提取内容（状态/字数已复位），可重新提取恢复" % n,
+        })
+    except Exception as e:
+        return jsonify({"error": "清空提取内容失败: %s" % e}), 500
+
+
+@app.route("/api/admin/init/abort", methods=["POST"])
+@admin_required()
+def admin_init_abort():
+    """中止后台提取：丢弃队列中尚未执行的任务，已提取的保留并重建索引。
+
+    接口立即返回，worker 在下次取任务时检测到中止信号即跳过剩余任务；当前正在
+    执行的单篇会在完成后停止（不会中断已开始的 PDF 解析）。中止后保留已成功提取
+    的文档文本，并对已提取部分重建 BM25 + 向量索引，保证可检索。
+    """
+    try:
+        _EXTRACT_ABORT.set()          # 通知 worker 丢弃后续任务
+        dropped = _drain_extract_queue()  # 立即清空尚未取走的队列
+        # 对已经提取成功的部分重建索引（已提取文档可检索，未提取的保持原状）
+        rebuilt = _rebuild_indexes()
+        # 复位中止信号（worker 空闲时也会再清一次，这里提前清避免影响下次提取）
+        _EXTRACT_ABORT.clear()
+        return jsonify({
+            "ok": True,
+            "dropped": dropped,
+            "index_rebuilt": rebuilt,
+            "note": "已中止后台提取，丢弃队列剩余 %d 篇；已提取文档已重建索引，可正常检索。" % dropped,
+        })
+    except Exception as e:
+        return jsonify({"error": "中止提取失败: %s" % e}), 500
 
 
 @app.route("/api/admin/init/index", methods=["POST"])
-@login_required("kb.upload.manage")
+@admin_required()
 def admin_init_index():
-    """仅重建 BM25 + 向量索引。"""
-    try:
-        res = kb_store.rebuild_index_only()
-        return jsonify({"ok": True, **res})
-    except Exception as e:
-        return jsonify({"error": "重建索引失败: %s" % e}), 500
+    """仅重建 BM25 + 向量索引（后台线程异步执行，立即返回，不阻塞页面）。"""
+    def _run():
+        try:
+            kb_store.rebuild_index_only()
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "note": "已提交后台重建索引，可在后台执行期间继续操作，完成后自动生效"})
 
 
 # ===================== 审计日志 =====================
@@ -1041,6 +1198,12 @@ def adm_user_update(uid):
         return jsonify({"ok": True})
 
 
+@app.route("/api/kb/features")
+@login_required()
+def kb_features():
+    return jsonify({"features": admin.list_features()})
+
+
 @app.route("/api/admin/features")
 @login_required("system.manage")
 def adm_features():
@@ -1070,7 +1233,16 @@ def adm_reindex():
 @app.route("/api/admin/vector_stats")
 @login_required("system.manage")
 def adm_vector_stats():
-    return jsonify(vec_store.stats())
+    # 轻量状态：不触发语义向量模型加载（避免设置页卡顿）
+    s = vec_store.stats()
+    return jsonify({
+        "ready": s.get("ready"),
+        "loaded": s.get("loaded", False),
+        "chunk_count": s.get("chunks"),
+        "doc_count": s.get("docs"),
+        "embedder": s.get("embedder"),
+        "dim": s.get("dim"),
+    })
 
 
 @app.route("/api/admin/stats")

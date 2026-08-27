@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, inject, computed } from "vue";
+import { ref, onMounted, onUnmounted, inject, computed } from "vue";
 import { api } from "../api.js";
 
 const notify = inject("notify");
@@ -12,6 +12,26 @@ const pageSize = 20;
 const q = ref("");
 const cats = ref([]);
 const loading = ref(false);
+
+// 后台提取轮询：当列表中存在「未识别」(indexed=0) 的活跃文档时，自动刷新列表，
+// 使「重新提取」后状态/字数能即时从「已识别/字数」→「未识别/0」→回填 可视化。
+const pollingTimer = ref(null);
+function hasExtracting() {
+  return items.value.some((d) => !d.deleted && d.indexed === 0);
+}
+function startPolling() {
+  if (pollingTimer.value) return;
+  pollingTimer.value = setInterval(async () => {
+    if (hasExtracting()) {
+      try { await load(); } catch (e) { /* 忽略轮询错误 */ }
+    } else {
+      stopPolling(); // 全部识别完成，停止轮询
+    }
+  }, 2500);
+}
+function stopPolling() {
+  if (pollingTimer.value) { clearInterval(pollingTimer.value); pollingTimer.value = null; }
+}
 
 // 批量删除
 const selected = ref(new Set());
@@ -35,6 +55,8 @@ function clearSelect() { selected.value = new Set(); }
 // 当前正在调整归类的行
 const reclassId = ref(null);
 const reclassCat = ref("");
+// 单篇内容提取中标记（doc_id，避免重复点击）
+const busyExtractId = ref(null);
 
 // 标签编辑
 const tagEditId = ref(null);
@@ -103,6 +125,20 @@ async function remove(d) {
   } catch (e) { notify(e.message, "err"); }
 }
 
+async function extractOne(d) {
+  if (busyExtractId.value === d.doc_id) return;
+  busyExtractId.value = d.doc_id;
+  try {
+    const r = await api.initExtractOne(d.doc_id);
+    notify((r.note || "已提交单篇提取，稍候自动刷新") + "", "ok");
+    await load();
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyExtractId.value = null;
+  }
+}
+
 async function batchRemove() {
   const ids = Array.from(selected.value);
   if (!ids.length) { notify("请先勾选要删除的文件", "err"); return; }
@@ -117,7 +153,8 @@ async function batchRemove() {
   finally { batchBusy.value = false; }
 }
 
-onMounted(() => { loadCats(); load(); });
+onMounted(() => { loadCats(); load(); startPolling(); });
+onUnmounted(() => stopPolling());
 </script>
 
 <template>
@@ -179,6 +216,9 @@ onMounted(() => { loadCats(); load(); });
             <template v-else>
               <button class="btn sm" @click="startReclass(d)">调整归类</button>
               <button class="btn sm" @click="openTagEdit(d)">标签</button>
+              <button class="btn sm" :disabled="busyExtractId === d.doc_id" @click="extractOne(d)">
+                {{ busyExtractId === d.doc_id ? '提取中…' : '内容提取' }}
+              </button>
               <button class="btn sm danger" @click="remove(d)">删除</button>
             </template>
           </td>

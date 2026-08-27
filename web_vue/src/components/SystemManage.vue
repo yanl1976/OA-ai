@@ -13,26 +13,31 @@ const vecStats = ref(null);
 
 const activeCard = ref(null); // 当前打开的弹窗 key
 const reindexing = ref(false);
+const me = ref(null); // 当前登录用户
 
 async function load() {
   loading.value = true;
   try {
-    const [f, s, h, v] = await Promise.all([
+    const [f, s, h, v, m] = await Promise.all([
       api.features(),
       api.stats(),
       api.health(),
       api.vectorStats(),
+      api.me(),
     ]);
     features.value = f.features || [];
     stats.value = s;
     health.value = h;
     vecStats.value = v;
+    me.value = (m && m.user) || null;
   } catch (e) {
     notify(e.message, "err");
   } finally {
     loading.value = false;
   }
 }
+
+const isAdmin = computed(() => me.value && me.value.role_name === "admin");
 
 const enabledCount = computed(() => features.value.filter((f) => f.enabled).length);
 
@@ -67,7 +72,9 @@ async function reindex() {
 // ============ 系统初始化（清除文档 / 提取内容 / 重建索引） ============
 const busyClear = ref(false);
 const busyExtract = ref(false);
+const busyClearExtract = ref(false);
 const busyIndex = ref(false);
+const busyAbort = ref(false);
 
 async function initClear() {
   if (!confirm("确定清空全部文档（含回收站）并重建空索引？此操作不可恢复。")) return;
@@ -88,12 +95,9 @@ async function initExtract() {
   busyExtract.value = true;
   try {
     const r = await api.initExtract();
-    if (r.failed) {
-      notify("重提取完成：成功 %d / 失败 %d".replace("%d", r.ok).replace("%d", r.failed), "warn");
-    } else {
-      notify("重提取完成：成功 %d 篇".replace("%d", r.ok), "ok");
-    }
-    await load();
+    // 后台异步执行：接口仅完成入队即返回，页面可立即关闭弹窗继续操作
+    notify((r.note || "已提交后台重新提取").replace("%d", r.queued || 0), "ok");
+    activeCard.value = null;
   } catch (e) {
     notify(e.message, "err");
   } finally {
@@ -101,12 +105,26 @@ async function initExtract() {
   }
 }
 
+async function initClearExtract() {
+  if (!confirm("确定清空全部文档的提取内容（保留文件）？状态将变为「未识别」、字数归 0，需重新提取才能恢复。")) return;
+  busyClearExtract.value = true;
+  try {
+    const r = await api.initClearExtract();
+    notify((r.note || "已清空提取内容").replace("%d", r.cleared || 0), "ok");
+    activeCard.value = null;
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyClearExtract.value = false;
+  }
+}
+
 async function initIndex() {
   busyIndex.value = true;
   try {
     const r = await api.initIndex();
-    notify("索引重建完成，已索引 %d 篇".replace("%d", r.docs), "ok");
-    await load();
+    notify(r.note || "已提交后台重建索引，可在后台执行期间继续操作", "ok");
+    activeCard.value = null;
   } catch (e) {
     notify(e.message, "err");
   } finally {
@@ -114,13 +132,31 @@ async function initIndex() {
   }
 }
 
-const cards = [
-  { key: "features", icon: "⚙", title: "功能开关", desc: "开启或关闭系统功能模块" },
-  { key: "index", icon: "🔎", title: "检索索引", desc: "全文检索向量索引状态与重建" },
-  { key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引" },
-  { key: "stats", icon: "📊", title: "数据统计", desc: "文档、用户与分类统计概览" },
-  { key: "info", icon: "💡", title: "系统信息", desc: "运行环境与版本信息" },
-];
+async function initAbort() {
+  if (!confirm("确定中止后台提取？已提取的文档将保留并重建索引，队列中剩余任务被丢弃。")) return;
+  busyAbort.value = true;
+  try {
+    const r = await api.initAbort();
+    notify(r.note || "已中止后台提取", "ok");
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    busyAbort.value = false;
+  }
+}
+
+const cards = computed(() => {
+  const base = [
+    { key: "features", icon: "⚙", title: "功能开关", desc: "开启或关闭系统功能模块" },
+    { key: "index", icon: "🔎", title: "检索索引", desc: "全文检索向量索引状态与重建" },
+    { key: "stats", icon: "📊", title: "数据统计", desc: "文档、用户与分类统计概览" },
+    { key: "info", icon: "💡", title: "系统信息", desc: "运行环境与版本信息" },
+  ];
+  if (isAdmin.value) {
+    base.splice(2, 0, { key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引" });
+  }
+  return base;
+});
 
 function statusText(key) {
   if (key === "features") return `${enabledCount.value}/${features.value.length} 已开启`;
@@ -219,6 +255,24 @@ onMounted(load);
         </div>
         <button class="btn warning sm" :disabled="busyExtract" @click="initExtract">
           {{ busyExtract ? "提取中…" : "重新提取" }}
+        </button>
+      </div>
+      <div class="init-item">
+        <div class="init-meta">
+          <div class="init-name">提取内容清除</div>
+          <div class="muted" style="font-size: 12px">仅清空全部文档的提取文本（保留文件），状态置「未识别」、字数归 0；不触发重提，需手动重新提取才能恢复。</div>
+        </div>
+        <button class="btn danger sm" :disabled="busyClearExtract" @click="initClearExtract">
+          {{ busyClearExtract ? "清除中…" : "执行清除" }}
+        </button>
+      </div>
+      <div class="init-item">
+        <div>
+          <div class="init-name">中止提取</div>
+          <div class="muted" style="font-size: 12px">后台提取进行中时，丢弃队列剩余任务；已提取文档保留并重建索引，可正常检索。</div>
+        </div>
+        <button class="btn sm" :disabled="busyAbort" @click="initAbort">
+          {{ busyAbort ? "中止中…" : "中止提取" }}
         </button>
       </div>
       <div class="init-item">

@@ -57,10 +57,57 @@ def _call_llm(raw_text: str, text: str) -> str:
     return structured_extract(text)
 
 
+def _clean_pdf_layout(text: str) -> str:
+    """清理 PDF 抽取产生的版面噪声，喂给 LLM / 兜底回退前统一处理。
+
+    仅删非语义的版面标记，绝不删正文内容：
+      - 位置码：独立行的 `2-1-2-1` 这类「页码-栏-段-行」定位码（fitz 按阅读顺序
+        拼页时插入），对读者无意义。
+      - 页脚块：`集团公司YYYY-M-D\\n发布\\nYYYY-M-D\\n实施` 这类每页重复的发布实施注记。
+      - 分页控制符 \\x0c 及紧随其后的 `Q/CT xxx.V0x` 文档编号标记行（下一行已是
+        章节号，编号标记非正文）。
+    """
+    lines = text.split("\n")
+    out = []
+    # 位置码 + 文档编号：可能独立成行，也可能粘连为 `2-1-4-1Q/CT 303-2022.V01`
+    _pos_doc_re = re.compile(r"^\s*\d-\d-\d-\d\s*Q/CT\s+[\w./-]+\.V0\d+\s*$")
+    _pos_re = re.compile(r"^\s*\d-\d-\d-\d\s*$")          # 独立位置码行
+    _docno_re = re.compile(r"^\s*\x0c?\s*Q/CT\s+[\w./-]+\.V0\d+\s*$")  # 独立文档号行
+    for ln in lines:
+        if _pos_doc_re.match(ln) or _pos_re.match(ln) or _docno_re.match(ln):
+            continue  # 版面定位标记整行剔除
+        out.append(ln)
+    text = "\n".join(out)
+    # 页脚发布/实施块（跨行，每页重复）：`XXX集团有限公司YYYY-M-D 发布 YYYY-M-D 实施`
+    # 需整段删除（含单位名前缀，如「天水电气传动研究所集团有限公司2025-8-11 发布...」），
+    # 否则只删「集团有限公司」起的后半段会残留单位名前半（如「天水电气传动研究所」）。
+    text = re.sub(
+        r"[一-龥（(][一-龥（）()\s]*?(?:集团有限公司|公司)\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*发布\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*实施(?:\s*\x0c?\s*Q/[A-Z]{1,5}\s*[\w./-]+(?:\.V\d{1,2})?)?",
+        "",
+        text,
+    )
+    # 附录模板里的占位发布/实施行（如 `标准化委员会20XX-XX-XX 发布` / `20XX-XX-XX 实施`）
+    text = re.sub(r"20XX-XX-XX\s*发布", "", text)
+    text = re.sub(r"20XX-XX-XX\s*实施", "", text)
+    # 残留分页符
+    text = text.replace("\x0c", "")
+    # 文档编号 Q/CT xxx.Vxx：仅删除「页眉/页脚」位置的编号——编号位于行首（前仅空白/
+    # 分页符，非中文），避免误删正文中被引用的标准号（如「引用 Q/CT 304-2022.V01 的规定」）。
+    # 版本号允许 .V1 / .V01（1-2 位）；允许编号前后粘连位置码/分页符/空白。MULTILINE 使 ^ 逐行。
+    text = re.sub(
+        r"(?m)^[\x0c\s]*Q/[A-Z]{1,5}\s*[\w./-]+(?:\.V\d{1,2})?[\x0c\s]*",
+        "",
+        text,
+    )
+    return text
+
+
 def _extract_with_llm(raw: bytes, filename: str, category: str = None) -> str:
     """使用 LLM 提取文档内容。"""
     # 先用基础方法提取原始文本（兜底基准）；标准类走保守模式保留全部文字
     raw_text = _decode_pdf(raw, category=category) if filename.lower().endswith('.pdf') else _decode_text(raw)
+    # 清理版面噪声（位置码/页脚/分页标记），让 LLM 聚焦正文、输出更干净
+    raw_text = _clean_pdf_layout(raw_text)
 
     # 调用 LLM 进行结构化（严格忠实原文）
     structured_text = _call_llm(raw_text, raw_text)
@@ -203,6 +250,30 @@ _PARAGRAPH_START = re.compile(
 )
 # 句末标点（当前行以此结尾视为段落结束）
 _END_PUNCT = set("。！？；：”’）】」…：…")
+
+# 标准条款标题（管理标准 / 工作标准 / 国标 GB/T 1.1 风格）：
+# 用于在无序号的短标题与正文之间断段，避免「范围本标准规定了…」「标准编写的
+# 基本要求贯彻国家…」这类条款标题被拼进正文挤成一坨。
+# 覆盖两类：
+#   1) 编号式条款标题：『1 范围』『2 规范性引用文件』『3.1 管理标准』『4.2.1 职责』
+#   2) 常见标准条款名（无编号）：范围/定义/术语和定义/职责/管理程序/要求/附录/前言…
+_CLAUSE_TITLE_WORDS = (
+    r"范围|规范性引用文件|引用文件|定义|术语和定义|术语|符号|符号和缩略语|缩略语"
+    r"|职责|管理内容|管理程序|管理要求|工作要求|技术要求|一般要求|总则|基本要求"
+    r"|方法|流程|检查与考核|考核|报告和记录|记录|附录|前言|引言|编制与解释|实施"
+    r"|引用|标注|标志|包装|运输|贮存|安全|环境保护|培训|评审|监督|改进"
+    r"|管理标准|工作标准|技术标准|程序|程序文件|标准编写的基本要求|编写规定|编写要求"
+    r"|结构|起草|封面|目次|名称|文体|统一性|资料性概述要素|规范性一般要素|资料性补充要素"
+)
+# 编号式：数字/小数编号后接标题词（可无空格），如「1 范围」「3.1管理标准」
+_CLAUSE_TITLE_RE = re.compile(
+    r"^\s*(?:"
+    r"\d+(?:\.\d+)*\s*" + _CLAUSE_TITLE_WORDS + r"?"   # 1 范围 / 3.1 管理标准
+    r"|" + _CLAUSE_TITLE_WORDS + r"(?![:：])"            # 纯条款名（非以冒号收尾，避免误吞「定义：」正文）
+    r")\s*$"
+)
+# 更宽松的编号式条款标题：仅「数字编号 + 短中文标题」亦可断段（兜底 GB/T 编号体系）
+_CLAUSE_TITLE_NUM_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+[一-龥A-Za-z]{2,14}\s*$")
 # 强结构名单行（出席/列席人员）：其后续行（可能因 PDF 块边界产生空行）应
 # 直接拼接为单行姓名，不应断段——区域化排版的一部分（与 derived_store.py 的
 # 出席/列席解析逻辑保持一致，把语义判断前置到提取阶段）。
@@ -361,11 +432,16 @@ def _clean_pdf_text(text: str) -> str:
         s = s.replace("\u3000", " ").strip()
         if not s:
             return ""
-        # 丢弃疑似页码 / 页眉噪声行（整行仅数字或极短纯符号）
-        if re.fullmatch(r"[\d\s\-—/．.]+", s) and len(s) <= 6:
+        # 丢弃疑似页码 / 页眉噪声行（整行仅数字或极短纯符号）。
+        # 【关键】仅删除"数字 + 分隔符"类（页码/位置码），纯 1-3 位短数字（如顶层章节号
+        # "1" "2" "3"）不能在此吞掉——会丢失章节编号，须交给 process_standard 切出。
+        if re.fullmatch(r"[\d\s\-—/．.]+", s) and len(s) <= 6 \
+                and not re.fullmatch(r"\d{1,3}", s.strip()):
             return ""
-        # 去除行首粘连的页码数字（如抽取为 "1天水电气…" 的 "1"）
-        s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s)
+        # 去除行首粘连的页码数字（如抽取为 "1天水电气…" 的 "1"）。
+        # 【关键】要求数字与中文之间【无空格】，否则会误删顶层章节号（"1 范围"→ "范围"）。
+        # ——顶层章节号格式为"数字 + 空格 + 标题词"，须保留给 process_standard 切出。
+        s = re.sub(r"^\d{1,3}(?!\s)(?=[\u4e00-\u9fff])", "", s)
         return s.strip()
 
     def _is_date_line(s: str) -> bool:
@@ -454,7 +530,10 @@ def _clean_pdf_text(text: str) -> str:
             # 「实际↵经济」「资金紧↵张」这类「无句号不应换行」的任意折行。
             # 仅当上一行恰好以句末标点收尾（段落结束）或本行是真正的议题头，
             # 才断段（断段条件仍仅由 空行 / 议题序号 / 公文要素 触发）。
-            if is_pagebreak and not (cur[-1:] in _END_PUNCT or _PARAGRAPH_START.match(cur)):
+            # 【章节号合并】cur 是纯数字 1-3 位（顶层章节号）→ 加空格拼成 "1 范围"
+            if re.fullmatch(r"\d{1,3}", cur.strip()):
+                cur = cur + " " + s   # "1" + "范围" → "1 范围"
+            elif is_pagebreak and not (cur[-1:] in _END_PUNCT or _PARAGRAPH_START.match(cur)):
                 cur = cur + s  # 跨页续行：上一行未结束
             else:
                 cur = cur + s  # 行内连接（中文不加空格）
@@ -714,15 +793,21 @@ def category_to_kind(category):
 
 
 def detect_kind(text):
-    """无分类信息时，按内容嗅探文档类型（兜底）。"""
+    """无分类信息时，按内容嗅探文档类型（兜底）。
+
+    关键：管理标准与会议纪要的判定互斥，绝不允许把标准当成会议纪要、或反之。
+    """
     head = text[:2000]
     body = text[:4000]
-    # 管理标准：含『管理标准/工作标准/技术标准』且有标准编号（Q/ 开头）
-    if re.search(r"管理标准|工作标准|技术标准", head) and re.search(r"Q/[A-Z]", head):
-        return "standard"
-    # 会议纪要：含『会议纪要』且含决议/出席要素
-    if "会议纪要" in head and re.search(r"会议决定|出席人员|列席人员|主持人", body):
+    # 会议纪要优先：含『会议纪要』且含决议/出席要素 -> minutes
+    if "会议纪要" in head and re.search(r"会议决定|出席人员|列席人员|主持人|会议时间", body):
         return "minutes"
+    # 管理标准：含『管理标准/工作标准/技术标准』字样（不强制 Q/ 编号，企标常无编号）
+    # 或正文出现典型标准条款结构（范围/规范性引用文件/术语和定义 连续出现）
+    if re.search(r"管理标准|工作标准|技术标准", head):
+        return "standard"
+    if re.search(r"Q/[A-Z]", head) and re.search(r"范围|规范性引用文件|术语和定义", body):
+        return "standard"
     return "default"
 
 
@@ -784,15 +869,82 @@ def _strip_std_tail_noise(s: str) -> str:
     return s
 
 
+# 行内切分专用标记（用于管理标准逐行处理前）：把「多级编号 + 标题/正文」在行内切
+# 成独立片段，使 3.1 / 4.1.1 这类条款号能独立成段，恢复章节层级。
+# 注意：刻意【不含】Q/CT 标准编号分支——避免历史 bug（Q/CT 303-2022.V01 被切成
+# V0 1）；标准编号整行保留。第X章/第X条/（一）不论前后是否有中文都切（管理标准的
+# 章节号几乎总粘连在正文后，必须强切）；多级编号 A?\d+(\.\d+)+ 后接空白/标点/行尾都切
+# （图片型 OCR 文本里编号常在行尾，如 '3.2.6'）。
+_STD_INLINE_SPLIT = re.compile(
+    r"(?:"
+    r"第[一二三四五六七八九十百千零\d]+章"                  # 第一章
+    r"|第[一二三四五六七八九十百千零\d]+条"                  # 第一条
+    r"|[（(][一二三四五六七八九十百千零]+[）)]"            # （一）（二）
+    r"|[A-Za-z]?\d+(?:\.\s*\d+)+"                          # 3.1 / 4.1.1 / A.1（OCR 多空格 5. 1.1）
+    r"|表\s*\d+|图\s*\d+"                                  # 表 1 / 图 1
+    r"|(?<=\s)[A-Za-z]?\d+(?:\.\s*\d+)+\s+[一-龥]{2,8}(?=\s|$|[，。；、])"  # 编号+短中文标题整体切出（3.1 标准体系、4.1 通则、5.1 管理标准体系表），让 process_standard 走 _CLAUSE_TITLE_NUM_RE 识别为标题独立成段
+    r")"
+)
+
+# 管理标准顶层固定章节标题（图片型 OCR 常把它们粘连在正文句号之后，如
+# '...GB/T 20000.2。 结构'）。这些词独立成行才能恢复章节层级；限定为
+# 标准里高频出现的章名，避免误切普通正文。
+_STD_TOP_TITLES = (
+    "范围", "规范性引用文件", "术语和定义", "总则", "结构", "起草", "附录",
+    "封面", "目次", "名称", "要求", "文体", "统一性", "资料性概述要素",
+    "规范性一般要素", "资料性补充要素", "规范性引用文件",
+)
+_STD_TOP_TITLE_RE = re.compile(
+    r"(?<=[。；；])(\s*(?:" + "|".join(_STD_TOP_TITLES) + r")\s*)(?=[\u4e00-\u9fff（(\s]|$)"
+)
+
+
+def _split_std_line(ln: str) -> list:
+    """把一行内连续多个条款（如 '3.1 标准体系... 3.2 标准体系表...'）切成多段。
+
+    在『编号』这类稳定的条款起始处插入换行（编号可出现在行内任意位置，因为图片型
+    OCR / 文本型 PDF 抽取的编号常粘连在前文之后）；编号前的普通文字（如
+    '本标准采用下列定义。'）保持原样作为前导段落。同时去除 PDF 页脚位置码
+    （如 '2-1-1-1'），避免噪声段落。
+    """
+    # 去除页脚位置码（四段式数字，如 2-1-1-1，可能含空格 2- 1- 1- 1），
+    # 不影响标准编号 Q/CT（非四段 -）
+    ln = re.sub(r"\d+(?:\s*[-–—]\s*\d+){3}", " ", ln)
+    # 顶层固定章名粘连在句号后时，独立成行（图片型 OCR 修复）
+    ln = _STD_TOP_TITLE_RE.sub(lambda m: "\n" + m.group(0).strip() + "\n", ln)
+    # 在编号前插入换行（编号可紧跟中文，如 '...条文。3.2.3 条'）
+    parts = _STD_INLINE_SPLIT.sub(lambda m: "\n" + m.group(0), ln)
+    # 二次清理：编号后若紧跟中文但被 OCR 多空格分隔（如 '5. 1.1' 已是单编号），不再处理
+    return [p.strip() for p in parts.split("\n") if p.strip()]
+
+
 @register("standard")
 def process_standard(text):
-    """管理标准：仅做换行切分与轻微去噪，严格保留全部文字内容（含图注尺寸、页码、
-    位置码、标准编号行），确保与 PDF 文字层差异最小、不丢内容。
+    """管理标准：与会议纪要提取方式严格区分——按「标准条款结构」断段，但基础合并
+    仍遵循「句末标点」原则（与会议纪要的合并逻辑同源，仅断段判据不同：会议纪要用
+    议题序号，标准用条款标题）。
+
+    关键修复：不再调用 _segment_standard_lines 做激进切行（会把 Q/CT 标准编号切碎）。
+    改为：① 逐行先做【行内切分】——把一行内连续多个多级条款号（3.1 / 4.1.1 / (一) /
+    第一章 / 第一条）切成独立片段，恢复章节层级；② 再用条款标题判据让『范围/定义/
+    规范性引用文件』等独立成段；③ 其余正文按句末标点合并，保持连贯。
+
+    严格保留全部文字（标准编号/页码/位置码），与 PDF 文字层一致；仅跳过纯页码行。
     """
-    # 先把 PDF 抽到一行的长文本切开（标准编号/日期/章节/条款/表格），再逐行处理
-    text = _segment_standard_lines(text)
     out = []
     cur = ""
+
+    def _is_std_title(s: str) -> bool:
+        """判断是否为标准条款标题（独立成段的依据）。"""
+        if not s:
+            return False
+        if _CLAUSE_TITLE_RE.match(s):
+            return True
+        if _CLAUSE_TITLE_NUM_RE.match(s):
+            return True
+        if _STD_TOPNUM_RE.match(s):
+            return True
+        return False
 
     def flush():
         nonlocal cur
@@ -800,20 +952,84 @@ def process_standard(text):
             out.append(cur.strip())
         cur = ""
 
-    for ln in text.split("\n"):
-        s = ln.strip()
-        if not s:
-            continue
-        # 仅去除行首粘连的页码数字（如抽取为 "1天水电气…"），其余文字完整保留
-        s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s).strip()
-        # 不删除任何内容行（位置码/图注坐标/标准编号/页码均保留，保证与原文一致）
-        if re.match(r"^\s*\d{1,3}\s+[\u4e00-\u9fff]", s):
-            # 顶层章节编号（如 "1 范围"）：断段，章节标题独立成段
+    for raw_ln in text.split("\n"):
+        # 行内切分：把一行内多个条款号拆成独立片段（保留顺序）
+        # 一次性切出本行所有 part，看是否有『纯数字编号孤行』在尾（如 "图表。 3.3"）
+        # 若尾 part 是编号孤行且 cur 末以句号收尾，先 flush cur 让编号独立成段
+        line_parts = _split_std_line(raw_ln)
+        # 检测：最后一个非空 part 是纯数字编号 → 后面编号要独立成段，cur 应先 flush
+        last_is_number = False
+        for s in line_parts[::-1]:
+            if s.strip() == "": continue
+            last_is_number = bool(re.fullmatch(r"\d{1,3}(?:\.\d+)+", s.strip()))
+            break
+        if last_is_number and cur and re.search(r"[。；]$", cur):
+            # 上一句以句号收尾，遇到独立编号孤行：先把上一段 flush
             flush()
-            out.append(s)
-            continue
-        # 其他行并入当前段
-        cur = (cur + " " + s).strip() if cur else s
+        for s in line_parts:
+            # OCR 同行粘连『正文。 3.3』：cur 末以句号收尾，遇到下一 part 是纯数字编号孤行
+            # （如 '3.3'），先把 cur flush 让编号独立成段；否则会与"图表。 3.3"被合到一段
+            if cur and re.fullmatch(r"\d{1,3}(?:\.\d+)+", s.strip()) and re.search(r"[。；]$", cur):
+                flush()
+            # OCR 同行粘连『多级编号 + 中文（标题或完整句子）+ 后续正文』（如
+            # "3.1 标准体系 标准按其..." 或 "3.2.1 公司标准应严于国家标准和行业标准。 3.2.2..."）：
+            # 把 "编号 + 首个中文片段" 作为条款独立成段（标题或完整短句），后续正文作为新段开头。
+            # 该模式由 _STD_INLINE_SPLIT 预切成独立 part，此处按「编号 + 中文开头」识别为条款起点。
+            # 注意：编号后中文不限字数（完整句子也算一条独立条款），只取编号到第一个句末标点/行尾作为本条。
+            m = re.match(r"^(\d+(?:\.\d+)+\s+[一-龥])", s)
+            if m:
+                # 切出"编号 + 到第一个句末标点为止"作为一条独立条款；剩余（下一条编号及之后）留给后续 part
+                seg = re.match(r"^(\d+(?:\.\d+)+\s+[^。；]*[。；]?)", s)
+                head = seg.group(1).strip() if seg else s
+                tail = s[seg.end():].strip() if seg else ""
+                if cur:
+                    flush()
+                out.append(head)   # "3.2.1 公司标准应严于国家标准和行业标准。" 独立成段
+                cur = tail         # 剩余正文（若含下一条编号，下个 part 继续切）
+                continue
+            # 顶层编号孤行（如 "1"）位于段首时：暂存，等下一行标题词来合并为
+            # "1 范围"，避免编号被当作页码跳过、或编号与标题断裂成两段。
+            # （必须放在页码跳过之前，否则纯数字章节号会被误删）
+            if re.fullmatch(r"\d{1,3}", s.strip()) and cur == "":
+                cur = s
+                continue
+            # 跳过纯页码行（如独立一行的 "12"，且不在段首、不可能是章节号）。
+            # 【关键】cur 非空 + 纯 1-3 位数字 → 不能直接 continue 跳过（否则会丢章节号）；
+            # 应先把旧 cur flush 出去，再把数字暂存为新 cur，等下一 part（标题）合并为 "1 范围"。
+            if re.fullmatch(r"\d{1,4}", s) or re.fullmatch(r"\d{1,3}(?:\.\d+){1,3}", s):
+                if re.fullmatch(r"\d{1,3}(?:\.\d+)*", s.strip()):
+                    # 短数字（含多级编号 1.1/3.1.1）：作为章节号。cur 非空先断段，数字暂存等下个标题词
+                    if cur:
+                        flush()
+                    cur = s
+                    continue
+                # 4 位及以上的纯数字（页码 1000+）才视为页码跳过
+                continue
+            # 跳过 PDF 页脚位置码（如 "2-1-1-1"，可能含空格）
+            if re.fullmatch(r"\d+(?:\s*[-–—]\s*\d+){3}", s):
+                continue
+            if s == "":
+                flush()
+                continue
+            if cur and re.fullmatch(r"\d{1,3}(?:\.\d+)*", cur.strip()) and (
+                _is_std_title(s) or re.fullmatch(r"[一-龥]{2,8}", s.strip())
+            ):
+                cur = cur + " " + s
+                continue
+            # 条款标题（无编号纯条款名 / 编号式 / 顶层章节编号 / 行内切出的多级编号）
+            # 独立成段；但若当前 cur 是【纯数字编号】孤行（如 "3.1"）、本行是标题词，
+            # 则合并为 "3.1 标准的分类"（而非断段）。若 cur 已经是 "3.1 标准的分类"（含中文），
+            # 则内层 re.fullmatch 不命中，走 else 把 cur 独立 flush、s 独立成段。
+            if _is_std_title(s) or _is_std_title(cur) or _CLAUSE_TITLE_NUM_RE.match(s) or _CLAUSE_TITLE_NUM_RE.match(cur):
+                if cur and re.fullmatch(r"\d{1,3}(?:\.\d+)*", cur.strip()):
+                    cur = cur + " " + s
+                else:
+                    flush()
+                    out.append(s)
+                    cur = ""
+                continue
+            # 其余：按句末标点合并（不以句末标点结尾则并入当前段，保持正文连贯）
+            cur = (cur + " " + s).strip() if cur else s
     flush()
     return "\n\n".join(out)
 
@@ -854,6 +1070,9 @@ def process_default(text):
 
 def post_process(text: str, category: str = None):
     """按分类（或内容嗅探）选择语义后处理器，返回结构化文本。"""
+    # 所有路径（标准/纪要/默认/LLM 回退）先统一清理页眉页脚噪声与版面伪换行，
+    # 否则标准类走规则后处理时会漏掉 _clean_pdf_layout（该函数在 LLM 路径才调）。
+    text = _clean_pdf_layout(text)
     kind = category_to_kind(category) or detect_kind(text) or "default"
     fn = EXTRACTORS.get(kind, EXTRACTORS["default"])
     return fn(text)
@@ -872,12 +1091,36 @@ def extract(raw: bytes, filename: str, category: str = None):
     新增文档类型时：在 EXTRACTORS 注册对应后处理器，并在 _CATEGORY_KIND_MAP
     中把分类名映射到该类型即可，无需改动本函数。
     """
-    # LLM 提取模式
-    # 会议纪要要求确定性结构化（红头每个定义换行、导语/议题整段），强制走规则化
-    # 提取，不使用 LLM——LLM 提取对会议纪要易出现非必要换行/强行换行，已实测需
-    # 人工修正。其余类型仍可走 LLM 以提升质量。
-    _force_rule = bool(category) and ("纪要" in category)
-    if USE_LLM and filename.lower().endswith(('.pdf', '.docx')) and not _force_rule:
+    # 按文档类型分流排版通道：
+    #   - 会议纪要(minutes)：保留规则后处理（process_minutes，红头拆分 + 议题合并），
+    #     不使用 LLM——规则对纪要结构（红头/出席列席/议题序号）已足够稳定且零成本。
+    #   - 管理标准(standard) / 其它：PDF/DOCX 统一交由大模型做结构化排版（忠实原文
+    #     重排：章节/条款/表格独立成行、自然段落换行）。模型排版是既定方案，规则后
+    #     处理器仅作为 LLM 失败时的兜底，避免标准类复杂条款层级被规则切坏。
+    kind = category_to_kind(category)
+    if kind is None:
+        # 无分类时，先用底层解码出原始文本再嗅探（仅判断类型用，不污染最终输出）
+        _ext0 = os.path.splitext(filename)[1].lower()
+        if _ext0 == ".pdf":
+            _raw0 = _decode_pdf(raw, category=category)
+        elif _ext0 == ".docx":
+            _raw0 = _extract_docx(raw)
+        else:
+            _raw0 = None
+        if _raw0 is not None:
+            kind = detect_kind(_raw0)
+
+    # 会议纪要与管理标准均走规则后处理（process_minutes / process_standard），不使用 LLM。
+    # 实证：本库管理标准 PDF（尤其图片型扫描件 OCR）经 LLM 排版后，表格/章节号/段落号
+    # 常被打乱、挤成一坨，质量不如规则版；而 process_standard 按「标准条款结构」断段，
+    # 能稳定还原章节层级、条款编号、表格标题，且不丢内容、零成本、无幻觉。
+    # 其它文档（无分类或非标准/纪要）仍按 .env 的 USE_LLM 决定走 LLM 还是规则兜底。
+    use_llm = (
+        USE_LLM
+        and filename.lower().endswith(('.pdf', '.docx'))
+        and kind not in ("minutes", "standard")  # 纪要/标准强制走规则
+    )
+    if use_llm:
         try:
             text = _extract_with_llm(raw, filename, category)
             return text, None

@@ -613,6 +613,51 @@ def delete_upload_binary(doc_id: str):
             return
 
 
+def mark_extracting(doc_ids: list) -> int:
+    """重新提取开始时，立即把这批文档的索引状态与文本清空（indexed=0, text=""），
+    使上传管理页能即时从「已识别/字数」复位为「未识别/0」，直观反映「提取中」。
+    后台 worker 逐篇跑完会再写回 text 与 indexed=1。返回被复位的文档数。
+    """
+    ids = set(doc_ids)
+    if not ids:
+        return 0
+    ups = _load_uploads()
+    n = 0
+    for u in ups:
+        if u.get("doc_id") in ids:
+            u["indexed"] = 0
+            u["text"] = ""
+            u["updated_at"] = _now()
+            n += 1
+    if n:
+        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+            json.dump(ups, f, ensure_ascii=False, indent=2)
+    return n
+
+
+def clear_extract() -> int:
+    """清空全部文档的提取内容（indexed=0, text=\"\"），但保留文件与条目本身。
+
+    与 mark_extracting（重新提取前的瞬时复位）不同：本函数用于「只清除、不再重提」，
+    使上传管理页状态立即变为「未识别」、字数归 0，且不触发后台提取/索引重建。
+    返回被清空的文档数。
+    """
+    ups = _load_uploads()
+    n = 0
+    for u in ups:
+        if u.get("deleted"):
+            continue  # 回收站不处理
+        if u.get("indexed") or u.get("text"):
+            u["indexed"] = 0
+            u["text"] = ""
+            u["updated_at"] = _now()
+            n += 1
+    if n:
+        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
+            json.dump(ups, f, ensure_ascii=False, indent=2)
+    return n
+
+
 def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
                  include_deleted: bool = False) -> dict:
     """返回上传文档管理列表（含归类/年代/存储路径/原文件状态），支持关键词与分页。
@@ -1265,3 +1310,20 @@ def rebuild_index_only() -> dict:
     uid, uname = audit_current_user()
     audit_log("doc.init.index", "-", "重建索引 文档数%d" % docs, uid, uname)
     return {"docs": docs}
+
+
+def iter_active_uploads() -> list:
+    """仅返回活跃上传文档的轻量列表 [{doc_id, filename, category}]（不读文本，
+    避免重提取批量入队时把全部文档内容载入内存）。"""
+    ups = _load_uploads()
+    res = []
+    for u in ups:
+        if u.get("deleted"):
+            continue
+        res.append({
+            "doc_id": u.get("doc_id"),
+            "filename": u.get("filename", u.get("doc_id")),
+            "category": u.get("category", "未分类"),
+        })
+    return res
+
