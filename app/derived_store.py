@@ -372,7 +372,32 @@ def parse_minutes(text: str) -> dict:
                 bodytext = seg_text[:dm.start()].strip()
             items.append({"title": title, "body": bodytext, "decision": decision})
     else:
-        intro = "\n".join(body).strip()
+        # 无章节号（如仅一项议题的纪要）：识别「现将……纪要如下」引导句，
+        # 引导句之后整段即为唯一议题，不应丢进 intro。
+        full = "\n".join(body).strip()
+        m = re.search(r"纪要如下[：:]\s*", full)
+        if m:
+            intro = full[:m.end()].strip()
+            topic = full[m.end():].strip()
+        else:
+            intro = ""
+            topic = full
+        if topic:
+            decision, bodytext = "", topic
+            dm = re.search(r"会议决定[：:].*", topic, re.DOTALL)
+            if dm:
+                decision = dm.group(0).strip()
+                bodytext = topic[:dm.start()].strip()
+            # 单议题无序号：标题取「议案/事项/议题」等议案结束词之后截断，
+            # 避免把整段正文（首句号在段尾）误当标题。
+            mt = re.search(r"(?:议案|事项|议题)[：:。]?", bodytext)
+            if mt:
+                title = bodytext[:mt.end()].strip()
+            elif "。" in bodytext:
+                title = bodytext.split("。")[0].strip()
+            else:
+                title = bodytext[:30]
+            items.append({"title": title, "body": bodytext, "decision": decision})
 
     structured = bool(header.get("doc_no") or header.get("meeting_name") or items)
     return {

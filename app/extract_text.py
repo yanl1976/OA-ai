@@ -317,7 +317,8 @@ def _clean_pdf_text(text: str) -> str:
         break
 
     def _strip_noise(s: str) -> str:
-        s = s.strip()
+        # 中文 PDF 常用全角空格 \u3000 分隔，标准正则 \s 不匹配，统一归一为半角空格
+        s = s.replace("\u3000", " ").strip()
         if not s:
             return ""
         # 丢弃疑似页码 / 页眉噪声行（整行仅数字或极短纯符号）
@@ -327,16 +328,28 @@ def _clean_pdf_text(text: str) -> str:
         s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s)
         return s.strip()
 
+    def _is_date_line(s: str) -> bool:
+        """纯发文日期短行（如 2025 年10 月17 日），不含其它公文内容。"""
+        if len(s) > 24 or "会议纪要" in s or "集团" in s or "公司" in s:
+            return False
+        return bool(re.fullmatch(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", s))
+
+    def _looks_like_org_tail(p: str) -> bool:
+        """上一条红头是否是发文单位风格（用于单位 + 日期跨块合并）。"""
+        return bool(re.search(r"(集团|公司|办公室|研究所|研究院|局|院|所|委员会|部|厅|处)$", p)) \
+            or "办公室" in p or "集团" in p or "公司" in p
+
     paras = []
 
-    # 2) 红头区：逐行保留，不合并（每个元素独立成段）
+    # 2) 红头区：逐行保留（每个元素独立成段），但将「发文单位 + 紧随的日期短行」
+    #    合并为同一行定义——解决 PyMuPDF 把『天传所集团办公室』与『2025 年10 月17 日』
+    #    拆成两个文本块导致的红头定义被强行换行问题。
     #    对于合并的红头行（如"公司名纪要天研司会议纪要〔2024〕59号..."），
     #    调用 _split_header_line 拆分为多行，并把拆分后的尾部导语/正文插入正文区
     body_prefix = ""
     for ln in lines[:header_end]:
         s = _strip_noise(ln)
         if s:
-            # 检查是否需要拆分：包含多个红头元素特征（纪要、〔、办公室、会议纪要、次）
             if ("纪要" in s and ("〔" in s or "办公室" in s or "会议纪要" in s or "（" in s)) or \
                (s.count("纪要") > 1):
                 split_lines, tail = _split_header_line(s)
@@ -345,31 +358,58 @@ def _clean_pdf_text(text: str) -> str:
                         paras.append(split_line.strip())
                 if tail:
                     body_prefix = tail
+            elif paras and _is_date_line(s) and _looks_like_org_tail(paras[-1]):
+                # 单位行 + 日期行 -> 合并为同一红头定义
+                paras[-1] = paras[-1] + " " + s
             else:
                 paras.append(s)
 
     # 3) 正文区（导语+议题）：行内换行合并
-    # 只在「当前行以句末标点结尾」或「当前行/下一行是条款序号」时断段，
-    # 空行不强制断段——导语等多行内容（PDF 行内换行）应合并为自然段落。
+    # 关键修复：不再以句末标点（。！？）断段——否则导语 / 议题内容会被“。”切碎成
+    # 多个碎片段（非必要换行）。仅以下情形才断段：
+    #   - 空行（PDF 文本块之间的间距，视为段落边界）；
+    #   - 本行是议题序号 / 公文要素前缀（_PARAGRAPH_START，如 一、 出席：）。
+    # 其余 PDF 自动折行一律直接拼接（中文行内连接不加空格），恢复“整段”阅读。
     # 若拆分红头时保留了尾部导语，先放入 cur 与后续正文合并。
-    cur = body_prefix
+    #
+    # 换页续行（\f）：PyMuPDF 每页用 \f 连接，跨页相邻两行本属同一段落（如正文在
+    # 页尾“破产程序，”换页后接“货款款项……”），若按空行断段会被错误切成两段。
+    # 处理规则：换页首行（行首带 \f）若上一行 cur 不以句末标点 / 议题前缀结束，且
+    # 本行也非议题 / 公文要素开头 → 视为同一段落跨页续行，直接拼接不断段；仅当 cur
+    # 恰好以句末标点 / 议题前缀结束（段落刚好在页尾结束）才断段。
+    expanded = []
     for ln in lines[header_end:]:
+        if "\f" in ln:
+            pre, post = ln.split("\f", 1)
+            if pre.strip():
+                expanded.append(pre)
+            expanded.append("\f" + post)  # 标记：换页后的首行
+        else:
+            expanded.append(ln)
+
+    cur = body_prefix
+    for raw_ln in expanded:
+        is_pagebreak = raw_ln.startswith("\f")
+        ln = raw_ln[1:] if is_pagebreak else raw_ln
         s = _strip_noise(ln)
         if s == "":
-            continue  # 空行不再作为段落边界
+            if cur:
+                paras.append(cur)
+                cur = ""
+            continue
         if cur == "":
             cur = s
         elif _PARAGRAPH_START.match(s) or _PARAGRAPH_START.match(cur):
-            # 下一行是条款序号，或当前行是条款序号开头 -> 断段
-            paras.append(cur)
-            cur = s
-        elif cur[-1:] in _END_PUNCT:
-            # 当前行以句末标点结尾 -> 断段
+            # 议题序号 / 公文要素前缀 -> 断段
             paras.append(cur)
             cur = s
         else:
-            # 否则合并（逗号、顿号等中间标点不断段）
-            cur = cur + s  # 行内连接（中文不加空格）
+            # 续行合并（逗号、顿号、句末标点等均不断段）
+            if is_pagebreak and not (cur[-1:] in _END_PUNCT or _PARAGRAPH_START.match(cur)):
+                # 跨页续行：上一行未结束，本行是上一段的延续，直接拼接
+                cur = cur + s
+            else:
+                cur = cur + s  # 行内连接（中文不加空格）
     if cur:
         paras.append(cur)
 
@@ -388,34 +428,40 @@ _HEADER_LINE_RE = re.compile(
     r"|.*会议纪要"                           # 会议名称
     r"|.*纪要$"                              # 单位名（以「纪要」结尾）
     r"|(?:(?!纪要)[\u4e00-\u9fff])*(?:公司|集团|研究所|研究院|局|部|委员会)$"  # 单位名称
+    r"|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$"                          # 纯发文日期行（红头）
     r")"
 )
 
 
 def _merge_body_lines(lines) -> list:
-    """正文区合并：只在句末标点 / 条款序号处断段，空行不作为段落边界。
-    导语等多行内容（PDF 行内换行）应合并为自然段落。"""
+    """正文区合并：仅在【空行（块间距）】或【议题序号 / 公文要素前缀】处断段，
+    不以句末标点（。！？）断段——与 _clean_pdf_text 保持一致，避免对已结构化的
+    整段文本（导语 / 议题内容）二次切碎。
+
+    对未结构化的旧数据（逐行碎段、无空行），续行直接拼接即恢复整段。
+    """
     paras = []
     cur = ""
-    for s in lines:
-        s = (s or "").rstrip()
+    for ln in lines:
+        s = (ln or "").replace("\u3000", " ").rstrip()
         if s == "":
+            if cur:
+                paras.append(cur)
+                cur = ""
             continue
         if re.fullmatch(r"[\d\s\-—/．.]+", s) and len(s.strip()) <= 6:
             continue
         s = re.sub(r"^\d{1,3}(?=[\u4e00-\u9fff])", "", s).strip()
+        if not s:
+            continue
         if cur == "":
             cur = s
         elif _PARAGRAPH_START.match(s) or _PARAGRAPH_START.match(cur):
-            # 下一行是条款序号，或当前行是条款序号开头 -> 断段
-            paras.append(cur)
-            cur = s
-        elif cur[-1:] in _END_PUNCT:
-            # 当前行以句末标点结尾 -> 断段
+            # 议题序号 / 公文要素前缀 -> 断段
             paras.append(cur)
             cur = s
         else:
-            # 否则合并（逗号、顿号等中间标点不断段）
+            # 续行合并（句末标点等中间/结尾标点均不断段）
             cur = cur + s
     if cur:
         paras.append(cur)
@@ -498,7 +544,11 @@ def _decode_pdf_pymupdf(raw: bytes, category: str = None) -> str:
             parts.append("\n".join(page_lines))
     doc.close()
 
-    text = "\n\n".join(parts)
+    # 页与页之间用 \f（form feed，PDF 语义即分页）连接，而非 \n\n。
+    # 这样 _clean_pdf_text 能精准识别「换页导致的换行」：跨页相邻两行若本属
+    # 同一段落（前一行未以句末标点 / 议题序号结束，后一行也非议题 / 公文要素
+    # 开头），则应合并而非断段——否则正文跨页处会被错误地切成两个段落。
+    text = "\f".join(parts)
     return _post_clean_pdf_text(text)
 
 
@@ -765,7 +815,11 @@ def extract(raw: bytes, filename: str, category: str = None):
     中把分类名映射到该类型即可，无需改动本函数。
     """
     # LLM 提取模式
-    if USE_LLM and filename.lower().endswith(('.pdf', '.docx')):
+    # 会议纪要要求确定性结构化（红头每个定义换行、导语/议题整段），强制走规则化
+    # 提取，不使用 LLM——LLM 提取对会议纪要易出现非必要换行/强行换行，已实测需
+    # 人工修正。其余类型仍可走 LLM 以提升质量。
+    _force_rule = bool(category) and ("纪要" in category)
+    if USE_LLM and filename.lower().endswith(('.pdf', '.docx')) and not _force_rule:
         try:
             text = _extract_with_llm(raw, filename, category)
             return text, None

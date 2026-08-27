@@ -248,9 +248,15 @@ def build_derived_pdf(meta: dict) -> bytes:
         # 导语/议题/出席列席
         if (tpl.get("intro") or "").strip():
             story.append(Paragraph(_esc_br(tpl["intro"]), s_intro))
-        for it in tpl.get("items", []):
-            if (it.get("title") or "").strip():
-                story.append(Paragraph(_esc(it["title"]), s_item_title))
+        items = tpl.get("items", [])
+        single_item = len(items) == 1  # 单议题：原文无章节号，渲染时去掉可能的前导序号
+        for it in items:
+            title = (it.get("title") or "").strip()
+            if title:
+                if single_item:
+                    # 去掉前导章节号（如「一、」「1.」），保留议题标题本身加粗显示
+                    title = re.sub(r"^\s*(?:[一二三四五六七八九十]+、|\d+[.．、])\s*", "", title)
+                story.append(Paragraph(_esc(title), s_item_title))
             if (it.get("body") or "").strip():
                 story.append(Paragraph(_esc_br(it["body"]), s_item_body))
             if (it.get("decision") or "").strip():
