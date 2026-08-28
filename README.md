@@ -100,9 +100,44 @@ pip install -r requirements.txt
 | `MINIMAX_API_URL` | 默认 `https://api.minimax.chat/v1/chat/completions`（国内版） |
 | `MINIMAX_MODEL` | 默认 `MiniMax-M2.5-highspeed`（可改 `MiniMax-M2.5` 求更高质量） |
 | `MINIMAX_STRIP_THINKING` | 默认 `true`，剥离推理模型 `<think>` 思考过程 |
-| `KB_ROOT` | 知识库根目录 |
+| `KB_ROOT` | 部署根目录（**含 `scripts/` 的那一层**） |
+| `KB_API_HOST` | 监听地址，默认 `0.0.0.0` |
+| `KB_API_PORT` | 监听端口，默认 `8080` |
+| `KB_TOP_K` | 检索返回条数，默认 `5` |
 
-> ⚠️ **`KB_ROOT` 陷阱**：若 `.env` 里写了生产路径（如 `/opt/OA-ai`），本地独立脚本直接 `import kb_store` 会读错路径，表现为「文档数为 0」。`serve.py` 启动时会自动修正为本地路径，但**自定义脚本需显式指定 `KB_ROOT`**。建议本地留空。
+> ⚠️ **`KB_ROOT` 陷阱**：必须填**部署根**（如 `/opt/OA-ai`），代码会自动在其下拼接
+> `knowledge_base/`、`data/`、`web_vue/dist/`。若误填成 `/opt/OA-ai/knowledge_base`，
+> 路径会二次叠加成 `.../knowledge_base/knowledge_base`，索引与文档全部找不着。
+> `serve.py` 已加防御：检测到目录里没有 `scripts/` 会自动回退并打印警告。
+> 本地开发若不填，则自动用 `serve.py` 所在位置推导。
+
+### 端口与监听（统一在 `.env` 管理）
+
+**改端口只需改 `.env` 里一行**，无需动 systemd、无需改代码：
+
+```bash
+# /opt/OA-ai/.env
+KB_API_PORT=8080      # 改成想要的端口
+```
+```bash
+sudo systemctl restart kb
+```
+
+**优先级**：`.env` **高于** systemd `Environment=` 与 shell 环境变量。
+`serve.py` 在读取任何配置前就以 `override=True` 加载 `.env`，确保改这里必定生效。
+
+> 生产 systemd unit 已**刻意删除** `KB_ROOT` / `KB_API_HOST` / `KB_API_PORT`
+> 三行 `Environment=`，避免同一项配置散落两处、改一处漏一处。
+
+**确认当前生效配置**（无需登录服务器翻配置）：
+
+```bash
+curl http://192.168.30.155:8080/api/health
+# {"port":8080,"host":"0.0.0.0","kb_root":"/opt/OA-ai",
+#  "env_file":"/opt/OA-ai/.env", ...}
+```
+
+`env_file` 为 `null` 表示未找到 `.env`，此时回退用环境变量或默认值。
 
 ### 3. 启动服务
 ```powershell
@@ -221,6 +256,7 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 | Python | `/opt/OA-ai/venv/bin/python` |
 | 访问 | http://192.168.30.155:8080/ |
 | 代码仓库 | `github.com/yanl1976/OA-ai`（公开仓） |
+| 端口配置 | `/opt/OA-ai/.env` 的 `KB_API_PORT`（改后 `systemctl restart kb`） |
 
 ### 推荐方式：本地直传（`deploy_from_local.py`）
 
@@ -278,6 +314,42 @@ systemctl restart kb         # 重启
 journalctl -u kb -n 50 --no-pager   # 查看日志
 curl http://127.0.0.1:8080/api/health
 ```
+
+> 服务监听端口 **8080**（`KB_API_PORT` 可覆盖）。
+
+### 备份与磁盘管理
+
+每次部署会在 `/opt` 生成两个目录：
+
+| 目录 | 用途 | 何时可删 |
+|---|---|---|
+| `/opt/OA-ai.bak.<时间戳>` | 部署前的完整拷贝 | **至少保留最新一个**，`--rollback` 依赖它 |
+| `/opt/OA-ai.old.<时间戳>` | 切换目录时移走的旧版本 | 确认新版本无误后即可删 |
+
+每份约 460MB（`venv` 293M + `knowledge_base` 118M + `fonts` 37M）。连续部署会快速堆积，需定期清理。
+
+**清理前务必先做文档比对**（确认新版本文档数 ≥ 备份，避免误删唯一副本）：
+
+```bash
+# 1）同口径统计文档数（两边用完全相同的 find 表达式）
+find /opt/OA-ai/knowledge_base -type f \
+  \( -name '*.pdf' -o -name '*.doc*' -o -name '*.xls*' \) | wc -l
+find /opt/OA-ai.bak.<时间戳>/knowledge_base -type f \
+  \( -name '*.pdf' -o -name '*.doc*' -o -name '*.xls*' \) | wc -l
+
+# 2）确认没有「仅备份才有」的文档（输出应为 0 行）
+find /opt/OA-ai/knowledge_base -type f \( -name '*.pdf' -o -name '*.doc*' -o -name '*.xls*' \) \
+  -printf '%f\n' | sort -u > /tmp/cur.txt
+find /opt/OA-ai.bak.<时间戳>/knowledge_base -type f \( -name '*.pdf' -o -name '*.doc*' -o -name '*.xls*' \) \
+  -printf '%f\n' | sort -u > /tmp/bak.txt
+comm -13 /tmp/cur.txt /tmp/bak.txt
+
+# 3）确认无误后，按【显式路径】删除，切勿用 rm -rf /opt/OA-ai*
+sudo rm -rf /opt/OA-ai.bak.<旧时间戳> /opt/OA-ai.old.<时间戳>
+```
+
+> ⚠️ `/opt` 属主为 `root`，删除/创建都需 `sudo`。
+> ⚠️ **禁止 `rm -rf /opt/OA-ai*`** —— 会连同正在运行的 `/opt/OA-ai` 一起删除。
 
 ---
 

@@ -43,8 +43,45 @@ import functools
 from flask import (Flask, request, jsonify, send_from_directory,
                    session, redirect, abort, make_response)
 
+
+# ===================== 统一配置源：.env =====================
+# 【背景】原先 serve.py 不加载 .env，端口/根目录只能靠 systemd 的 Environment
+# 注入，导致同一项配置散落在 systemd 与 .env 两处，改一处常漏另一处。
+# 这里在【读取 KB_ROOT 与端口之前】加载 .env，使配置统一收敛到 .env。
+#
+# 【为什么 override=True】必须让 .env 压过外部环境变量（如 systemd 残留的
+# Environment=），否则 .env 里的修改永远不生效 —— 这正是此前端口改不动的根因。
+def _load_env_file():
+    """加载部署根目录下的 .env，返回其路径；未找到则返回 None。"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return None
+    from pathlib import Path
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        # override=True：.env 为最高优先级配置源
+        load_dotenv(env_path, override=True)
+        return env_path
+    return None
+
+
+ENV_FILE = _load_env_file()
+
 # KB_ROOT：部署根目录。serve.py 位于 <root>/scripts/
-KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 【防御性校验】环境变量里的 KB_ROOT 可能是误设值（历史坑：.env 里曾被填成
+# ".../knowledge_base"，而下方 KB_DIR 会再拼一次 knowledge_base，导致路径
+# 二次叠加成 .../knowledge_base/knowledge_base，索引与文档全部找不着）。
+# 合法部署根必须含 scripts/ 目录，据此自动纠正，避免服务带病启动。
+_DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_env_root = (os.environ.get("KB_ROOT") or "").strip()
+if _env_root and os.path.isdir(os.path.join(_env_root, "scripts")):
+    KB_ROOT = _env_root
+else:
+    if _env_root:
+        print("[警告] KB_ROOT=%r 不是合法部署根（缺少 scripts/ 目录），"
+              "已自动改用推导值 %s" % (_env_root, _DEFAULT_ROOT))
+    KB_ROOT = _DEFAULT_ROOT
 KB_DIR = os.path.join(KB_ROOT, "knowledge_base")
 WEB_DIR = os.path.join(KB_ROOT, "web")            # 旧版静态资源（保留兼容）
 DIST_DIR = os.path.join(KB_ROOT, "web_vue", "dist")  # Vue3 生产构建产物
@@ -383,7 +420,12 @@ def health():
     vec_ready = vec_store.stats().get("ready", False)
     status = "ok" if (bm25_ready and vec_ready) else "index_missing"
     return jsonify({"status": status, "bm25_ready": bm25_ready, "vec_ready": vec_ready,
-                    "kb_root": KB_ROOT, "index_dir": INDEX_DIR})
+                    "kb_root": KB_ROOT, "index_dir": INDEX_DIR,
+                    # 端口与配置来源：运维可直接据此确认 .env 是否生效，
+                    # 无需登录服务器翻 systemd unit
+                    "host": os.environ.get("KB_API_HOST", "0.0.0.0"),
+                    "port": int(os.environ.get("KB_API_PORT", "8080")),
+                    "env_file": str(ENV_FILE) if ENV_FILE else None})
 
 
 # ===================== 鉴权 API =====================
@@ -1895,4 +1937,10 @@ if __name__ == "__main__":
     host = os.environ.get("KB_API_HOST", "0.0.0.0")
     port = int(os.environ.get("KB_API_PORT", "8080"))
     print(f"知识库管理服务启动: http://{host}:{port}/  (KB_ROOT={KB_ROOT})")
+    # 明确打印配置来源，便于运维确认端口究竟由 .env 还是外部环境变量决定
+    if ENV_FILE:
+        print(f"配置文件: {ENV_FILE}  (端口/根目录以该文件为准)")
+    else:
+        print("配置文件: 未找到 .env，使用环境变量或内置默认值")
+        print("          端口来源: KB_API_PORT 环境变量 or 默认 8080")
     app.run(host=host, port=port, debug=False)
