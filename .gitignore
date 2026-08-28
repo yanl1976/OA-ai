@@ -29,6 +29,10 @@ knowledge_base/*.bak_*
 .env.bak*
 config/.env
 config/.env.*
+# 任何目录下的 .env（如 knowledge_base/.env），防止子目录配置被误入库
+**/.env
+!.env.example
+!config/.env.example
 
 # 索引重建前的本地备份（_backup_index_<时间戳>/）。
 # 曾误入库：生产部署时不上传该目录，git 便认为文件被删除（D），
