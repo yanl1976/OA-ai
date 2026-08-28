@@ -6,7 +6,14 @@ import PdfModal from "./PdfModal.vue";
 
 const notify = inject("notify");
 const openDerivedInManage = inject("openDerivedInManage");
+const openDerivedForDoc = inject("openDerivedForDoc");
 const pendingDocId = inject("pendingDocId");
+const user = inject("user");
+// 纪要二次生成：① 需 derived.manage 权限；② 仅当前文档属于「会议纪要」分类才显示
+const canDerived = computed(() => {
+  if (!(user.value?.permissions || []).includes("derived.manage")) return false;
+  return docDetail.value?.category === "会议纪要";
+});
 
 const roots = ref([]);
 const selected = ref(""); // "" 表示全部文档
@@ -239,6 +246,7 @@ onMounted(async () => {
         </div>
         <div class="toolbar" style="margin-bottom:10px">
           <button class="btn sm primary" @click="previewPdf">预览 PDF</button>
+          <button class="btn sm" v-if="canDerived" @click="openDerivedForDoc(docDetail.doc_id)">纪要二次生成</button>
         </div>
         <div class="doc-view">{{ docDetail.text || docDetail.full_text || "（无正文）" }}</div>
 

@@ -196,13 +196,21 @@ class VecIndex:
         return get_embedder().encode(texts, is_query=False)
 
     def rebuild(self, documents):
-        """全量重建索引。documents: list[dict]。"""
+        """全量重建索引。documents: list[dict]。
+
+        注意：耗时的 BGE 编码(_recompute)放在锁外执行，仅最后 swap(self.vectors/
+        self.meta 引用替换)与 save() 才持锁，避免重建全程持有锁导致检索(search)
+        被长时间阻塞（200 篇全量编码可达数分钟）。swap 是引用替换，检索读到的是
+        重建前的旧向量或重建后的新向量，不会出现读到半截状态。
+        """
+        all_chunks = []
+        for doc in documents:
+            all_chunks.extend(self._doc_chunks(doc))
+        new_meta = [m for m, _ in all_chunks]
+        new_vecs = self._recompute(all_chunks)  # 锁外：BGE 编码（耗时）
         with self._lock:
-            all_chunks = []
-            for doc in documents:
-                all_chunks.extend(self._doc_chunks(doc))
-            self.meta = [m for m, _ in all_chunks]
-            self.vectors = self._recompute(all_chunks)
+            self.meta = new_meta
+            self.vectors = new_vecs
             self.save()
         return len(self.meta)
 

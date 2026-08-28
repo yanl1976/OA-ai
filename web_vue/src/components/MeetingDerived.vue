@@ -6,6 +6,8 @@ import PdfModal from "./PdfModal.vue";
 const notify = inject("notify");
 const openDocInBrowse = inject("openDocInBrowse");
 const pendingDerivedId = inject("pendingDerivedId");
+// 从知识浏览页「纪要二次生成」按钮带过来的来源文档 id：加载后自动选为该来源并进入生成 tab
+const pendingDerivedSourceId = inject("pendingDerivedSourceId");
 
 // 中文数字（与后端 renumber_items 对应，用于二次生成时章节号自动重编号预览）
 const CN = "零一二三四五六七八九";
@@ -34,17 +36,29 @@ const DEST_OPTIONS = ["董事会", "管理层", "财务部", "人力资源部", 
 function splitBlocks(text) {
   if (!text) return [];
   const byBlank = text.split(/\n[ \t]*\n/).map((s) => s.trim()).filter(Boolean);
-  if (byBlank.length > 1) return byBlank;
-  const lines = text.split(/\n/).map((l) => l.replace(/\s+$/, ""));
-  const blocks = [];
-  let buf = [];
-  for (const ln of lines) {
-    if (ln.trim() === "") {
-      if (buf.length) { blocks.push(buf.join("\n")); buf = []; }
-    } else buf.push(ln);
+  let raw;
+  if (byBlank.length > 1) raw = byBlank;
+  else {
+    const lines = text.split(/\n/).map((l) => l.replace(/\s+$/, ""));
+    raw = [];
+    let buf = [];
+    for (const ln of lines) {
+      if (ln.trim() === "") {
+        if (buf.length) { raw.push(buf.join("\n")); buf = []; }
+      } else buf.push(ln);
+    }
+    if (buf.length) raw.push(buf.join("\n"));
   }
-  if (buf.length) blocks.push(buf.join("\n"));
-  return blocks.filter(Boolean);
+  // 决策/结论性标记句（如「会议决定：…」「经讨论，会议一致同意…」）独立成行
+  const DECISION = /(?<=[。])((?:会议决定[：:]|经讨论[，,]?|会议一致通过|会议一致同意|会议认为|会议要求|会议指出))/;
+  const out = [];
+  for (const b of raw) {
+    const b2 = b.replace(DECISION, "\n$1");
+    if (b2.includes("\n")) {
+      for (const seg of b2.split("\n")) if (seg.trim()) out.push(seg.trim());
+    } else out.push(b);
+  }
+  return out.filter(Boolean);
 }
 
 // 将模板结构化字段重排为纯文本（预览/查看用，与后端 render_minutes 对应）
@@ -269,16 +283,25 @@ async function generate() {
     };
   }
   try {
+    let created = null;
     if (form.editingId) {
       await api.derivedUpdate(form.editingId, payload);
       notify("已保存修改", "ok");
     } else {
-      await api.derivedCreate(payload);
+      const r = await api.derivedCreate(payload);
+      created = r.derived || null;
       notify("二次纪要已生成", "ok");
     }
     await loadDerived(filterSource.value === "all" ? null : filterSource.value);
     if (selectedSource.value) await loadDerived(selectedSource.value.doc_id);
     resetGen();
+    // 方案 A：生成/保存成功后直接弹出该纪要的 PDF 预览界面，最直给
+    if (created) {
+      previewPdf(created);
+    } else {
+      // 编辑模式下无新建对象，退回管理标签查看
+      tab.value = "manage";
+    }
   } catch (e) { notify(e.message || "操作失败", "err"); }
 }
 
@@ -453,6 +476,28 @@ onMounted(async () => {
   await loadSources();
   await loadDerived(null);
   if (pendingDerivedId.value) await applyPendingDerived();
+  // 从知识浏览页「纪要二次生成」按钮带过来：自动选为该来源纪要并进入生成 tab
+  const srcId = pendingDerivedSourceId.value;
+  if (srcId) {
+    pendingDerivedSourceId.value = null;
+    let src = sources.value.find((s) => s.doc_id === srcId);
+    if (!src) {
+      // 来源不一定属于「会议纪要」分类列表：直接以 doc_id 拉取最小信息构造来源对象
+      try {
+        const r = await api.document(srcId);
+        const d = r.document;
+        src = { doc_id: d.doc_id, filename: d.label || d.filename || d.doc_id,
+                category: d.category, year: d.year };
+      } catch (e) {
+        notify("读取来源文档失败：" + (e.message || ""), "err");
+        src = null;
+      }
+    }
+    if (src) {
+      tab.value = "generate";
+      await selectSource(src);
+    }
+  }
 });
 </script>
 
@@ -466,7 +511,14 @@ onMounted(async () => {
     </div>
 
     <!-- 二次生成 -->
-    <div v-if="tab === 'generate'" class="md-gen">
+    <div v-if="tab === 'generate'">
+      <div class="gen-topbar">
+        <button class="btn primary" :disabled="!canGenerate" @click="generate">
+          {{ form.editingId ? "保存修改" : "生成二次纪要" }}
+        </button>
+        <span class="muted" v-if="!canGenerate" style="font-size:12px">请先选择来源纪要并勾选内容</span>
+      </div>
+      <div class="md-gen">
       <div class="md-left card card-pad">
         <div class="field">
           <label>源会议纪要（按文件名检索）</label>
@@ -536,7 +588,7 @@ onMounted(async () => {
             <div v-if="!tpl.items.length" class="muted">未识别到议题。</div>
           </div>
 
-          <div class="field-row" style="margin-top:12px">
+          <div class="field-row" style="margin-top:6px">
             <div class="field"><label>出席人员</label>
               <textarea class="input" rows="2" v-model="meta.present"></textarea></div>
             <div class="field"><label>列席人员</label>
@@ -556,7 +608,7 @@ onMounted(async () => {
           </div>
         </template>
 
-        <div class="field" style="margin-top:14px">
+        <div class="field" style="margin-top:8px">
           <label>二次纪要标题</label>
           <input class="input" v-model="form.title" placeholder="如：董事会决议摘要-预算部分" />
         </div>
@@ -587,7 +639,7 @@ onMounted(async () => {
           <pre class="preview-body">{{ genPreview }}</pre>
         </div>
 
-        <div class="toolbar" style="margin-top:14px">
+        <div class="toolbar" style="margin-top:10px">
           <button class="btn primary" :disabled="!canGenerate" @click="generate">
             {{ form.editingId ? "保存修改" : "生成二次纪要" }}
           </button>
@@ -601,6 +653,7 @@ onMounted(async () => {
            style="display:flex;align-items:center;justify-content:center;min-height:300px">
         请选择左侧一份会议纪要开始截取
       </div>
+    </div>
     </div>
 
     <!-- 衍生版本管理 -->
@@ -703,39 +756,45 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.md-tabs { display: inline-flex; gap: 6px; background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
-.md-tab { border: none; background: transparent; padding: 7px 18px; border-radius: 7px; cursor: pointer; font-size: 14px; color: var(--muted); }
+.md-tabs { display: inline-flex; gap: 4px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 3px; }
+.md-tab { border: none; background: transparent; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--muted); }
 .md-tab.active { background: var(--primary); color: #fff; font-weight: 600; }
 
-.md-gen { display: flex; gap: 16px; align-items: flex-start; }
-.md-left { width: 300px; flex: 0 0 300px; max-height: calc(100vh - 170px); overflow: auto; }
-.md-right { flex: 1; min-width: 0; max-height: calc(100vh - 170px); overflow: auto; }
+.gen-topbar { display: flex; justify-content: center; align-items: center; gap: 12px; margin-bottom: 10px; }
+.gen-topbar .btn.primary { min-width: 160px; }
+.md-gen { display: flex; gap: 10px; align-items: flex-start; }
+.md-left { width: 260px; flex: 0 0 260px; max-height: calc(100vh - 150px); overflow: auto; }
+.md-right { flex: 1; min-width: 0; max-height: calc(100vh - 150px); overflow: auto; }
 
-.src-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
-.gen-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; gap: 12px; }
+.src-list { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
+.gen-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; gap: 10px; }
 
-.tpl-meta { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
-.field-row { display: flex; gap: 10px; }
+.tpl-meta { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.tpl-meta .field { margin-bottom: 4px; }
+.field-row { display: flex; gap: 8px; }
 .field-row .field { flex: 1; min-width: 0; }
+.field { margin-bottom: 6px; }
+.field label { font-size: 12px; margin-bottom: 2px; display: block; }
+.input { padding: 5px 8px; font-size: 13px; }
 
-.blocks { display: flex; flex-direction: column; gap: 8px; }
+.blocks { display: flex; flex-direction: column; gap: 5px; }
 .block {
-  display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; cursor: pointer;
-  border: 1px solid var(--line); border-radius: 9px; background: #fff; position: relative;
+  display: flex; gap: 8px; align-items: flex-start; padding: 7px 9px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 7px; background: #fff; position: relative;
 }
 .block:hover { border-color: var(--primary); }
 .block.sel { border-color: var(--primary); background: var(--primary-soft); }
-.block input { margin-top: 3px; width: auto; }
-.block-txt { flex: 1; white-space: pre-wrap; line-height: 1.7; font-size: 13.5px; }
-.block-idx { position: absolute; top: 6px; right: 8px; font-size: 11px; color: var(--muted); }
+.block input { margin-top: 2px; width: auto; }
+.block-txt { flex: 1; white-space: pre-wrap; line-height: 1.55; font-size: 13px; }
+.block-idx { position: absolute; top: 4px; right: 6px; font-size: 10px; color: var(--muted); }
 
-.item-title { font-weight: 700; margin-bottom: 3px; }
+.item-title { font-weight: 700; margin-bottom: 2px; }
 .item-body { color: #374151; }
-.item-dec { color: #047857; margin-top: 3px; font-size: 13px; }
+.item-dec { color: #047857; margin-top: 2px; font-size: 12.5px; }
 
-.preview { margin-top: 16px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-.preview-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #f8fafc; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 13px; }
-.preview-body { margin: 0; padding: 14px; white-space: pre-wrap; line-height: 1.8; font-size: 13.5px; font-family: inherit; max-height: 360px; overflow: auto; }
+.preview { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.preview-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #f8fafc; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 12.5px; }
+.preview-body { margin: 0; padding: 10px; white-space: pre-wrap; line-height: 1.6; font-size: 13px; font-family: inherit; max-height: 300px; overflow: auto; }
 .link { color: var(--primary); cursor: pointer; text-decoration: underline; }
 .link:hover { color: var(--primary-d); }
 .link-chains { white-space: nowrap; }

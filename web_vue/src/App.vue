@@ -29,6 +29,8 @@ let toastTimer = null;
 // 跨页跳转：从衍生版本页跳回原版文档 / 跳到某衍生版本
 const pendingDocId = ref(null);
 const pendingDerivedId = ref(null);
+// 跨页跳转：从知识浏览页直接打开某文档的「纪要二次生成」编辑页（作为来源纪要）
+const pendingDerivedSourceId = ref(null);
 const detailDocId = ref("");
 
 function notify(msg, type = "") {
@@ -44,6 +46,11 @@ function openDocInBrowse(docId) {
 }
 function openDerivedInManage(derivedId) {
   pendingDerivedId.value = derivedId;
+  current.value = "MeetingDerived";
+}
+// 从知识浏览页点击「纪要二次生成」：以指定文档作为来源纪要，直接打开二次编辑页
+function openDerivedForDoc(docId) {
+  pendingDerivedSourceId.value = docId;
   current.value = "MeetingDerived";
 }
 function openDocDetail(docId) {
@@ -62,6 +69,8 @@ provide("openDerivedInManage", openDerivedInManage);
 provide("openDocDetail", openDocDetail);
 provide("pendingDocId", pendingDocId);
 provide("pendingDerivedId", pendingDerivedId);
+provide("openDerivedForDoc", openDerivedForDoc);
+provide("pendingDerivedSourceId", pendingDerivedSourceId);
 
 // 导航：按权限过滤。perm 为所需权限 key，无 perm 表示人人可见。
 const groups = [
