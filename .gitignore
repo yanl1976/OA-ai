@@ -30,6 +30,11 @@ knowledge_base/*.bak_*
 config/.env
 config/.env.*
 
+# 索引重建前的本地备份（_backup_index_<时间戳>/）。
+# 曾误入库：生产部署时不上传该目录，git 便认为文件被删除（D），
+# 导致工作区永久变脏、git pull 失败。故从版本库移除并永久忽略。
+_backup_index_*/
+
 # 运行时缓存
 .jieba_cache/
 

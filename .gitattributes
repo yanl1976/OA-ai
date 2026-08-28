@@ -1,0 +1,30 @@
+# 统一换行符为 LF，保证「开发环境(Windows) → Git → 生产(Linux)」三端一致。
+#
+# 背景（踩过的坑）：
+# 开发环境 core.autocrlf=true，工作区文件为 CRLF；而 Git 库中存的是 LF。
+# 将本地目录直传（SFTP）到生产后，生产工作区文件是 CRLF，git 比对其内容时
+# 判定为「已修改」，导致 git status 出现大量 M 标记，进而使 `git pull` 报
+#   error: Your local changes would be overwritten by merge
+# 而无法更新。
+#
+# 统一为 LF 后，无论在哪端检出，工作区与索引内容一致，git status 保持干净，
+# git pull 才能正常工作。
+
+# 文本文件统一用 LF（Git 自动识别文本/二进制）
+* text=auto eol=lf
+
+# 二进制文件明确声明，禁止任何换行符转换
+*.pkl   binary
+*.pdf   binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.db    binary
+*.key   binary
