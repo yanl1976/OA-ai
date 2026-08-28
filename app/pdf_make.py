@@ -64,6 +64,20 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_CN_SPACE_RE = re.compile(r"(\d)\s+(?=[一-鿿])")
+
+
+def _strip_cn_space(s: str) -> str:
+    """移除「数字+空格+中文」中的空格。
+
+    PDF 抽取常在数字与中文字符间留 ASCII 空格（如「50 万元」「2025 年」），
+    reportlab Paragraph 会优先在空格处断行，导致长标题被切成多段（如把
+    「50 万元以上」断成「50」+「万元以上」两行）。该函数仅在 PDF 渲染前对
+    标题/导语/正文中这种"数字-空格-中文"模式做合并，不影响英文词间空格。
+    """
+    return _CN_SPACE_RE.sub(r"\1", s or "")
+
+
 def _esc_br(s: str) -> str:
     """转义并保留原始换行（\n → <br/>），使导语/正文排版忠实于原文。"""
     return _esc(s).replace("\n", "<br/>")
@@ -221,7 +235,7 @@ def build_derived_pdf(meta: dict) -> bytes:
             story.append(Paragraph(_esc(tpl["meeting_seq"]), s_seq))
         # 导语/议题/出席列席
         if (tpl.get("intro") or "").strip():
-            story.append(Paragraph(_esc_br(tpl["intro"]), s_intro))
+            story.append(Paragraph(_esc_br(_strip_cn_space(tpl["intro"])), s_intro))
         items = tpl.get("items", [])
         single_item = len(items) == 1  # 单议题：原文无章节号，渲染时去掉可能的前导序号
         for it in items:
@@ -230,7 +244,7 @@ def build_derived_pdf(meta: dict) -> bytes:
                 if single_item:
                     # 去掉前导章节号（如「一、」「1.」），保留议题标题本身加粗显示
                     title = re.sub(r"^\s*(?:[一二三四五六七八九十]+、|\d+[.．、])\s*", "", title)
-                story.append(Paragraph(_esc(title), s_item_title))
+                story.append(Paragraph(_esc(_strip_cn_space(title)), s_item_title))
             if (it.get("body") or "").strip():
                 for para in _split_indent_paras(it["body"]):
                     story.append(Paragraph(_esc_br(para), s_item_body))

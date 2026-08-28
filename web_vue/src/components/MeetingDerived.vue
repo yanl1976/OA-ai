@@ -788,7 +788,7 @@ onMounted(async () => {
 .block-txt { flex: 1; white-space: pre-wrap; line-height: 1.55; font-size: 13px; }
 .block-idx { position: absolute; top: 4px; right: 6px; font-size: 10px; color: var(--muted); }
 
-.item-title { font-weight: 700; margin-bottom: 2px; }
+.item-title { font-weight: 700; margin-bottom: 2px; white-space: normal; }
 .item-body { color: #374151; }
 .item-dec { color: #047857; margin-top: 2px; font-size: 12.5px; }
 

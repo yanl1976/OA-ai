@@ -276,6 +276,15 @@ _ITEM_HEAD_ONLY_RE = re.compile(
     r"^\s*[（(]?[一二三四五六七八九十百千零\d]+[、.)）](?![\d])\s*[^。！？；：]*$"
 )
 
+# 议题内数字子项头行（如「3.依据《…》要求，…，并删除《监事会议事规则》。该事项」）：
+# 仅以阿拉伯数字序号（1./2./3.）开头即可，不要求整行无句末标点——子项内部本就可能有
+# 多个句号（如「…，并删除《…规则》。该事项」）。是否拼回续行由守卫里的「cur 不以句末
+# 标点结尾」判定（即本子项尚未结束）。用于续行守卫，避免被 _PARAGRAPH_START 的「数字
+# 序号分支」误判该子项为新段落起点而把折行切断。
+_SUBITEM_HEAD_RE = re.compile(
+    r"^\s*\d+[、.．](?!\d)"
+)
+
 # 标准条款标题（管理标准 / 工作标准 / 国标 GB/T 1.1 风格）：
 # 用于在无序号的短标题与正文之间断段，避免「范围本标准规定了…」「标准编写的
 # 基本要求贯彻国家…」这类条款标题被拼进正文挤成一坨。
@@ -581,6 +590,15 @@ def _clean_pdf_text(text: str) -> str:
                 else:
                     # 整行就是标题（尚无后续正文），暂存 cur 等下一行
                     cur = merged
+            elif _SUBITEM_HEAD_RE.match(cur) and not _SUBITEM_HEAD_RE.match(sub) and not _PARAGRAPH_START.match(sub) and not _END_PUNCT.intersection(cur[-1:]):
+                # 议题内数字子项续行守卫：cur 是以数字序号开头的议题内子项（如「3.依据《…》
+                # 要求，…，并删除《监事会议事规则》。该事项」），而下一行 sub 是该子项被 PDF
+                # 文本块边界折断的续行（如「经7月11日党委会前置研究通过。」），并非新议题/
+                # 公文要素/新数字子项。若直接走下方「_PARAGRAPH_START.match(cur)」（cur 以
+                # 「3.」命中数字序号分支）会把续行误断为新段落。故此处优先把续行拼回子项，
+                # 保持子项作为一个整体段落。仅当 sub 是真新段落（议题头/要素/另一数字子项/
+                # cur 已以句末标点收尾）时才断段。
+                cur = cur + sub
             elif _PARAGRAPH_START.match(sub) or _PARAGRAPH_START.match(cur):
                 # 议题序号 / 公文要素前缀 -> 断段
                 paras.append(cur)

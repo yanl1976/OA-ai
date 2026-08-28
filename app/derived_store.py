@@ -61,6 +61,31 @@ _ATTEND_RE = re.compile(r"^\s*(出\s*席|列\s*席)\s*人员\s*[:：]?")
 _ITEM_HEAD_RE = re.compile(r"^\s*((?:[0-9]{1,2}(?![\d]))|[一二三四五六七八九十百零]+)\s*[\.、．]")
 
 
+# 议题正文段内折行合并：若前行不以句末标点结尾（前行未结束），后行是延续句
+# （而非新段落/会议决定/讨论收束），则把后行拼回前行（用空格分隔）。
+# 解决「…该事项\n经7月11日…党委会前置研究通过。」被原样保留两行的问题——
+# PDF 原版段内自带的换行（如 PDF 文本块边界切断了同一段），提取层不一定合并，
+# 议题 body 显示会"随意换行"。
+# 保守判据：仅在前行未结束 且 后行不像是新段落/决定句开头时合并。
+_BODY_END_PUNCT = set("。！？；：…")  # 前行以此收尾则视为已结束
+_DECISION_HEAD_RE = re.compile(r"^\s*会议\s*(决定|要求|指出|强调|听取|审议|同意)|^\s*经\s*讨论|^\s*讨论\s*决定")
+
+
+def _merge_unfinished_lines(lines):
+    """议题 body 段内折行合并：前行未结束 + 后行延续 → 拼回。"""
+    if not lines:
+        return lines
+    out = [lines[0]]
+    for ln in lines[1:]:
+        prev = out[-1].rstrip()
+        last_char = prev[-1] if prev else ""
+        if last_char not in _BODY_END_PUNCT and ln.strip() and not _DECISION_HEAD_RE.match(ln):
+            out[-1] = prev + ln.lstrip()
+        else:
+            out.append(ln)
+    return out
+
+
 def _now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -381,8 +406,12 @@ def parse_minutes(text: str) -> dict:
         i += 1
     body = cleaned
 
-    # 7) 议题切分（以"一、/1."开头的行）
-    item_starts = [i for i, ln in enumerate(body) if _ITEM_HEAD_RE.match(ln)]
+    # 7) 议题切分（仅以中文序号"一、/二、"开头的行视为顶层议题）
+    # 注意：数字序号「1. / 2. / 3.」是议题内部的小章节/子项（如「1.依据…要求，
+    # 制定公司《…》」），不能当作新议题切分，否则会把一个议题拆成多个卡片。
+    # 因此顶层议题只认中文序号前缀，数字子项归入当前议题正文。
+    _TOP_ITEM_RE = re.compile(r"^\s*[一二三四五六七八九十百零]+\s*[、．]")
+    item_starts = [i for i, ln in enumerate(body) if _TOP_ITEM_RE.match(ln)]
     items = []
     intro = ""
     if item_starts:
@@ -391,7 +420,11 @@ def parse_minutes(text: str) -> dict:
             end = item_starts[j + 1] if j + 1 < len(item_starts) else len(body)
             seg = body[start:end]
             title = seg[0]
-            seg_text = "\n".join(seg[1:]).strip()
+            # 段内折行合并：解决 PDF 同一段被文本块边界切两行（如「…该事项」+「经7月
+            # 11 日…」）原样保留为两行的"随意换行"问题。仅在议题 body 内做，不影响
+            # 出席/列席名单的跨行续写（名单已先于此处处理）。
+            seg_body = _merge_unfinished_lines(seg[1:])
+            seg_text = "\n".join(seg_body).strip()
             decision, bodytext = "", seg_text
             dm = re.search(r"会议决定[：:].*", seg_text, re.DOTALL)
             if dm:
@@ -401,7 +434,8 @@ def parse_minutes(text: str) -> dict:
     else:
         # 无章节号（如仅一项议题的纪要）：识别「现将……纪要如下」引导句，
         # 引导句之后整段即为唯一议题，不应丢进 intro。
-        full = "\n".join(body).strip()
+        # 段内折行合并：与多议题分支保持一致。
+        full = "\n".join(_merge_unfinished_lines(body)).strip()
         m = re.search(r"纪要如下[：:]\s*", full)
         if m:
             intro = full[:m.end()].strip()
