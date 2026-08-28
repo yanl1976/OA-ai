@@ -52,6 +52,7 @@ kb_deploy/
 │   └── crypto.py             # 加密（secret.key）
 ├── scripts/
 │   ├── serve.py              # ✅ 启动入口（Flask，默认 8080）
+│   ├── start.sh              # ✅ 一行命令启动 + 进程守护（崩溃自动重启）
 │   └── install.sh            # 首次安装脚本（systemd 服务）
 ├── web_vue/                  # 前端（Vue 3 + Vite + Three.js）
 │   ├── dist/                 # 生产构建（serve.py 直接托管，无需 dev server）
@@ -339,6 +340,81 @@ bash scripts/install.sh
 > ```bash
 > sed -i 's/\r$//' scripts/install.sh
 > ```
+
+### 一行命令启动 + 进程守护（`scripts/start.sh`）
+
+**启动服务只需一条命令**，脚本自带守护进程，应用崩溃会自动重启：
+
+```bash
+bash /opt/OA-ai/scripts/start.sh
+```
+
+其他子命令：
+
+```bash
+bash scripts/start.sh stop       # 停止
+bash scripts/start.sh restart    # 重启
+bash scripts/start.sh status     # 查看状态
+bash scripts/start.sh logs       # 实时跟踪日志
+bash scripts/start.sh --help     # 帮助
+```
+
+**两种模式自动切换**（二选一，绝不重复守护）：
+
+| 模式 | 触发条件 | 说明 |
+|---|---|---|
+| **systemd** | 本机装有 `kb.service` 且当前用户能免密控制它 | 委托 `systemctl`，自带崩溃重启与**开机自启**，最省心 |
+| **standalone** | 无 systemd（容器等），或指定 `--standalone` | 脚本自带守护循环，后台常驻，检测到退出即拉起 |
+
+```bash
+bash scripts/start.sh --standalone    # 强制用脚本守护
+```
+
+**standalone 模式的守护行为**：
+
+| 行为 | 默认 | 可调环境变量 |
+|---|---|---|
+| 重启延迟 | 5 秒 | `RESTART_DELAY` |
+| 崩溃限流 | 5 次 / 300 秒 | `MAX_CRASH` / `CRASH_WINDOW` |
+| 正常退出是否重启 | 是 | `RESTART_ALWAYS=no` 可改为不重启 |
+| 日志上限 | 10 MB 自动轮转 | `MAX_LOG_SIZE` |
+
+```bash
+MAX_CRASH=10 RESTART_DELAY=10 bash scripts/start.sh --standalone
+```
+
+**产物**：
+
+```
+logs/kb.log              应用日志
+logs/kb-guardian.log     守护日志（记录每次崩溃与重启）
+run/kb.pid               应用 PID
+run/kb-guardian.pid      守护进程 PID
+```
+
+守护日志示例（可看出崩溃原因与限流计数）：
+
+```
+[2026-08-29 00:59:43] [G] 守护进程启动 (pid=130796, 延迟=5s, 限流=5次/300s)
+[2026-08-29 00:59:43] [G] 应用已启动 (pid=130804)
+[2026-08-29 00:59:52] [G] 应用退出 (pid=130804, code=137, 存活 9s)
+[2026-08-29 00:59:52] [G] 5s 后重启 (崩溃计数 1/5)
+[2026-08-29 00:59:57] [G] 应用已启动 (pid=130867)
+```
+
+**已实测验证**：
+
+- `kill -9` 应用进程 → 5 秒后自动拉起，服务恢复 ✅
+- 连续崩溃 2 次 → 限流计数正常递增（1/5 → 2/5）✅
+- 停止 → 进程干净退出，无残留 ✅
+
+> ⚠️ **防双重守护**：若 systemd 已在运行同一服务，脚本会先尝试停止它；
+> **停不掉则直接中止**并提示，绝不带冲突启动。
+> （早期版本只警告就继续，导致端口冲突、应用反复崩溃，最终留下 4 个进程。）
+>
+> ⚠️ **崩溃限流很重要**：无限重启会让服务在根本起不来时持续空转刷日志。
+> 达到上限后守护会停止并保留现场，便于排查。
+> 恢复方式：排除故障后重新执行 `bash scripts/start.sh`。
 
 ### 守护进程配置（systemd）
 
