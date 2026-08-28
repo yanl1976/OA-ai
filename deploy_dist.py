@@ -3,9 +3,10 @@
 import os
 import paramiko
 
-HOST = "192.168.30.155"
-USER = "yanl"
-PASSWORD = "Tsdcs2009520"
+from deploy_common import load_ssh_config
+
+# 连接凭据从 .env 读取（切勿硬编码：本仓库是公开的，明文密码会被推送到公网）
+HOST, USER, PASSWORD = load_ssh_config()
 REMOTE_DIST = "/opt/OA-ai/web_vue/dist"
 LOCAL_DIST = os.path.join(os.path.dirname(__file__), "web_vue", "dist")
 

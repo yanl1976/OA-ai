@@ -30,9 +30,10 @@ import posixpath
 
 import paramiko
 
-HOST = "192.168.30.155"
-USER = "yanl"
-PASSWORD = "Tsdcs2009520"
+from deploy_common import load_ssh_config
+
+# 连接凭据从 .env 读取（切勿硬编码：本仓库是公开的，明文密码会被推送到公网）
+HOST, USER, PASSWORD = load_ssh_config()
 REMOTE_ROOT = "/opt/OA-ai"
 REMOTE_NEW = "/opt/OA-ai-new"
 LOCAL_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +45,10 @@ EXCLUDE_DIRS = {
 }
 EXCLUDE_DIR_NAMES = {"__pycache__", "node_modules", ".jieba_cache"}
 EXCLUDE_FILE_SUFFIX = {".pyc", ".pyo"}
+# 【安全】凭据文件绝不上传。本地 .env 含 SSH 密码与 API Key，若被整目录
+# 传到生产，会覆盖生产自己的 .env（或在其缺失时被误用），造成配置错乱与
+# 密钥扩散。生产 .env 由下方第 3 步从原目录迁移，不依赖上传。
+EXCLUDE_FILE_NAMES = {".env"}
 # 备份目录与临时脚本不上传
 EXCLUDE_PREFIX = ("_backup_index_", "_scan_", "_diag_", "_verify_",
                   "_check_", "_probe_", "_test", "_chk_", "_vfinal",
@@ -110,6 +115,8 @@ def should_skip(rel_path):
             return True
     name = parts[-1]
     if any(name.endswith(s) for s in EXCLUDE_FILE_SUFFIX):
+        return True
+    if name in EXCLUDE_FILE_NAMES:
         return True
     if any(name.startswith(p) for p in EXCLUDE_PREFIX):
         return True
