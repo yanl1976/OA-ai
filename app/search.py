@@ -157,35 +157,36 @@ def _phrase_boost(text: str, query: str, qtokens: list, idf: dict = None) -> flo
     # 1) 完整短语命中次数（大小写不敏感，按原串连续匹配）
     exact_n = t.count(q) if len(q) >= 2 else 0
 
-    # 2) 分词覆盖率：按 IDF 加权（稀有词权重更高，缺关键词的文档明显吃亏）
-    #    同样先归并重叠 token，避免「智能/智能化」这类冗余切分重复计权。
-    if qtokens:
-        pairs = _merge_overlap_tokens(qtokens, idf)
-        total_w = sum(w for _, w in pairs)
-        hit_w = sum(w for tk, w in pairs if tk in t)
-        coverage = (hit_w / total_w) if total_w > 0 else 0.0
-    else:
-        coverage = 0.0
+    # 2) 分词覆盖率：按 IDF 加权，且【必须在同一个句子内统计】。
+    #
+    # 【重要修复】原实现在【整个 chunk（约 1200 字）】范围内统计覆盖率，导致
+    # 关键词散落在长文各处也算「全覆盖」，把检索带偏。真实 badcase：
+    #     查询「安全生产」        → 正确命中《应急预案》《消防安全管理》
+    #     查询「安全生产责任制」→ 却跑到《党风廉政建设责任制》《信访维稳》
+    # 原因：「责任制」是稀有词（高 IDF），而它在党风廉政领域大量出现；整段
+    # 统计时，只要 chunk 里同时飘着「安全生产」和「责任制」两个词（哪怕相隔
+    # 八百字），覆盖率就是 100%，于是党风廉政文档凭高 IDF 词胜出。
+    # 改为按句统计后，只有真正在同一句里同时出现「安全生产」和「责任制」的
+    # 文档才算全覆盖，语义无关的长文自然被降权。
+    coverage = _proximity_score(text, qtokens, idf=idf) if qtokens else 0.0
 
-    # 3) 聚集度：查询 token 是否集中在同一小句内（长查询的关键区分信号）
-    proximity = _proximity_score(text, qtokens, idf=idf)
-
-    # 4) 合成系数 = 基础分 + 完整短语加成 + 聚集度加成
+    # 3) 合成系数 = 基础分 + 完整短语加成 + 句级覆盖加成
+    #    注：coverage 已改为句级 IDF 加权覆盖率，与「聚集度」是同一指标，
+    #    故此处只计一次，避免同一信号被重复加成而失真。
     if exact_n > 0:
         # 完整短语命中：基础 1.0 + 按次数递增的加成（封顶）
         boost = 1.0 + min(exact_n * PHRASE_BOOST, PHRASE_BOOST_MAX)
-        boost += COVERAGE_WEIGHT * coverage * 0.5
-        boost += PROX_WEIGHT * proximity
+        boost += PROX_WEIGHT * coverage
         return boost
 
-    # 无完整短语：以「聚集度」为主、「覆盖率」为辅。
-    # 场景：长查询（如「安全生产责任制度」）在原文中无完全一致的连续串，
+    # 无完整短语：完全依赖「句级覆盖率」定分。
+    # 场景：长查询（如「安全生产责任制」）在原文中未必有完全一致的连续串，
     # 但只要「安全生产 / 责任 / 制度」挤在同一句里出现，就仍应判为强相关；
-    # 反之若它们散落在 1200 字各处各命中一次，则属碎片，应予降权。
+    # 反之若它们散落在长文各处各命中一次，则属无关长文，应予降权。
     if coverage <= 0:
         return LOW_COVER_PENALTY
-    base = LOW_COVER_PENALTY + (1.0 - LOW_COVER_PENALTY) * coverage
-    return base + PROX_WEIGHT * proximity
+    return LOW_COVER_PENALTY + (1.0 - LOW_COVER_PENALTY) * coverage \
+        + PROX_WEIGHT * coverage
 
 
 def _highlight(text, query_tokens, query=None):

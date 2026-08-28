@@ -148,3 +148,101 @@ def structured_extract(raw_text: str) -> str:
             + snippet)},
         # 「忠实还原原文」类任务必须低温，避免推理模型的默认高温导致自由发挥
     ], temperature=0.1, max_tokens=8192)
+
+
+# ============ 检索增强：查询改写 + 对比问题分解 ============
+# 这两项用于解决「检索喂料不准」导致的答非所问：
+#   1) 多轮对话中用户常省略主语（如「那它的流程呢？」），直接用这句话去检索
+#      必然搜不到，需结合上文补全为独立问句。
+#   2) 跨文档对比类问题（如「A 和 B 有什么区别」）单轮检索往往只召回其中一方，
+#      需拆成多个子问题分别检索后合并。
+# 均为「轻量辅助调用」：低温、限长、失败即回退到原问题，绝不阻塞主流程。
+
+_AUX_TIMEOUT = 30      # 辅助调用超时（秒），避免拖慢整体响应
+_AUX_MAX_TOKENS = 512  # 辅助调用只需短输出
+
+
+def rewrite_query(question: str, history: list, timeout: int = _AUX_TIMEOUT) -> str:
+    """把多轮对话中的「省略指代」问题补全为可独立检索的问句。
+
+    例：上文谈「安全生产责任制」，用户问「那它的流程呢？」
+        → 「安全生产责任制的工作流程是什么？」
+
+    history: [{"role": "user"|"assistant", "content": "..."}, ...]
+    失败或无需改写时返回原问题（保证主流程不被阻塞）。
+    """
+    if not question or not history:
+        return question  # 首轮无历史，无需改写
+    # 只取最近若干轮，控制 prompt 体积与延迟
+    recent = history[-6:]
+    hist_txt = "\n".join(
+        ("用户：" if m.get("role") == "user" else "助手：") + (m.get("content") or "")[:400]
+        for m in recent)
+    system = (
+        "你是检索查询改写器。结合对话历史，把用户最后的问题改写为"
+        "【可独立理解】的完整问句，用于全文检索。\n"
+        "铁律：\n"
+        "1. 只输出改写后的问句本身，不要任何解释、引号、前缀。\n"
+        "2. 必须保留原问题的核心意图，不得改变提问方向。\n"
+        "3. 若原问题本身已完整独立（无指代、无省略），原样输出即可。\n"
+        "4. 补全时优先使用上文出现过的【文档名/制度名/术语】原词。\n"
+    )
+    try:
+        out = chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": "对话历史：\n%s\n\n用户最后的问题：%s\n\n改写后的检索问句："
+             % (hist_txt, question)},
+        ], temperature=0.1, max_tokens=_AUX_MAX_TOKENS, timeout=timeout)
+        out = (out or "").strip().strip("\"'“”‘’ \n")
+        # 异常保护：改写结果为空或过长则回退原问题
+        if not out or len(out) > 200:
+            return question
+        return out
+    except Exception:
+        return question  # 改写失败不影响主流程
+
+
+# 对比/多主体意图的关键词（用于避免对每个简单问题都做 LLM 分解，控制延迟）
+_COMPARE_HINTS = ("对比", "比较", "区别", "差异", "异同", "相比", "有何不同",
+                  "哪个", "有哪些不同", "对照", " versus ", " vs ")
+
+
+def looks_like_comparison(question: str) -> bool:
+    """快速判断是否疑似「对比/多主体」问题（纯规则，零延迟）。"""
+    q = (question or "").lower()
+    return any(h in q for h in _COMPARE_HINTS)
+
+
+def decompose_question(question: str, timeout: int = _AUX_TIMEOUT) -> list:
+    """把对比/多主体问题拆为若干可独立检索的子问题。
+
+    例：「对比安全生产责任制和党风廉政责任制的差异」
+        → ["安全生产责任制的要求和内容", "党风廉政建设责任制的要求和内容"]
+
+    返回子问题列表；失败或不适用时返回 [原问题]（主流程不受影响）。
+    """
+    if not question:
+        return []
+    system = (
+        "你是检索任务分解器。把需要【跨多份资料对比】的问题，拆成若干个"
+        "可独立检索的子问题，确保每个子问题都能单独检索到其中一方的资料。\n"
+        "铁律：\n"
+        "1. 每行一个子问题，不要编号、不要解释、不要多余文字。\n"
+        "2. 子问题数量控制在 2-4 个。\n"
+        "3. 每个子问题必须保留原问题中的【具体对象名称原文】。\n"
+        "4. 若问题只涉及单一对象、无需对比，则只输出原问题本身一行。\n"
+    )
+    try:
+        out = chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": "原问题：%s\n\n子问题列表：" % question},
+        ], temperature=0.1, max_tokens=_AUX_MAX_TOKENS, timeout=timeout)
+        lines = [(l.strip().lstrip("0123456789.、)（- "))
+                 for l in (out or "").splitlines()]
+        subs = [l for l in lines if len(l) >= 4][:4]
+        if not subs:
+            return [question]
+        # 始终保留原问题作为第一个检索入口（保证整体语义不丢）
+        return [question] + [s for s in subs if s != question][:3]
+    except Exception:
+        return [question]

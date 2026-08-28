@@ -1771,15 +1771,37 @@ def kb_chat():
         first_title = question[:40]
         sid = chat_store.create_session(uid, first_title)
 
-    # 3) 检索（按分类 search 权限过滤）
-    hits = _retrieve_for_chat(question, perms, top_k=top_k)
-
-    # 4) 组装多轮历史（仅用户/助手文本，不含系统）
+    # 3) 组装多轮历史（仅用户/助手文本，不含系统）
+    #    必须先于检索：查询改写需要结合上文才能补全指代。
     history = []
     for m in chat_store.list_messages(sid):
         if m["role"] in ("user", "assistant"):
             history.append({"role": m["role"], "content": m["content"]})
     history.append({"role": "user", "content": question})
+
+    # 4) 检索（按分类 search 权限过滤）
+    #    4a) 查询改写：多轮时把「那它的流程呢？」这类省略指代的问题补全，
+    #        否则拿半句话去检索必然搜不到。首轮无历史时自动跳过，零开销。
+    search_query = llm.rewrite_query(question, history[:-1])
+    #    4b) 对比类问题分解：「A 和 B 有什么区别」单轮检索往往只召回一方，
+    #        拆成子问题分别检索后合并，保证对比双方资料齐全。
+    if llm.looks_like_comparison(search_query):
+        sub_queries = llm.decompose_question(search_query)
+    else:
+        sub_queries = [search_query]
+    #    4c) 多子问题检索并按文档去重合并（保留各自最高分）
+    hits = []
+    seen_doc = set()
+    for sq in sub_queries:
+        for h in _retrieve_for_chat(sq, perms, top_k=top_k):
+            d = h.get("doc_id")
+            if d in seen_doc:
+                continue
+            seen_doc.add(d)
+            hits.append(h)
+        if len(hits) >= top_k * 3:  # 合并池上限，避免上下文爆炸
+            break
+    hits = hits[:top_k * 2]
 
     # 5) 调 LLM：系统指令 + 历史 + 当前问题
     try:
