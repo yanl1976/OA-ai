@@ -129,6 +129,31 @@ def should_skip(rel_path):
     return False
 
 
+def _put_file(sftp, lp, rp, rel):
+    """上传单个文件。
+
+    【关键】.sh 脚本强制转为 LF 换行后再上传。
+
+    原因: 本部署是「从 Windows 工作区 SFTP 直传」，本地文件为 CRLF。
+    .gitattributes 的 eol=lf 只对 git 检出生效，管不到这条直传链路。
+    而 shell 脚本带 CRLF 在 Linux 上会出各种怪问题：
+      - 反斜杠续行符后面是 \\r\\n 而非 \\n，bash 直接报语法错误；
+      - 每行末尾多出的 \\r 会被当成命令/参数的一部分。
+    故在此统一转换，根治整类问题，不必逐个脚本手工注意。
+    """
+    if rel.endswith(".sh"):
+        with open(lp, "rb") as f:
+            data = f.read()
+        normalized = data.replace(b"\r\n", b"\n")
+        if normalized != data:
+            log("    [换行修正] %s (CRLF -> LF)" % rel)
+        with sftp.open(rp, "wb") as f:
+            f.write(normalized)
+        return len(normalized)
+    sftp.put(lp, rp)
+    return os.path.getsize(lp)
+
+
 def upload_tree(sftp, local, remote, stats):
     for name in sorted(os.listdir(local)):
         lp = os.path.join(local, name)
@@ -147,9 +172,9 @@ def upload_tree(sftp, local, remote, stats):
             if should_skip(rel):
                 continue
             try:
-                sftp.put(lp, rp)
+                size = _put_file(sftp, lp, rp, rel)
                 stats["n"] += 1
-                stats["b"] += os.path.getsize(lp)
+                stats["b"] += size
                 if stats["n"] % 100 == 0:
                     log("    已传 %d 个文件 (%.1f MB)"
                         % (stats["n"], stats["b"] / 1024 / 1024))

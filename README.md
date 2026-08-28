@@ -333,6 +333,103 @@ bash scripts/install.sh
 
 生成 systemd 服务、安装依赖、构建索引。
 
+> ⚠️ **Shell 脚本换行符**：本脚本从 Windows 直传后可能变成 CRLF，在 Linux 上会
+> 因 heredoc 结束标记变成 `EOF\r` 而报 `unexpected end of file`，**整个脚本无法运行**。
+> `deploy_from_local.py` 已自动把 `.sh` 转为 LF 上传；若手动 `scp` 上传，务必先转 LF：
+> ```bash
+> sed -i 's/\r$//' scripts/install.sh
+> ```
+
+### 守护进程配置（systemd）
+
+服务由 systemd 托管，unit 文件在 `/etc/systemd/system/kb.service`：
+
+```ini
+[Unit]
+Description=Local Knowledge Base Service (RAG + 3D Graph)
+After=network.target
+
+# 崩溃重启限流：防止反复崩溃时被无限重启
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=yanl
+WorkingDirectory=/opt/OA-ai
+ExecStart=/opt/OA-ai/venv/bin/python /opt/OA-ai/scripts/serve.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+MemoryMax=2G
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kb
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**关键项说明**：
+
+| 配置 | 作用 |
+|---|---|
+| `Restart=on-failure` | 仅在异常退出时重启（正常退出不拉起；`systemctl stop` 也不触发） |
+| `RestartSec=5` | 崩溃后等 5 秒再拉起，避免瞬时反复重启 |
+| `StartLimitIntervalSec` + `StartLimitBurst` | **防崩溃风暴**：300 秒内最多重启 5 次，超出则停止尝试并进入 `failed`，等人工介入 |
+| `MemoryMax=2G` | 内存上限，防止泄漏拖垮整机（实测常驻约 70MB） |
+| `TimeoutStopSec=30` | 停止时先发 SIGTERM，30 秒未退出才强杀（默认 90 秒太久） |
+| `ProtectSystem=full` | `/usr` `/boot` `/etc` 只读；`/opt` 不受影响，服务仍可正常读写数据 |
+| `WantedBy=multi-user.target` | 开机自启（配合 `systemctl enable`） |
+
+> ⚠️ **务必保留 `StartLimit*`**：此前服务曾因异常崩溃，被 systemd 无限重启
+> **17653 次**，刷爆日志并持续占用资源。加上限流后，超限即停止并进入 `failed`，
+> 便于人工排查而非任其空转。
+
+**常用操作**：
+
+```bash
+systemctl status kb                  # 查看状态
+systemctl restart kb                 # 重启
+systemctl stop kb / start kb         # 停止 / 启动
+systemctl enable kb                  # 设置开机自启
+systemctl disable kb                 # 取消开机自启
+journalctl -u kb -f                  # 实时跟踪日志
+journalctl -u kb -n 100 --no-pager   # 查看最近 100 行
+journalctl -u kb --since today       # 只看今天的日志
+```
+
+**修改 unit 后必须重载**：
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart kb
+systemd-analyze verify /etc/systemd/system/kb.service   # 改前先验语法
+```
+
+**验证守护是否真的生效**（杀掉进程看能否自愈）：
+
+```bash
+kill -9 $(systemctl show kb -p MainPID --value)
+sleep 8
+systemctl is-active kb      # 应仍为 active，且 PID 已变化
+```
+
+> 注意：`systemctl show` 里 `StartLimitIntervalSec` 显示为 `StartLimitIntervalUSec`
+> （值为 `5min`），这是同一项，只是属性名带 `USec` 后缀。
+
+**服务进入 failed 且不再重启时**（多半是触发了限流）：
+
+```bash
+systemctl status kb            # 看失败原因
+journalctl -u kb -n 50         # 查日志定位根因
+systemctl reset-failed kb      # 清除失败计数
+systemctl start kb             # 排除故障后重新启动
+```
+
 ### 服务运维
 
 ```bash
@@ -342,7 +439,7 @@ journalctl -u kb -n 50 --no-pager   # 查看日志
 curl http://127.0.0.1:8080/api/health
 ```
 
-> 服务监听端口 **8080**（`KB_API_PORT` 可覆盖）。
+> 服务监听端口 **8080**（`.env` 的 `KB_API_PORT` 可覆盖）。
 
 ### 备份与磁盘管理
 
