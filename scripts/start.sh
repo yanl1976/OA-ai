@@ -138,6 +138,17 @@ _use_systemd() {
   _can_control_systemd
 }
 
+_systemd_state() {
+  # 只读地查询 systemd 服务状态。
+  #
+  # 【与 _can_control_systemd 的区别】
+  #   systemctl is-active 是只读命令，普通用户【无需 sudo】即可执行。
+  #   而 start/stop/restart 需要 root。
+  #   因此即便无权控制服务，也应能如实读出它是否在跑——
+  #   否则 status 会把「正在由 systemd 运行的服务」误报成「未运行」。
+  systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown
+}
+
 # ---------- systemd 模式操作 ----------
 _sys() {
   # root 直接执行；非 root 加 sudo -n（免密方式，失败由调用方处理）
@@ -393,27 +404,81 @@ cmd_restart() {
 }
 
 cmd_status() {
-  if _use_systemd; then
-    echo "模式      : systemd（委托 systemctl，自带崩溃重启）"
-    _sys status "$SERVICE_NAME" --no-pager 2>&1 | head -12
-  else
+  # status 必须【如实反映服务实际状态】，而不是只报脚本自己的守护。
+  # 否则会出现「服务明明在跑，status 却说未运行」的误导（踩过）。
+  #
+  # 判定顺序：
+  #   1) 脚本守护在跑        -> standalone 模式，显示脚本守护信息
+  #   2) systemd 服务在跑    -> 由 systemd 守护（只读查询，无需 sudo）
+  #   3) 都不在              -> 未运行
+
+  if _is_alive "$GUARD_PID_FILE"; then
     _status_standalone
+    return 0
   fi
+
+  if _have_systemd_unit; then
+    local st
+    st=$(_systemd_state)
+    if [ "$st" = "active" ] || [ "$st" = "activating" ] \
+       || [ "$st" = "reloading" ]; then
+      echo "模式      : systemd（由 systemd 守护，自带崩溃重启与开机自启）"
+      echo "服务状态  : $st"
+      local mpid
+      mpid=$(systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null)
+      if [ -n "${mpid:-}" ] && [ "$mpid" != "0" ]; then
+        echo "应用进程  : 运行中 pid=$mpid  已运行 $(_uptime_of "$mpid")"
+      fi
+      local nr
+      nr=$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null)
+      [ -n "${nr:-}" ] && echo "重启次数  : $nr"
+      local enabled
+      enabled=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo unknown)
+      echo "开机自启  : $enabled"
+      if _can_control_systemd; then
+        echo ""
+        echo "（当前用户可控制该服务，start/stop/restart 将委托 systemd）"
+      else
+        echo ""
+        echo "注意: 当前用户无权启停该服务（sudo 需密码），start/stop/restart"
+        echo "      将自动降级为脚本守护。若要操作 systemd 请用 sudo："
+        echo "        sudo systemctl restart $SERVICE_NAME"
+      fi
+      return 0
+    fi
+    if [ "$st" = "failed" ]; then
+      echo "模式      : systemd"
+      echo "服务状态  : failed（可能因崩溃次数超限而停止重启，需人工排查）"
+      echo "提示      : 查看日志 journalctl -u $SERVICE_NAME -n 50"
+      echo "           排除故障后: systemctl reset-failed $SERVICE_NAME && systemctl start $SERVICE_NAME"
+      return 0
+    fi
+  fi
+
+  echo "服务状态  : 未运行"
+  echo "提示      : 执行 bash $0 start 启动"
 }
 
 cmd_logs() {
-  if _use_systemd; then
-    _sys_dash() {
-      if [ "$(id -u)" -eq 0 ]; then
+  # 优先跟 journal（systemd 模式），不可用时回退到应用日志文件
+  if _have_systemd_unit; then
+    local st
+    st=$(_systemd_state)
+    if [ "$st" = "active" ] || [ "$st" = "activating" ]; then
+      if journalctl -u "$SERVICE_NAME" -n 1 >/dev/null 2>&1; then
+        _log A "跟踪 systemd 日志（Ctrl+C 退出）"
         journalctl -u "$SERVICE_NAME" -f
-      else
-        sudo journalctl -u "$SERVICE_NAME" -f
+        return 0
       fi
-    }
-    _sys_dash
-  else
+    fi
+  fi
+  if [ -f "$APP_LOG" ]; then
     _log A "跟踪应用日志: $APP_LOG （Ctrl+C 退出）"
     tail -f "$APP_LOG"
+  else
+    _log A "无应用日志，且无法读取 systemd 日志（可能需要 sudo）"
+    _log A "  尝试: sudo journalctl -u $SERVICE_NAME -f"
+    return 1
   fi
 }
 
