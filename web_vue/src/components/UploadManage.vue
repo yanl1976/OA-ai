@@ -147,15 +147,30 @@ async function remove(d) {
 async function extractOne(d) {
   if (busyExtractId.value === d.doc_id) return;
   busyExtractId.value = d.doc_id;
+  const docId = d.doc_id;
   try {
-    const r = await api.initExtractOne(d.doc_id);
+    const r = await api.initExtractOne(docId);
     notify((r.note || "已提交单篇提取，稍候自动刷新") + "", "ok");
-    await load();
+    // 提取在后台 worker 异步执行，轮询刷新列表直到该文档提取完成（indexed=1），
+    // 避免「提交后立即 load 读到的仍是复位态/旧态」而误以为「没有任何变化」。
+    await pollUntilIndexed(docId);
   } catch (e) {
     notify(e.message, "err");
   } finally {
     busyExtractId.value = null;
   }
+}
+
+async function pollUntilIndexed(docId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await load();
+    const row = (items.value || []).find((x) => x.doc_id === docId);
+    if (row && row.indexed) return; // 后台已提取写回，停止轮询
+    await new Promise((res) => setTimeout(res, 1200));
+  }
+  // 超时也未完成：再刷新一次以呈现最终状态（可能仍提取中，用户可手动刷新）
+  await load();
 }
 
 async function batchRemove() {

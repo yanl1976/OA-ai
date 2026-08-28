@@ -145,11 +145,13 @@ def _extract_worker():
         try:
             task = _EXTRACT_Q.get(timeout=1.0)
         except _queue.Empty:
-            # 队列空：若有脏文档，异步触发一次向量全量重建 + BM25 全量重建
-            # （批量重提时逐篇只标记脏，此处统一 1 次重建，避免 N 次全量文件重写）
+            # 队列空：若有脏文档，异步触发一次「向量全量重建 + BM25 全量重建」。
+            # 向量此前在队列非空时只标脏、未单篇写盘（避免每篇全库 pickle 重写），
+            # 故此处统一做 1 次全量 BGE 编码 + 1 次文件重写（批量场景 O(1) 开销）；
+            # BM25 为纯分词、开销极低，同样统一重建一次。
             if _INDEX_DIRTY.is_set():
-                _vec_rebuild_async()
                 _bm25_rebuild_async()
+                _vec_rebuild_async()
             # 中止信号：清空剩余（理论上已空）并复位，避免再次入队时仍生效
             if _EXTRACT_ABORT.is_set():
                 _EXTRACT_ABORT.clear()
@@ -211,25 +213,26 @@ def _do_extract_task(task):
         except Exception as e:  # noqa: BLE001
             print("[background] 重归类失败 %s: %s" % (doc_id, e))
     kb_store.update_upload_text_async(doc_id, text, cat, year)
-    # 向量索引策略（兼顾单篇即时可搜 + 批量高效）：
-    # - 队列里还有后续任务（批量重提/批量上传）-> 只标记脏、不立即 upsert，避免 N 篇
-    #   逐篇 vstack + 全量 npy 原子重写（O(N 次文件重写）的巨大浪费）；待队列空闲时
-    #   一次性 vec_store.rebuild（全量，仅 1 次文件重写）+ BM25 全量重建。
-    # - 队列已空（本篇是最后/单独一篇，如单篇上传、单篇重提）-> 立即增量 upsert 这一篇，
-    #   用户可在数秒内检索到，无需等全库重建。
-    if _EXTRACT_Q.qsize() > 0:
-        _INDEX_DIRTY.set()
-        print("[background] 已提取文本: %s (%s)，批量中，待队列空闲后统一重建向量+BM25" % (filename, cat))
-    else:
+    # 向量索引策略（性能关键，勿回退为每篇 upsert）：
+    #   - 队列【非空】时：只标记脏、跳过任何向量写盘。把全部 BGE 编码 + 索引
+    #     重写推迟到队列空闲后【统一全量 rebuild 1 次】（见 _extract_worker 空闲分支）。
+    #     原因：每篇 upsert_document 会持锁做 BGE 编码 + np.vstack + 把整个 vec_index.pkl
+    #     全量 pickle 重写一次；连续点击 N 篇 = 全库向量写盘 N 次，开销 O(N×全库)，
+    #     这正是「连续点击变慢」的根因。统一 rebuild 仅 1 次文件重写，批量场景开销 O(1)。
+    #   - 队列【空】时（即单篇 / 最后一篇）：直接增量 upsert，使该篇立即可搜，
+    #     不触发全量 rebuild（单篇增量反而更省）。
+    # BM25 同理（不支持单篇增量，始终标记脏、空闲时统一 rebuild 一次，纯分词开销极低）。
+    if _EXTRACT_Q.empty():
         try:
             doc = kb_store.get_document(doc_id)
             if doc:
                 n = vec_store.upsert_document(doc)
-                _INDEX_DIRTY.set()  # BM25 仍全量，空闲时统一重建
-                print("[background] 向量增量更新(单篇): %s (+%d chunks)" % (filename, n))
+                print("[background] 向量增量更新: %s (%s, +%d chunks)" % (filename, cat, n))
         except Exception as e:  # noqa: BLE001
             print("[background] 向量增量失败 %s: %s" % (filename, e))
-            _INDEX_DIRTY.set()
+    else:
+        print("[background] 向量延迟到队列清空后统一重建（跳过本篇单写）: %s (%s)" % (filename, cat))
+    _INDEX_DIRTY.set()  # BM25 仍全量，空闲时统一重建
 
 
 def start_extract_worker():
