@@ -287,16 +287,43 @@ python deploy_from_local.py --rollback
 
 ### 备用方式：服务器 git 拉取
 
-`/opt/OA-ai` 已含 `.git`，也可在服务器上增量更新：
+`/opt/OA-ai` 已含完整 `.git`（非浅仓库，remote 为 HTTPS），可在服务器增量更新：
 
 ```bash
 cd /opt/OA-ai
-git fetch --depth 1 origin main && git reset --hard origin/main
+git pull origin main        # 工作区干净时可用
 sudo systemctl restart kb
 ```
 
-> ⚠️ 用 `--depth 1` 浅仓库时**不要用 `git pull`**（merge 在浅仓库可能失败），用 `fetch + reset --hard`。
-> 注意：此方式只更新被 git 跟踪的文件，索引仍需重建。
+**若报 `Your local changes ... would be overwritten by merge`**，改用强制同步：
+
+```bash
+cd /opt/OA-ai
+git fetch origin main && git reset --hard origin/main
+sudo systemctl restart kb
+```
+
+**为什么会脏**：`deploy_from_local.py` 是「把本地工作区文件整棵传过去」，不走 git。
+若本地有**未提交的改动**就部署，生产文件内容会比它的 git HEAD 新，于是 `pull` 被拒绝。
+（典型场景：改了代码先部署、后提交，或提交前就上传。）
+
+**规避方法**：部署前先 `git commit && git push`，再跑 `deploy_from_local.py`。
+
+**已验证的修复流程**（当工作区改动与远端内容实际一致时，丢弃零损失）：
+
+```bash
+# 1）先确认工作区文件与 origin/main 内容相同（哈希一致即可安全丢弃）
+git hash-object scripts/serve.py
+git rev-parse origin/main:scripts/serve.py
+
+# 2）一致则强制同步
+git fetch origin main && git reset --hard origin/main
+```
+
+> ⚠️ **不要用 `sudo` 跑 git**：root 的 `HOME`/凭据环境与 `yanl` 不同，`git fetch` 会长时间挂起。
+> 一律以 `yanl` 身份执行 git 命令，只有 `systemctl` / 写 `/opt` 才需要 `sudo`。
+>
+> ⚠️ 此方式只更新被 git 跟踪的文件，**索引仍需重建**，且不会迁移 `.env`、`venv` 等未入库数据。
 
 ### 首次安装（全新机器）
 
