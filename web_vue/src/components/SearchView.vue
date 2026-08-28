@@ -18,8 +18,20 @@ const activeRegion = ref(0); // 当前定位到的命中区域序号
 const regions = ref([]); // 命中内容区域 [[s,e],...]
 const renderedHtml = ref("");
 
-// 关键词拆分（与后端一致：长度≥2 的词才参与高亮，单字兜底）
-function splitTerms(q) {
+// 关键词拆分。
+// 优先使用【后端返回的分词 terms】：后端有 jieba 分词能力，而前端没有。
+// 若前端只拿整个查询串去 indexOf，则「安全生产责任制度」这类在原文中实际
+// 写作「安全生产责任制」的长查询会永远匹配不到，用户就会看到
+// 「正文未精确匹配关键词」。按后端分词匹配即可正确标出命中位置。
+// 无后端 terms 时（兼容旧接口）退化为按分隔符 + 整串兜底。
+function splitTerms(q, backendTerms) {
+  if (Array.isArray(backendTerms) && backendTerms.length) {
+    return backendTerms
+      .map((t) => String(t || "").trim().toLowerCase())
+      .filter((t) => t.length >= 1)
+      .filter((t, i, arr) => arr.indexOf(t) === i)
+      .sort((a, b) => b.length - a.length); // 长词优先
+  }
   const raw = (q || "").trim().toLowerCase();
   const terms = [];
   if (!raw) return terms;
@@ -38,8 +50,9 @@ function escapeHtml(s) {
 }
 
 // 在全文 text 中找出所有查询关键词的出现位置（大小写不敏感，去重叠）
-function computeOccurrences(text, query) {
-  const terms = splitTerms(query);
+// backendTerms：后端 jieba 分词结果，命中率远高于整串匹配（见 splitTerms 说明）
+function computeOccurrences(text, query, backendTerms) {
+  const terms = splitTerms(query, backendTerms);
   const lower = text.toLowerCase();
   const hits = [];
   const seen = new Set();
@@ -174,7 +187,7 @@ async function selectResult(res) {
     const doc = r.document || {};
     const text = doc.text || doc.full_text || "";
     docText.value = text;
-    occurrences.value = computeOccurrences(text, kw.value);
+    occurrences.value = computeOccurrences(text, kw.value, res.terms);
     regions.value = res.regions || [];
     // 初始定位到离检索命中点(char_start)最近的那个关键词
     let a = 0;

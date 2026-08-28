@@ -333,11 +333,31 @@ def stats():
 
     系统设置页等仅用于展示「索引是否就绪 / 文档数」，不应为展示而加载整个
     语义向量模型（BGE 模型首次加载需联网下载权重，约数十秒，是设置页卡顿根因）。
-    仅当索引已被检索路径加载过（_INDEX 非 None）才返回真实 chunks/docs；
-    否则只基于文件存在性返回就绪状态，避免任何模型加载。
+
+    【重要】_INDEX 未加载时，仍要读出索引文件的真实 chunks/docs，不能返回 None。
+    否则会让依赖 stats() 判断「向量索引是否为空」的调用方（如 search.hybrid_search）
+    在服务刚启动、索引尚未加载时误判为「空索引」而永久跳过向量检索——而跳过向量
+    就意味着 _INDEX 永远不会被加载，loaded 恒为 False，形成自锁死循环，语义检索
+    能力永远无法生效。读 pickle 中的 meta 列表（反序列化开销仅几十 ms，远小于
+    模型加载的数十秒）足以拿到真实数量，且不触发任何模型加载。
     """
     if _INDEX is None:
-        ready = os.path.exists(VEC_FILE)
-        return {"ready": ready, "chunks": None, "docs": None,
-                "loaded": False, "embedder": "bge"}
+        if not os.path.exists(VEC_FILE):
+            return {"ready": False, "chunks": 0, "docs": 0,
+                    "loaded": False, "embedder": "bge", "dim": BGE_DIM}
+        try:
+            with open(VEC_FILE, "rb") as f:
+                d = pickle.load(f)
+            meta = d.get("meta") or []
+            return {
+                "ready": True,
+                "chunks": len(meta),
+                "docs": len({m.get("doc_id") for m in meta}),
+                "loaded": False,
+                "embedder": d.get("embedder_type", "bge"),
+                "dim": d.get("dim", BGE_DIM),
+            }
+        except Exception:  # noqa: BLE001 - 索引损坏/读取失败：视为未就绪
+            return {"ready": False, "chunks": 0, "docs": 0,
+                    "loaded": False, "embedder": "bge", "dim": BGE_DIM}
     return get_index().stats()

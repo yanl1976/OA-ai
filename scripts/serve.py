@@ -1815,6 +1815,36 @@ def kb_chat():
     })
 
 
+def _warmup_vector_index():
+    """后台预热语义向量模型（BGE），消除首次检索的冷启动卡顿。
+
+    BGE 模型首次加载实测 ~20-33s（sentence-transformers 初始化需联网 HEAD 校验
+    权重 + CPU 推理准备）。若不在启动时预热，这份开销会落到第一个发起检索的
+    用户头上，表现为「第一次检索卡几十秒，之后就快了」。
+
+    两个保护：
+      1. 向量索引为空时跳过预热——此时 search.hybrid_search 会直接跳过向量路
+         （见 search.py），加载模型纯属浪费，且会拖慢服务启动。
+      2. 放进 daemon 后台线程——不阻塞服务启动，服务可立即对外提供 BM25 检索，
+         向量能力在预热完成后自动生效。
+    """
+    def _run():
+        try:
+            st = vec_store.stats()
+            if not st.get("ready") or (st.get("chunks") or 0) <= 0:
+                print("[信息] 向量索引为空，跳过 BGE 预热（检索走纯 BM25）")
+                return
+            t0 = time.time()
+            vec_store.get_embedder()          # 加载 BGE 模型（主要开销）
+            vec_store.search("预热", top_k=1)  # 触发索引加载 + 一次推理
+            print("[信息] BGE 语义向量预热完成，用时 %.1fs" % (time.time() - t0))
+        except Exception as e:  # noqa: BLE001
+            # 预热失败不影响服务：检索仍可用 BM25
+            print("[警告] BGE 预热失败（检索将回退 BM25）: %s" % e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 if __name__ == "__main__":
     admin.init_db()
     _seed_categories_from_source()
@@ -1829,6 +1859,8 @@ if __name__ == "__main__":
             print("[信息] 上传原文件归类迁移完成，共移动 %d 个文件" % moved)
     except Exception as e:  # noqa: BLE001
         print("[警告] 上传文件归类迁移失败（不影响服务启动）:", e)
+    # 后台预热语义向量模型，避免首次检索冷启动卡顿（非阻塞）
+    _warmup_vector_index()
     host = os.environ.get("KB_API_HOST", "0.0.0.0")
     port = int(os.environ.get("KB_API_PORT", "8080"))
     print(f"知识库管理服务启动: http://{host}:{port}/  (KB_ROOT={KB_ROOT})")
