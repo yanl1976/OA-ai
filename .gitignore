@@ -25,7 +25,10 @@ knowledge_base/*.bak_*
 # 环境配置（真实 .env 含凭证，切勿上传）
 .env
 .env.bak
+# 带时间戳的备份（如 .env.bak_20260828_175522）同样含明文密钥，必须一并排除
+.env.bak*
 config/.env
+config/.env.*
 
 # 运行时缓存
 .jieba_cache/
