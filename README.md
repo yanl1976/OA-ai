@@ -404,9 +404,41 @@ run/kb-guardian.pid      守护进程 PID
 
 **已实测验证**：
 
+- 服务在运行中执行 `start.sh` → **自动终止并重新启动**（pid 132132 → 132238）✅
 - `kill -9` 应用进程 → 5 秒后自动拉起，服务恢复 ✅
 - 连续崩溃 2 次 → 限流计数正常递增（1/5 → 2/5）✅
 - 停止 → 进程干净退出，无残留 ✅
+
+**权限配置（让脚本能自动停止/重启 systemd 服务）**：
+
+脚本需要 root 权限才能启停 systemd 服务。若未配置，`start.sh` 会提示
+"systemd 服务 kb 正在运行" 并中止。配置免密 sudo 即可解决：
+
+```bash
+sudo tee /etc/sudoers.d/kb-service > /dev/null <<'EOF'
+# 仅放行 kb 服务的 systemctl 操作
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl start kb
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl stop kb
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl restart kb
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl is-active kb
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl is-enabled kb
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl status kb *
+yanl ALL=(root) NOPASSWD: /usr/bin/systemctl show kb *
+EOF
+sudo chmod 440 /etc/sudoers.d/kb-service
+sudo visudo -c          # 必须校验通过
+```
+
+> ⚠️ 修改 sudoers 前**务必用 `visudo -c` 校验**，语法错误会导致 sudo 完全不可用。
+> 生产已配置此文件，位于 `/etc/sudoers.d/kb-service`。
+
+**三级提权回退**（脚本内建，保证任何环境都能真正把服务拉起来）：
+
+1. root → 直接执行
+2. `sudo -n` → 免密 sudo（配了上面的 sudoers 时走这条）
+3. `echo 密码 | sudo -S` → 从 `.env` 读取 `SUDO_PASSWORD`（无则回退 `SSH_PASSWORD`）
+
+三条都不通才会中止并提示，此时会明确告诉你该怎么配。
 
 > ⚠️ **防双重守护**：若 systemd 已在运行同一服务，脚本会先尝试停止它；
 > **停不掉则直接中止**并提示，绝不带冲突启动。
@@ -505,6 +537,12 @@ journalctl -u kb -n 50         # 查日志定位根因
 systemctl reset-failed kb      # 清除失败计数
 systemctl start kb             # 排除故障后重新启动
 ```
+
+> ⚠️ **别在脚本里快速连打启停命令**。限流是 300 秒 5 次，若自动化脚本在几秒内
+> 连续 `stop`+`start`+`restart`，会触发 `start-limit-hit` 让服务进入 `failed`。
+> （真实踩过：验证 sudoers 时按秒连打启停，服务直接 failed，
+> 日志显示 `Start request repeated too quickly`。）
+> 批量操作之间请留出 ≥8 秒间隔。
 
 ### 服务运维
 

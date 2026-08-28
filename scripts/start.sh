@@ -108,26 +108,21 @@ _have_systemd_unit() {
 }
 
 _can_control_systemd() {
-  # 是否真能操作 systemd 服务。
+  # 是否真能【启停】systemd 服务（而非仅查询）。
   #
-  # 【坑】systemctl start/stop 需要 root 权限。非 root 用户即使能查到 unit，
-  # 也可能无权启停（sudo 若需密码且无 tty，会报
-  # "a terminal is required to read the password" 并失败）。
-  # 这里用「能否免密执行一条只读命令」来判定，避免脚本走进必然失败的分支。
-  local out
+  # systemctl start/stop 需要 root。非 root 用户有两条路：
+  #   (1) sudo 免密（/etc/sudoers.d/ 配了 NOPASSWD）—— 推荐
+  #   (2) sudo 需密码，但 .env 里提供了密码 —— 由 _sys() 用 sudo -S 传入
+  # 两条任一可行即认为可控制，脚本就能真正「自动停止并重启」。
   if [ "$(id -u)" -eq 0 ]; then
-    systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1
-    return $?
+    return 0
   fi
-  out=$(sudo -n systemctl is-active "$SERVICE_NAME" 2>&1)
-  case "$out" in
-    *"a terminal is required"*|*"a password is required"*|*"not allowed"*)
-      return 1 ;;
-    *"inactive"*|*"active"*|*"failed"*|*"activating"*|*"unknown"*)
-      return 0 ;;
-    *)
-      return 1 ;;
-  esac
+  if sudo -n systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    return 0
+  fi
+  # 免密不可用，看是否有密码可用
+  [ -n "$(_sudo_password)" ] && return 0
+  return 1
 }
 
 _use_systemd() {
@@ -150,13 +145,48 @@ _systemd_state() {
 }
 
 # ---------- systemd 模式操作 ----------
+_sudo_password() {
+  # 需要提权时使用的密码来源（优先专用变量，回退 SSH 密码）。
+  # 从 .env 读取；该文件已被 .gitignore 排除，不会入库。
+  local f="$KB_ROOT/.env" v=""
+  [ -f "$f" ] || { echo ""; return 0; }
+  v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?SUDO_PASSWORD=' "$f" 2>/dev/null | tail -1 | cut -d= -f2-)
+  v=$(echo "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")
+  if [ -z "$v" ]; then
+    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?SSH_PASSWORD=' "$f" 2>/dev/null | tail -1 | cut -d= -f2-)
+    v=$(echo "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+          -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")
+  fi
+  echo "$v"
+}
+
 _sys() {
-  # root 直接执行；非 root 加 sudo -n（免密方式，失败由调用方处理）
+  # 执行 systemctl，按以下顺序尝试提权：
+  #   1) root            -> 直接执行
+  #   2) sudo 免密       -> sudo -n（需 /etc/sudoers.d/ 中配了 NOPASSWD）
+  #   3) sudo + 密码     -> echo pwd | sudo -S（密码取自 .env）
+  #
+  # 三级回退保证「一行命令」在任何环境都能真的把服务拉起来，
+  # 而不是卡在权限上。密码方式仅在本机未配 sudoers 时触发。
   if [ "$(id -u)" -eq 0 ]; then
     systemctl "$@"
-  else
-    sudo -n systemctl "$@"
+    return $?
   fi
+
+  if sudo -n systemctl "$@" 2>/dev/null; then
+    return 0
+  fi
+
+  local pwd
+  pwd="$(_sudo_password)"
+  if [ -n "$pwd" ]; then
+    # -S 从 stdin 读密码；过滤掉 sudo 回显的密码提示，避免污染输出
+    printf '%s\n' "$pwd" | sudo -S -p '' systemctl "$@" 2>/dev/null
+    return $?
+  fi
+
+  return 1
 }
 
 # ---------- standalone 守护核心 ----------
@@ -248,35 +278,38 @@ _standalone_start() {
     return 0
   fi
 
-  # 【防双重守护·必须成功否则中止】
-  # 若 systemd 已在运行同一服务，必须先把它停掉再启动脚本守护。
+  # 【自动停止已存在的服务，再重新拉起】
+  # 若 systemd 已在运行同一服务，先自动停掉它，再由本脚本接管。
   #
   # 【踩过的坑】曾在这里只打印警告就继续启动，结果 systemd 与脚本同时拉起
   # 应用：端口被 systemd 那份占着，脚本启动的应用立刻以 code=1 退出，
   # 守护又马上重启，形成崩溃风暴，最终留下 4 个 serve.py 进程。
-  # 因此：停不掉就【直接中止】，绝不带冲突启动。
+  # 所以必须先真正停掉，且要等端口释放干净。
   if _have_systemd_unit; then
     local st
     st=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)
-    if [ "$st" = "active" ] || [ "$st" = "activating" ]; then
-      if ! _sys stop "$SERVICE_NAME" 2>/dev/null; then
-        _log A "错误: systemd 服务 ${SERVICE_NAME} 正在运行，且当前用户无权停止它"
-        _log A "      若强行以 standalone 启动，会造成双重守护与端口冲突，故已中止。"
-        _log A "      请选择其一："
-        _log A "        (1) 用 systemd 管理: sudo systemctl restart $SERVICE_NAME"
-        _log A "        (2) 先交给 systemd 停止: sudo systemctl stop $SERVICE_NAME"
-        _log A "           再执行: bash $0 --standalone"
+    if [ "$st" = "active" ] || [ "$st" = "activating" ] || [ "$st" = "failed" ]; then
+      _log A "检测到 systemd 服务 ${SERVICE_NAME} 状态为 $st，正在自动停止..."
+      if ! _sys stop "$SERVICE_NAME"; then
+        _log A "错误: 无法停止 systemd 服务 ${SERVICE_NAME}（权限不足）"
+        _log A "      为避免端口冲突与双重守护，已中止启动。"
+        _log A "      请任选其一："
+        _log A "        (1) 配置免密 sudo 后重试（推荐）:"
+        _log A "            sudo visudo -f /etc/sudoers.d/kb-service"
+        _log A "        (2) 手动停止后重试: sudo systemctl stop $SERVICE_NAME"
+        _log A "        (3) 直接用 systemd 管理: sudo systemctl restart $SERVICE_NAME"
         return 1
       fi
-      _log A "已停止 systemd 服务 ${SERVICE_NAME}，改由脚本守护接管（避免双重拉起）"
-      # 等待端口释放
+      # 等它真正停下（最多 30 秒），确保端口已释放
       local waited=0
-      while [ "$waited" -lt 15 ]; do
-        if ! systemctl is-active "$SERVICE_NAME" 2>/dev/null | grep -q '^active$'; then
-          break
-        fi
-        sleep 1; waited=$((waited + 1))
+      while [ "$waited" -lt 30 ]; do
+        st=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)
+        case "$st" in
+          active|activating|deactivating) sleep 1; waited=$((waited + 1)) ;;
+          *) break ;;
+        esac
       done
+      _log A "已停止 systemd 服务 ${SERVICE_NAME}（等待 ${waited}s），改由脚本守护接管"
     fi
   fi
 
@@ -368,17 +401,36 @@ USAGE
 
 cmd_start() {
   if _use_systemd; then
-    _log A "使用 systemd 模式启动 ${SERVICE_NAME}.service"
-    if _sys start "$SERVICE_NAME" 2>/dev/null; then
-      sleep 2
-      _sys is-active "$SERVICE_NAME" 2>/dev/null
-      _log A "已启动 [systemd 模式]（systemd 自带崩溃重启与开机自启）"
-      _log A "  查看状态: bash $0 status"
-      _log A "  实时日志: bash $0 logs"
-      return 0
+    local st
+    st=$(_systemd_state)
+    # 服务已在运行 -> 先终止再重新拉起（systemctl start 对已运行的服务是
+    # no-op，不会重启，因此这里显式走 restart）
+    if [ "$st" = "active" ] || [ "$st" = "activating" ]; then
+      local old_pid
+      old_pid=$(systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null)
+      _log A "服务已在运行 (pid=${old_pid})，正在自动终止并重新启动..."
+      if _sys restart "$SERVICE_NAME"; then
+        sleep 4
+        local new_pid
+        new_pid=$(systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null)
+        _log A "已重启 [systemd 模式]  pid: ${old_pid} -> ${new_pid}"
+        _sys is-active "$SERVICE_NAME" 2>/dev/null
+        return 0
+      fi
+      _log A "systemd 重启失败，降级为脚本自带守护（会先停止 systemd 服务）"
+    else
+      _log A "使用 systemd 模式启动 ${SERVICE_NAME}"
+      if _sys start "$SERVICE_NAME"; then
+        sleep 2
+        _sys is-active "$SERVICE_NAME" 2>/dev/null
+        _log A "已启动 [systemd 模式]（systemd 自带崩溃重启与开机自启）"
+        _log A "  查看状态: bash $0 status"
+        _log A "  实时日志: bash $0 logs"
+        return 0
+      fi
+      # 启动失败（多为权限不足）时降级为脚本守护，保证一行命令总能起服务
+      _log A "systemd 启动失败，自动降级为脚本自带守护"
     fi
-    # 启动失败（多为权限不足）时降级为脚本守护，保证一行命令总能起服务
-    _log A "systemd 启动失败，自动降级为脚本自带守护"
   fi
   _standalone_start
 }
@@ -395,6 +447,8 @@ cmd_stop() {
 cmd_restart() {
   if _use_systemd; then
     _sys restart "$SERVICE_NAME"
+    sleep 3
+    _sys is-active "$SERVICE_NAME" 2>/dev/null
     _log A "已重启 [systemd 模式]"
   else
     _standalone_stop
