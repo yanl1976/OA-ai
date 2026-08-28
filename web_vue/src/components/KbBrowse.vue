@@ -26,6 +26,9 @@ const pageSize = 15;
 const loadingDocs = ref(false);
 const docDetail = ref(null);
 const loadingDoc = ref(false);
+// 中间列表搜索（按文档名/分类模糊筛选当前列表）
+const search = ref("");
+let searchTimer = null;
 
 // 该文档的衍生版本（顺查：原版 -> 衍生）
 const derivedForDoc = ref([]);
@@ -67,6 +70,7 @@ async function loadDocs() {
     const r = await api.documents({
       category: selected.value,
       year: selectedYear.value,
+      q: search.value.trim(),
       page: page.value,
       page_size: pageSize,
     });
@@ -92,6 +96,21 @@ async function loadDerivedForDoc(docId) {
 function selectCat(name) {
   selected.value = name || "";
   selectedYear.value = null;
+  page.value = 1;
+  loadDocs();
+}
+
+// 中间列表搜索：防抖 300ms，输入即筛选当前分类/年代下的文档
+function onSearch() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    page.value = 1;
+    loadDocs();
+  }, 300);
+}
+
+function clearSearch() {
+  search.value = "";
   page.value = 1;
   loadDocs();
 }
@@ -201,6 +220,17 @@ onMounted(async () => {
       <div class="cat-head">
         <span class="muted">{{ selected || "全部文档" }}（{{ total }}）</span>
       </div>
+      <!-- 列表内搜索（按文档名/分类模糊筛选当前列表） -->
+      <div class="list-search">
+        <input
+          class="search-input"
+          type="text"
+          v-model="search"
+          placeholder="搜索文档名 / 分类…"
+          @input="onSearch"
+        />
+        <button v-if="search" class="search-clear" @click="clearSearch">✕</button>
+      </div>
       <!-- 年代筛选按钮 -->
       <div class="year-bar" v-if="years.length">
         <button class="chip" :class="{ on: selectedYear === null }" @click="selectYear(null)">全部</button>
@@ -294,6 +324,37 @@ onMounted(async () => {
   gap: 6px;
   margin-bottom: 12px;
 }
+.list-search {
+  position: relative;
+  margin-bottom: 12px;
+}
+.search-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 28px 7px 11px;
+  font-size: 13px;
+  color: var(--text);
+  background: #fff;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.search-input:focus { border-color: var(--primary); }
+.search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  color: var(--muted, #9aa3b2);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px;
+}
+.search-clear:hover { color: var(--text); }
 .chip {
   border: 1px solid var(--line);
   background: #fff;
