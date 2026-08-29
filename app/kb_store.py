@@ -221,7 +221,20 @@ def _load_json_safe(path, default, kind="list"):
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # 类型兜底：防止并发/历史损坏导致「数组套数组」或混入非预期类型
+        if kind == "list":
+            if isinstance(data, list):
+                flat = []
+                for x in data:
+                    if isinstance(x, list):
+                        flat.extend(x)
+                    elif isinstance(x, dict):
+                        flat.append(x)
+                data = flat
+            else:
+                data = default
+        return data
     except (json.JSONDecodeError, ValueError):
         try:
             raw = open(path, "r", encoding="utf-8").read()
@@ -510,6 +523,9 @@ def save_upload(filename: str, category: str, text: str, raw_bytes: bytes = None
         except Exception:
             stored_rel = None
     ups = _load_uploads()
+    if not isinstance(ups, list):
+        ups = []
+    ups = [u for u in ups if isinstance(u, dict)]
     entry = {"doc_id": doc_id, "filename": filename, "category": category,
              "pages": max(1, text.count("\n") // 40 + 1), "label": filename,
              "text": text, "created_at": _now(),
@@ -577,6 +593,9 @@ def save_upload_raw(filename: str, category: str, raw_bytes: bytes) -> str:
         except Exception:
             stored_rel = None
     ups = _load_uploads()
+    if not isinstance(ups, list):
+        ups = []
+    ups = [u for u in ups if isinstance(u, dict)]
     entry = {"doc_id": doc_id, "filename": filename, "category": category,
              "pages": 1, "label": filename,
              "text": "", "created_at": _now(),
