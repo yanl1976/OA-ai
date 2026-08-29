@@ -30,6 +30,18 @@
 - **派生分析**：会议纪要结构化解析（议题切分）、二次生成 PDF。
 - **权限与角色**：用户/角色/权限管理，细粒度权限点（查看、上传、删除、图谱、派生分析等）。
 
+### 系统设置与界面（2026-08-29 更新）
+- **统一卡片网格**：原「管理功能」「系统维护」两个分组合并为统一卡片网格（入口卡片带「进入 →」，维护卡片带状态）。「系统初始化」高危卡片红框置底。
+- **系统名称设定**：系统设置新增「🏷 系统名称」卡片，可设定系统名称并查看版本号。
+  - **版本号**：由 Git 提交次数派生（每次 Git 更新即重新定义），规则为 `1.{commits//10}.{commits%10}`（每位满 10 进位，初始基准 1.0.0）。当前 55 次提交 → `v1.5.5`。
+  - 系统名称持久化于 `config/system_settings.json`（默认 "OA-AI 知识库"）。
+  - **首页左上角品牌名已变量化**：自动读取系统设置中的系统名称；管理员在系统设置修改并保存后，首页品牌名立即同步（全局响应式，无需刷新）。
+- **页面水印**：所有内容显示页叠加全局半透明水印（使用者账号 + 姓名，如 `zhangsan（张三）`），用于信息流向追踪与防泄露。
+  - 开关位于系统设置「🌐 页面水印」专用卡片（需 `system.manage` 权限切换），默认开启。
+  - 后端以功能开关 `watermark_enabled` 持久化（`app/admin.py` 的 `DEFAULT_FEATURES`，默认 1）；`list_features()` 幂等补种，保证旧库升级后开关可用且可持久化切换。
+- **概览首页联动**：首页「最近更新」列表点击文档 → 跳转「知识浏览」页并在右侧详情区打开该具体文档（与中间列表联动），不再跳独立详情组件。
+- **纪要二次生成按钮**：知识浏览页右侧详情区对「纪要」类文档（分类名以"纪要"结尾，如"总经理会议纪要"）显示「纪要二次生成」按钮（需 `derived.manage` 权限）；无权限时显示禁用提示按钮，便于区分"功能丢失"还是"账号未授权"。
+
 ---
 
 ## 目录结构
@@ -43,7 +55,7 @@ kb_deploy/
 │   ├── vec_store.py          # BGE 语义向量索引（缺失时回退哈希方案）
 │   ├── llm.py                # MiniMax LLM 封装（思考剥离、查询改写、问题分解）
 │   ├── kb_store.py           # 文档存储 / 元数据
-│   ├── admin.py              # 用户 / 角色 / 权限
+│   ├── admin.py              # 用户 / 角色 / 权限 + 功能开关（含 watermark_enabled）
 │   ├── chat_store.py         # 对话会话持久化
 │   ├── extract_text.py       # 多格式文档解析（PDF/Office/HTML）
 │   ├── pdf_make.py           # PDF 生成（reportlab）
@@ -233,6 +245,14 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 | GET | `/api/admin/roles` | 角色管理（需 `role.manage`） |
 | GET | `/api/admin/permissions` | 权限点列表 |
 | GET | `/api/admin/audit` | 审计日志 |
+
+### 系统设置
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/system/info` | 系统信息（登录可见）：`system_name` + `version`（Git 提交数派生）+ `commits` |
+| PUT | `/api/system/info` | 更新系统名称（需 `system.manage`，1~60 字符），请求体 `{ "system_name": "..." }` |
+| GET | `/api/admin/features` | 功能开关列表（含 `watermark_enabled`）；旧库首次访问自动补种缺失开关 |
+| PUT | `/api/admin/feature` | 切换功能开关（见上方"页面水印"） |
 
 ### 派生分析（会议纪要）
 | 方法 | 路径 | 说明 |
@@ -675,3 +695,12 @@ A：删除 `data/kb_admin.db` 重启服务，将重新初始化 `admin / Admin@1
 
 **Q：多个 serve.py 进程冲突？**
 A：停止所有匹配 `serve.py` 的 python 进程后再启动单实例。
+
+**Q：新增的系统名称 / 页面水印 / 卡片整理等前端改动没生效？**
+A：前端改动需 `npm run build` 重建 `web_vue/dist`，而 **`dist/` 被 `.gitignore` 忽略，`git pull` 拉不到**。生产机更新必须另行同步 dist：开发机 `python deploy_dist.py`（走既定部署脚本，不触碰 git 跟踪文件），或生产机 `cd /opt/OA-ai/web_vue && npm run build`。后端 `scripts/serve.py`、`app/admin.py` 等会随 `git pull` 更新。
+
+**Q：升级后系统设置里「页面水印」开关切换不生效？**
+A：旧库缺少 `watermark_enabled` 这一行时，`setFeature` 的 UPDATE 会因找不到行而静默失效。已在 `admin.list_features()` 增加幂等补种（首次访问 `/api/admin/features` 自动 `INSERT OR IGNORE` 补入缺失开关），`git pull` + 重启后前端首次加载即补入，开关即可持久化切换。
+
+**Q：系统名称改了但首页左上角没变？**
+A：首页品牌名在页面加载时读取 `/api/system/info`；管理员在系统设置保存后全局立即同步。若未登录或非管理员，左上角显示的是最近一次读取到的名称（默认 "OA-AI 知识库"）。确认系统设置卡片已保存成功。

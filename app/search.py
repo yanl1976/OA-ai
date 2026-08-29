@@ -27,6 +27,10 @@ MIN_REL = 0.3
 # 低于此值的文档视为语义不相关，直接剔除（如"会议纪要"类 0.67 远低于标准类 0.8+）。
 # 该值基于归一化余弦的物理意义（<0.72 通常语义无关），回退哈希向量时不启用。
 SIM_FLOOR = 0.72
+# 绝对语义门槛（仅 BGE 向量生效）：用于「完整词法串全库未命中」时对纯向量召回
+# 文档（档 0，零词法命中）的二次收紧。比 SIM_FLOOR(0.72) 更严格，过滤掉 BGE 把
+# 专有名词（如人名「郑世勤」）语义关联到相邻主题（如「员工薪酬管理」）产生的弱误召回。
+ABS_SEMANTIC_TIER = 0.80
 # 每篇相关文档最多取多少个最相关 chunk 拼接进 content（控制 LLM 上下文长度，避免整本文档碎片噪声）
 MAX_CHUNKS_PER_DOC = 3
 
@@ -443,7 +447,22 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     elif _max_tier >= 2:
         _kept = [ds for ds in ranked if _qual[ds[0]][0] >= 1]
     else:
-        _kept = list(ranked)
+        # 完整词法串全库未命中（无任何文档含查询原串，最高档<=1）：
+        # 此时结果里若存在文档，几乎全是「纯向量语义召回、零词法命中」的档 0 文档，
+        # 极易误召回（如搜人名「郑世勤」却召回「员工薪酬管理」——BGE 把人名语义
+        # 关联到相邻主题）。必须对档 0 加重过滤，否则会变成「列出一堆全文零命中」的垃圾。
+        #   ① 先剔除档 0（纯向量零词法）；
+        #   ② 若剔除后为空（全库无词法聚集文档），则仅保留向量单文档最高余弦相似度
+        #      >= ABS_SEMANTIC_TIER(0.80，比 SIM_FLOOR 更严格) 的档 0 文档，过滤弱语义；
+        #   ③ 仍为空则回退到未过滤结果（宁宽松也不空，避免误杀真实存在的弱相关）。
+        _kept = [ds for ds in ranked if _qual[ds[0]][0] >= 1]
+        if not _kept:
+            _kept = [
+                ds for ds in ranked
+                if max((sc for _, sc in vec_chunks.get(ds[0], [])), default=0) >= ABS_SEMANTIC_TIER
+            ]
+            if not _kept:
+                _kept = list(ranked)
     if _kept:
         ranked = _kept
 
