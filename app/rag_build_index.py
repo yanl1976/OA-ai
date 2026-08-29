@@ -131,7 +131,7 @@ def build_index():
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     print(f"\n{'='*50}")
-    print("✅ 索引构建完成！")
+    print("[OK] 索引构建完成！")
     print(f"   索引路径:    {INDEX_DIR}")
     print(f"   文档数量:    {len(docs)} 份")
     print(f"   文本块数量:  {len(all_chunks)} 个")
