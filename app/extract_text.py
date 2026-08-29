@@ -1296,25 +1296,31 @@ def extract(raw: bytes, filename: str, category: str = None):
     if ext not in ALLOWED_EXT:
         raise ValueError(
             "不支持的文件格式: %s（支持 txt/md/csv/docx/xlsx/pptx/pdf）" % ext)
-    if ext in (".txt", ".md", ".csv"):
-        text = _decode_text(raw)
-        warn = None
-    elif ext == ".docx":
-        text = _extract_docx(raw)
-        warn = None
-    elif ext == ".xlsx":
-        text = _extract_xlsx(raw)
-        warn = None
-    elif ext == ".pptx":
-        text = _extract_pptx(raw)
-        warn = None
-    elif ext == ".pdf":
-        text = _decode_pdf(raw, category=category)
-        warn = None
-        if not text.strip():
-            warn = "PDF 未提取到文本（可能为扫描件/图片型 PDF）"
-    else:
-        raise ValueError("不支持的文件格式: %s" % ext)
+    try:
+        if ext in (".txt", ".md", ".csv"):
+            text = _decode_text(raw)
+            warn = None
+        elif ext == ".docx":
+            text = _extract_docx(raw)
+            warn = None
+        elif ext == ".xlsx":
+            text = _extract_xlsx(raw)
+            warn = None
+        elif ext == ".pptx":
+            text = _extract_pptx(raw)
+            warn = None
+        elif ext == ".pdf":
+            text = _decode_pdf(raw, category=category)
+            warn = None
+            if not text.strip():
+                warn = "PDF 未提取到文本（可能为扫描件/图片型 PDF）"
+        else:
+            raise ValueError("不支持的文件格式: %s" % ext)
+    except Exception as e:  # noqa: BLE001
+        # 兜底：任何底层解码异常都不应让后台提取任务崩溃（否则文档永久「识别中」）。
+        # 返回空文本 + 明确告警，由上层决定是否重试或标注。
+        text = ""
+        warn = "基础提取失败（已跳过，文档可能损坏或不支持）: %s" % e
     # 语义后处理（会议纪要 / 管理标准 / 默认）
     text = post_process(text, category)
     return text, warn

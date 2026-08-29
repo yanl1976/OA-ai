@@ -211,26 +211,69 @@ def _extract_year(filename: str, content: str):
     return datetime.now().year
 
 
+def _load_json_safe(path, default, kind="list"):
+    """安全读取 JSON 文件：损坏时自动截断恢复为合法结构，避免单文件损坏瘫痪整个功能。
+
+    恢复策略：若整体解析失败，逐对象回退（JSONDecoder.raw_decode），仅保留能解析的前缀；
+    原损坏文件备份为 <file>.bad. 供人工核查。无法恢复时返回 default。
+    """
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            raw = open(path, "r", encoding="utf-8").read()
+            dec = json.JSONDecoder()
+            items = []
+            s = raw.lstrip()
+            while s:
+                s = s.lstrip()
+                if not s:
+                    break
+                try:
+                    obj, end = dec.raw_decode(s)
+                except Exception:
+                    break
+                if kind == "list":
+                    items.append(obj)
+                else:
+                    items = obj  # dict 场景：取首个合法对象
+                    break
+                s = s[end:]
+            # 备份原文件
+            shutil_move = path + ".bad."
+            try:
+                import shutil as _sh
+                _sh.copy(path, shutil_move)
+            except Exception:
+                pass
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(items if kind == "list" else (items or default), f,
+                          ensure_ascii=False, indent=2)
+            return items if kind == "list" else (items or default)
+        except Exception:
+            return default
+
+
 def _load_raw() -> dict:
     if not os.path.exists(RAW_DATA):
         return {"categories": {}, "documents": []}
-    with open(RAW_DATA, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json_safe(RAW_DATA, {"categories": {}, "documents": []}, kind="dict")
 
 
 def _load_uploads() -> list:
     if not os.path.exists(UPLOAD_FILE):
         return []
-    with open(UPLOAD_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json_safe(UPLOAD_FILE, [], kind="list")
 
 
 def _load_manifest() -> dict:
     """manifest: {doc_id: {filename, category, pages, label, source}}"""
     if not os.path.exists(MANIFEST):
         return {}
-    with open(MANIFEST, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json_safe(MANIFEST, {}, kind="dict")
 
 
 def _upload_to_doc(u: dict) -> dict:
