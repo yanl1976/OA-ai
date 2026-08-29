@@ -433,6 +433,22 @@ def list_users() -> list:
 
 
 def create_user(username: str, password: str, display_name: str = "", role_id: int = None) -> int:
+    """创建用户。
+
+    【防呆】签名中 display_name 位于 role_id 之前，按位置传易把角色 id 当成
+    显示名（如 create_user(u, p, rid)），结果 display_name 变成数字、role_id 为
+    None —— 用户被创建但【没有任何角色】，权限全空，且不报错、极难排查。
+    这里做类型校验：display_name 必须是字符串，role_id 必须是整数。
+    """
+    if display_name is not None and not isinstance(display_name, str):
+        # 常见误用：把 role_id 按位置传给了 display_name
+        if isinstance(display_name, int) and role_id is None:
+            role_id = display_name     # 纠正：挪到 role_id
+            display_name = ""
+        else:
+            raise ValueError("显示名必须是字符串，收到 %s" % type(display_name).__name__)
+    if role_id is not None and not isinstance(role_id, int):
+        raise ValueError("角色 id 必须是整数，收到 %s" % type(role_id).__name__)
     conn = _conn()
     if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
         conn.close()

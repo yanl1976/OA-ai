@@ -569,13 +569,16 @@ def kb_documents():
         page_size = int(request.args.get("page_size", 20))
     except ValueError:
         page, page_size = 1, 20
-    res = kb_store.list_documents(category, q, year, page, page_size)
-    # 按分类浏览权限过滤（静默过滤无权限类型）
-    docs = [d for d in res.get("documents", [])
-            if admin.check_cat_action(perms, d.get("category"), "view")]
-    total = len(docs)
-    res["documents"] = docs
-    res["total"] = total
+
+    # 【修复·权限过滤】原实现在拿到结果后过滤 res["documents"]，而 list_documents
+    # 返回的键是 "items"，键名不匹配 -> 过滤从未生效，未授权文档直接泄漏给前端。
+    # 现改为：先算出「允许浏览的分类集合」，下传给 list_documents 在【分页之前】
+    # 完成过滤，保证 total / years / 分页结果三者一致，且翻页不错乱。
+    allowed = _allowed_browse_categories(perms)
+    res = kb_store.list_documents(category, q, year, page, page_size,
+                                  allowed_categories=allowed)
+    # 兼容：历史前端可能仍读 documents 键，这里同时提供两个键，指向同一份数据
+    res["documents"] = res.get("items", [])
     return jsonify(res)
 
 
@@ -918,6 +921,24 @@ def _split_year_segs(path_segs):
             continue          # 年度层不作为分类
         cat_segs.append(seg)
     return cat_segs, year
+
+
+def _allowed_browse_categories(perms: set):
+    """返回当前账号允许浏览（view）的文档分类集合。
+
+    按「去重后的分类名」逐一判定，而非对每篇文档判定：权限判定本身要连库
+    沿祖先链查询，若对 N 篇文档各判一次就是 N 次库查询；改为先取全库出现的
+    分类名（通常几十个），判一次缓存复用，开销大幅下降。
+
+    返回集合供 kb_store.list_documents 做「分页前过滤」，保证：
+      - 未授权分类的文档一条都不会出现在列表里（而不是点进去才被拦）
+      - total / years / 分页切片三者一致，翻页不错乱
+    """
+    try:
+        cats = kb_store.all_category_names()
+    except Exception:  # noqa: BLE001
+        return None      # 取分类失败时不过滤，交由逐篇判定兜底
+    return {c for c in cats if admin.check_cat_action(perms, c, "view")}
 
 
 def _ensure_category(name: str, parent_id):
@@ -1600,8 +1621,11 @@ def adm_user_create():
     if not username or not password:
         return jsonify({"error": "用户名与密码不能为空"}), 400
     try:
-        uid = admin.create_user(username, password, data.get("display_name", ""),
-                                data.get("role_id"))
+        # 关键字参数：避免签名调整后 display_name / role_id 位置传参错位
+        # （错位会导致用户被创建但无角色，权限全空且不报错）
+        uid = admin.create_user(username, password,
+                                display_name=data.get("display_name", ""),
+                                role_id=data.get("role_id"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "id": uid})

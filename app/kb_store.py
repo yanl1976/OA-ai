@@ -414,13 +414,37 @@ def _all_browse_docs() -> list:
     return docs
 
 
+def all_category_names() -> set:
+    """返回全部浏览文档中出现过的分类名（去重）。
+
+    供权限过滤使用：按「分类」而非「文档」判定权限，把原本 N 篇文档的
+    逐篇数据库查询（每篇都要沿祖先链查一次）降为「去重后的分类数」次，
+    开销从 O(文档数) 降到 O(分类数)，通常只有几十个。
+    """
+    return {d.get("category") for d in _all_browse_docs() if d.get("category")}
+
+
 def list_documents(category: str = None, q: str = None, year: int = None,
-                   page: int = 1, page_size: int = 20) -> dict:
+                   page: int = 1, page_size: int = 20,
+                   allowed_categories: set = None) -> dict:
     """返回分页文档列表 + 总数 + 可选年份 facet。
 
     年份 facet(years): 当前筛选条件下出现的全部年份，供前端按年代出按钮。
+
+    allowed_categories: 允许浏览的分类集合（None 表示不过滤）。
+      【修复·未授权文档泄漏】权限过滤【必须】在这里、且【必须在分页之前】完成。
+      原因有二：
+        1) 原实现在路由层对返回结果的 "documents" 键做过滤，而本函数实际返回的
+           是 "items" 键 —— 键名对不上，过滤遍历空列表，等于完全没过滤，
+           前端直接拿到未授权文档（这正是「秘书能看到管理标准」的根因）。
+        2) 即便改对键名，若在【分页之后】过滤，会导致 total 只统计当前页过滤后
+           的条数、翻页错乱、每页数量忽多忽少。
+      下沉到分页前过滤，则 total / years / 分页切片三者天然一致。
     """
     docs = _all_browse_docs()
+    # 权限过滤：分页前执行，保证 total 与分页结果一致
+    if allowed_categories is not None:
+        docs = [d for d in docs if d.get("category") in allowed_categories]
     # 补全 year 字段
     for d in docs:
         if d.get("year") is None:
