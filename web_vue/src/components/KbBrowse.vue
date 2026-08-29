@@ -22,11 +22,15 @@ function isMinutesCategory(cat) {
   // 子分类命名形如「总经理会议纪要」「专项会议纪要」，统一以「纪要」结尾归类
   return c.endsWith("纪要");
 }
-const canDerived = computed(() => {
+// 当前文档是否为「纪要类」（仅用于判断是否可展示二次生成入口）
+const isMinutesDoc = computed(() => isMinutesCategory(docDetail.value?.category));
+// 是否有「会议纪要二次生成」权限
+const hasDerivedPerm = computed(() => {
   const perms = user.value?.permissions || [];
-  if (!perms.includes("derived.manage")) return false;
-  return isMinutesCategory(docDetail.value?.category);
+  return perms.includes("derived.manage");
 });
+// 二次生成按钮：① 需 derived.manage 权限；② 当前文档须属于「纪要」分类域
+const canDerived = computed(() => isMinutesDoc.value && hasDerivedPerm.value);
 
 const roots = ref([]);
 const selected = ref(""); // "" 表示全部文档
@@ -290,6 +294,12 @@ onMounted(async () => {
         <div class="toolbar" style="margin-bottom:10px">
           <button class="btn sm primary" @click="previewPdf">预览 PDF</button>
           <button class="btn sm" v-if="canDerived" @click="openDerivedForDoc(docDetail.doc_id)">纪要二次生成</button>
+          <button
+            class="btn sm disabled"
+            v-else-if="isMinutesDoc && !hasDerivedPerm"
+            title="当前账号未授予「会议纪要二次生成」权限"
+            disabled
+          >纪要二次生成（无权限）</button>
         </div>
         <div class="doc-view">{{ docDetail.text || docDetail.full_text || "（无正文）" }}</div>
 

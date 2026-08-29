@@ -4,7 +4,7 @@ import { api } from "../api.js";
 import { inject } from "vue";
 
 const notify = inject("notify");
-const openDocDetail = inject("openDocDetail");
+const openDocInBrowse = inject("openDocInBrowse");
 const overview = ref({ doc_count: 0, category_count: 0, tag_count: 0,
   trash_count: 0, total_count: 0, recent: [] });
 const tags = ref([]);
@@ -29,7 +29,9 @@ function go(key) {
 }
 
 function openDoc(docId) {
-  if (openDocDetail) openDocDetail(docId);
+  // 跳转到「知识浏览」页并在右侧详情区打开该具体文档（与列表联动），
+  // 而非独立的 DocDetail 组件。
+  if (openDocInBrowse) openDocInBrowse(docId);
 }
 
 onMounted(load);
