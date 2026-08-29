@@ -93,6 +93,7 @@ DEFAULT_FEATURES = [
     ("register_enabled","自助注册",      "允许访客自行注册为只读账号",             0),
     ("upload_enabled",  "文档上传",      "允许用户上传文档扩充知识库",             1),
     ("api_public",      "开放检索 API",  "无需登录即可调用 /api/query",          0),
+    ("watermark_enabled","页面水印",      "为所有内容显示页叠加使用者账号+姓名水印", 1),
 ]
 
 

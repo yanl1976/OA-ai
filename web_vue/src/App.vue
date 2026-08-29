@@ -33,6 +33,13 @@ function setSystemName(name) {
   if (name) systemName.value = name;
 }
 
+// 页面水印：开关来自功能开关 watermark_enabled；内容 = 使用者账号 + 姓名
+const watermarkOn = ref(true);
+const watermarkText = ref("");
+function setWatermark(text) {
+  watermarkText.value = text || "";
+}
+
 // 跨页跳转：从衍生版本页跳回原版文档 / 跳到某衍生版本
 const pendingDocId = ref(null);
 const pendingDerivedId = ref(null);
@@ -81,6 +88,22 @@ provide("openDerivedForDoc", openDerivedForDoc);
 provide("pendingDerivedSourceId", pendingDerivedSourceId);
 provide("systemName", systemName);
 provide("setSystemName", setSystemName);
+provide("watermarkOn", watermarkOn);
+provide("watermarkText", watermarkText);
+provide("setWatermark", setWatermark);
+
+// 水印平铺格子（覆盖视口，旋转展示账号+姓名）
+const watermarkTiles = computed(() => {
+  if (!watermarkOn.value || !watermarkText.value) return [];
+  const cols = 5, rows = 8;
+  const arr = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      arr.push({ id: r * cols + c, top: (r * (100 / rows)) + (c % 2 ? 6 : 0), left: c * (100 / cols) });
+    }
+  }
+  return arr;
+});
 
 // 导航：按权限过滤。perm 为所需权限 key，无 perm 表示人人可见。
 const groups = [
@@ -131,7 +154,13 @@ async function logout() {
 onMounted(async () => {
   try {
     const r = await api.me();
-    if (r.user) user.value = r.user;
+    if (r.user) {
+      user.value = r.user;
+      // 水印内容：使用者账号 + 姓名
+      const uname = r.user.username || "";
+      const dname = r.user.display_name || "";
+      watermarkText.value = dname ? `${uname}（${dname}）` : uname;
+    }
   } catch (e) {
     /* 未登录 */
   }
@@ -141,6 +170,14 @@ onMounted(async () => {
     if (si && si.system_name) systemName.value = si.system_name;
   } catch (e) {
     /* 取不到则用默认 */
+  }
+  // 加载水印开关（功能开关 watermark_enabled）
+  try {
+    const f = await api.features();
+    const wm = (f.features || []).find((x) => x.key === "watermark_enabled");
+    if (wm) watermarkOn.value = !!wm.enabled;
+  } catch (e) {
+    /* 取不到则用默认开启 */
   } finally {
     loading.value = false;
   }
@@ -209,5 +246,15 @@ const views = {
     </div>
 
     <div v-if="toast.show" class="toast" :class="toast.type">{{ toast.msg }}</div>
+
+    <!-- 全局页面水印：覆盖所有内容显示页，内容为使用者账号+姓名 -->
+    <div v-if="watermarkOn && watermarkText" class="watermark-layer" aria-hidden="true">
+      <span
+        v-for="t in watermarkTiles"
+        :key="t.id"
+        class="watermark-item"
+        :style="{ top: t.top + '%', left: t.left + '%' }"
+      >{{ watermarkText }}</span>
+    </div>
   </div>
 </template>

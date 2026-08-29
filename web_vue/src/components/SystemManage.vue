@@ -57,6 +57,24 @@ const sysInfo = ref({ system_name: "", version: "", commits: 0 });
 const setSystemName = inject("setSystemName");
 const sysNameGlobal = inject("systemName");
 
+// 页面水印开关（与全局 App.vue 提供的 watermarkOn 同步）
+const watermarkOn = inject("watermarkOn");
+const watermarkBusy = ref(false);
+async function toggleWatermark() {
+  if (!watermarkOn) return;
+  watermarkBusy.value = true;
+  try {
+    const next = watermarkOn.value ? 0 : 1;
+    await api.setFeature("watermark_enabled", next);
+    watermarkOn.value = !!next;
+    notify(next ? "页面水印已开启" : "页面水印已关闭", "ok");
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    watermarkBusy.value = false;
+  }
+}
+
 const activeCard = ref(null); // 当前打开的弹窗 key
 const reindexing = ref(false);
 const me = ref(null); // 当前登录用户
@@ -224,6 +242,7 @@ const cards = computed(() => {
     { key: "stats", icon: "📊", title: "数据统计", desc: "文档、用户与分类统计概览" },
     { key: "info", icon: "💡", title: "系统信息", desc: "运行环境与版本信息" },
     { key: "sysname", icon: "🏷", title: "系统名称", desc: "设定系统名称与查看版本" },
+    { key: "watermark", icon: "🌐", title: "页面水印", desc: "为所有内容页叠加账号姓名水印" },
   ];
   if (isAdmin.value) {
     base.push({ key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引", danger: true });
@@ -252,6 +271,7 @@ function statusText(key) {
     return ok ? "运行正常" : "需关注";
   }
   if (key === "sysname") return `v${sysInfo.value.version || "—"}`;
+  if (key === "watermark") return (watermarkOn && watermarkOn.value) ? "已开启" : "已关闭";
   if (key === "init") return "3 项操作";
   return "";
 }
@@ -447,6 +467,27 @@ onMounted(load);
       <button class="btn" @click="activeCard = null">关闭</button>
       <button v-if="isAdmin" class="btn primary" :disabled="nameBusy" @click="saveSystemName">
         {{ nameBusy ? "保存中…" : "保存" }}
+      </button>
+    </template>
+  </Modal>
+
+  <!-- 页面水印设定 -->
+  <Modal :show="activeCard === 'watermark'" title="页面水印" @close="activeCard = null">
+    <p class="muted">开启后，系统所有内容显示页将叠加半透明水印，内容为「使用者账号（姓名）」，用于追踪信息流向与防泄露。</p>
+    <div class="info-rows" style="margin-top: 12px">
+      <div class="info-row">
+        <span>当前状态</span>
+        <b :class="(watermarkOn && watermarkOn.value) ? 'ok' : 'warn'">{{ (watermarkOn && watermarkOn.value) ? "已开启" : "已关闭" }}</b>
+      </div>
+      <div class="info-row">
+        <span>水印内容</span>
+        <b class="mono">{{ me && (me.display_name ? me.username + '（' + me.display_name + '）' : me.username) || "—" }}</b>
+      </div>
+    </div>
+    <template #actions>
+      <button class="btn" @click="activeCard = null">关闭</button>
+      <button v-if="isAdmin" class="btn primary" :disabled="watermarkBusy" @click="toggleWatermark">
+        {{ watermarkBusy ? "处理中…" : (watermarkOn && watermarkOn.value ? "关闭水印" : "开启水印") }}
       </button>
     </template>
   </Modal>

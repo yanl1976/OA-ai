@@ -219,6 +219,25 @@ a { color: var(--primary); text-decoration: none; }
 .sys-card.danger { border-color: #fca5a5; background: #fef2f2; }
 .sys-card.danger:hover { border-color: #ef4444; box-shadow: 0 6px 18px rgba(239,68,68,.14); }
 .sys-card.danger .sys-card-status { color: #b91c1c; }
+
+/* 全局页面水印 */
+.watermark-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  pointer-events: none;
+  overflow: hidden;
+}
+.watermark-item {
+  position: absolute;
+  transform: translate(-50%, -50%) rotate(-25deg);
+  white-space: nowrap;
+  font-size: 18px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.10);
+  user-select: none;
+  letter-spacing: 1px;
+}
 .sys-card-icon { font-size: 26px; margin-bottom: 12px; }
 .sys-card-title { font-size: 16px; font-weight: 700; }
 .sys-card-desc { color: var(--muted); font-size: 12.5px; margin-top: 6px; min-height: 34px; }
