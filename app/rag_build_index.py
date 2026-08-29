@@ -104,7 +104,9 @@ def build_index():
     corpus = [c["text"] for c in all_chunks]
     tokenized_corpus = []
     for text in tqdm(corpus, desc="分词"):
-        tokenized_corpus.append(jieba.lcut_for_search(text))
+        # 精确模式（lcut）：与 search._tokenize 对齐，以完整词为单位、不拆字，
+        # 避免「人名 / 专有词组」被碎成单字后污染 BM25 召回。
+        tokenized_corpus.append(jieba.lcut(text))
 
     print("步骤4: 构建 BM25 索引...")
     if not tokenized_corpus:

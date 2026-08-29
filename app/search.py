@@ -51,7 +51,12 @@ LOW_COVER_PENALTY = 0.35  # 低覆盖惩罚下限：仅命中极少 token 时最
 
 
 def _tokenize(text):
-    return [t for t in jieba.lcut_for_search(text) if t.strip()]
+    # 精确模式（lcut 而非 lcut_for_search）：以完整词为单位，不主动拆字。
+    # 对「人名 / 专有词组」类查询（如「郑世勤」）尤为关键——lcut_for_search 会把
+    # 词进一步碎成子词（「郑」「世」「勤」），导致 BM25 把仅零星含相同单字的无关文档
+    # （如「员工薪酬管理」）误召回。精确模式保留整词 token，配合下方 _phrase_boost
+    # （整串命中→档3）与 proximity（聚集度），实现「按全量词组检索」的语义。
+    return [t for t in jieba.lcut(text) if t.strip()]
 
 
 # 聚集度评分：把文本切成小段（句子/子句）后，评估查询 token 是否「挤在一起」出现。
