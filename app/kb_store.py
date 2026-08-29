@@ -11,6 +11,8 @@
 import os
 import re
 import json
+import threading
+import hashlib
 
 from extract_text import merge_lines_to_paragraphs as _merge_lines
 
@@ -23,6 +25,58 @@ UPLOAD_FILE = os.path.join(UPLOAD_DIR, "user_documents.json")
 MANIFEST = os.path.join(KB_DIR, "bm25_index", "documents_manifest.json")
 
 _YEAR_RE = re.compile(r"(?:18|19|20)\d{2}")
+
+# ---------------------------------------------------------------------------
+# 并发安全基础设施
+#
+# 背景（生产事故）：user_documents.json 曾出现「数组套数组」的损坏结构，
+# 根因是「多进程/多线程并发读-改-写」同一文件且写盘非原子：
+#   进程A 读到旧快照 -> 进程B 写入新数据 -> 进程A 用旧快照覆盖（丢数据/结构错乱）
+# 因此这里统一提供：
+#   1) _STORE_LOCK：同一进程内所有「读-改-写」必须持锁，保证复合操作原子性；
+#   2) _atomic_write_json：先写临时文件再 os.replace，保证落盘原子性
+#      （进程崩溃 / 断电不会留下半截 JSON）。
+# 注意：本锁只保护单进程内线程。跨进程需依赖部署层保证单实例（见 start.sh / systemd）。
+# ---------------------------------------------------------------------------
+_STORE_LOCK = threading.RLock()
+
+
+def store_lock():
+    """返回文档存储层的全局可重入锁。
+
+    所有对 user_documents.json 的「读取-修改-写回」复合操作都必须在此锁内完成，
+    否则并发场景下会互相覆盖（历史事故：文件被写成 [[...]] 导致上传 500）。
+    """
+    return _STORE_LOCK
+
+
+def _atomic_write_json(path: str, data) -> None:
+    """原子写 JSON：先写同名临时文件并 fsync，再 os.replace 覆盖目标。
+
+    保证任意时刻读取该文件都拿到完整合法的 JSON，不会出现半截/损坏内容。
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, ".tmp_" + os.path.basename(path) + ".%d" % os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _stable_hash(*parts) -> str:
+    """稳定哈希：替代内置 hash()。
+
+    内置 hash() 对 str 带 PYTHONHASHSEED 随机化，同一文件名在不同进程/重启后
+    会得到不同值，会导致 doc_id 漂移、归档目录不一致、重复上传产生重复条目。
+    这里用 blake2b 保证跨进程、跨重启稳定。
+    """
+    h = hashlib.blake2b(digest_size=8)
+    for p in parts:
+        h.update(str(p).encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()
 
 # 上传文件预览时用于返回原始二进制（而不是从文本重新生成 PDF）的 MIME 类型
 _EXT_MIME = {
@@ -540,25 +594,32 @@ def save_upload(filename: str, category: str, text: str, raw_bytes: bytes = None
             break
     else:
         ups.append(entry)
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     uid, uname = audit_current_user()
     audit_log("doc.upload", doc_id, "%s -> %s" % (filename, category), uid, uname)
     return doc_id
 
 
 def _save_uploads(ups: list):
-    """原子写入 uploads.json（先写临时文件再 rename，避免并发/崩溃损坏）。"""
-    tmp = UPLOAD_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, UPLOAD_FILE)
+    """原子写入 uploads.json（先写临时文件再 os.replace，避免并发/崩溃损坏）。
+
+    与 _atomic_write_json 保持一致，并额外 fsync 保证断电安全。
+    """
+    _atomic_write_json(UPLOAD_FILE, ups)
 
 
 def _doc_id_for(filename: str, category: str, raw_bytes: bytes) -> str:
     """稳定的 doc_id：仅依赖 文件名+分类+原始字节数（与提取文本长度无关），
-    使「先落盘(raw) → 后补文本(update)」两次写入指向同一条 entry。"""
-    return "up_%d" % (abs(hash(filename + "|" + category + "|" + str(len(raw_bytes)))) % (10 ** 12))
+    使「先落盘(raw) → 后补文本(update)」两次写入指向同一条 entry。
+
+    【修复】原用内置 hash() 取模，但 Python 对 str 的 hash 带 PYTHONHASHSEED
+    随机化：同一文件在不同进程/重启后会得到不同 doc_id，导致
+      - 重复上传产生重复条目（旧条目孤儿化）
+      - 归档目录名随 doc_id 漂移
+      - 上传与提取两阶段指向不同 entry
+    改用 blake2b 稳定哈希，跨进程、跨重启恒等。
+    """
+    return "up_%d" % (int(_stable_hash(filename, category, len(raw_bytes))[:12], 16) % (10 ** 12))
 
 
 def save_upload_raw(filename: str, category: str, raw_bytes: bytes) -> str:
@@ -592,26 +653,29 @@ def save_upload_raw(filename: str, category: str, raw_bytes: bytes) -> str:
                     pass
         except Exception:
             stored_rel = None
-    ups = _load_uploads()
-    if not isinstance(ups, list):
-        ups = []
-    ups = [u for u in ups if isinstance(u, dict)]
-    entry = {"doc_id": doc_id, "filename": filename, "category": category,
-             "pages": 1, "label": filename,
-             "text": "", "created_at": _now(),
-             "stored_path": stored_rel,
-             "mimetype": mimetype,
-             "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None,
-             "indexed": 0}   # indexed=0 标记尚未经后台提取/建索引
-    existed = False
-    for u in ups:
-        if u.get("doc_id") == doc_id:
-            u.update(entry)
-            existed = True
-            break
-    else:
-        ups.append(entry)
-    _save_uploads(ups)
+    # 「读-改-写」必须整体持锁：并发上传同一文件时，两个线程可能同时读到旧列表、
+    # 各自 append 后再写回，造成后写覆盖先写（丢条目）或结构错乱。
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        entry = {"doc_id": doc_id, "filename": filename, "category": category,
+                 "pages": 1, "label": filename,
+                 "text": "", "created_at": _now(),
+                 "stored_path": stored_rel,
+                 "mimetype": mimetype,
+                 "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None,
+                 "indexed": 0}   # indexed=0 标记尚未经后台提取/建索引
+        existed = False
+        for u in ups:
+            if u.get("doc_id") == doc_id:
+                u.update(entry)
+                existed = True
+                break
+        else:
+            ups.append(entry)
+        _save_uploads(ups)
     uid, uname = audit_current_user()
     audit_log("doc.upload", doc_id, "%s -> %s (raw, 待后台提取)" % (filename, category), uid, uname)
     return doc_id
@@ -625,17 +689,23 @@ def update_upload_text_async(doc_id: str, text: str, category: str = None, year:
     按 doc_id 定位 entry（与 save_upload_raw 同公式），补充 text/pages/year，
     若后台重新判定了分类（category 非空且与原值不同）也一并更新。
     """
-    ups = _load_uploads()
-    for u in ups:
-        if u.get("doc_id") == doc_id:
-            u["text"] = text
-            u["pages"] = max(1, text.count("\n") // 40 + 1)
-            if category is not None and category != u.get("category"):
-                u["category"] = category
-            u["year"] = year if year is not None else u.get("year")
-            u["indexed"] = 1
-            _save_uploads(ups)
-            return True
+    # 持锁：worker 并发回填多篇文本时，避免「读-改-写」互相覆盖（丢文本/丢条目）
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        for u in ups:
+            if u.get("doc_id") == doc_id:
+                u["text"] = text
+                u["pages"] = max(1, text.count("\n") // 40 + 1)
+                if category is not None and category != u.get("category"):
+                    u["category"] = category
+                u["year"] = year if year is not None else u.get("year")
+                u["indexed"] = 1
+                u["updated_at"] = _now()
+                _save_uploads(ups)
+                return True
     return False
 
 
@@ -683,18 +753,22 @@ def mark_extracting(doc_ids: list) -> int:
     ids = set(doc_ids)
     if not ids:
         return 0
-    ups = _load_uploads()
-    n = 0
-    for u in ups:
-        if u.get("doc_id") in ids:
-            u["indexed"] = 0
-            u["text"] = ""
-            u["updated_at"] = _now()
-            n += 1
-    if n:
-        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-            json.dump(ups, f, ensure_ascii=False, indent=2)
-    return n
+    # 持锁：避免与 worker 回填 / 清除操作并发导致互相覆盖
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        n = 0
+        for u in ups:
+            if u.get("doc_id") in ids:
+                u["indexed"] = 0
+                u["text"] = ""
+                u["updated_at"] = _now()
+                n += 1
+        if n:
+            _atomic_write_json(UPLOAD_FILE, ups)
+        return n
 
 
 def clear_extract() -> int:
@@ -704,20 +778,23 @@ def clear_extract() -> int:
     使上传管理页状态立即变为「未识别」、字数归 0，且不触发后台提取/索引重建。
     返回被清空的文档数。
     """
-    ups = _load_uploads()
-    n = 0
-    for u in ups:
-        if u.get("deleted"):
-            continue  # 回收站不处理
-        if u.get("indexed") or u.get("text"):
-            u["indexed"] = 0
-            u["text"] = ""
-            u["updated_at"] = _now()
-            n += 1
-    if n:
-        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-            json.dump(ups, f, ensure_ascii=False, indent=2)
-    return n
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        n = 0
+        for u in ups:
+            if u.get("deleted"):
+                continue  # 回收站不处理
+            if u.get("indexed") or u.get("text"):
+                u["indexed"] = 0
+                u["text"] = ""
+                u["updated_at"] = _now()
+                n += 1
+        if n:
+            _atomic_write_json(UPLOAD_FILE, ups)
+        return n
 
 
 def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
@@ -773,8 +850,7 @@ def delete_upload(doc_id: str) -> bool:
     if len(new_ups) == len(ups):
         return False
     delete_upload_binary(doc_id)
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(new_ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, new_ups)
     # 一并清理该上传文档关联的「二次生成纪要」派生记录与 PDF（提取文件），
     # 避免删除源码后仍残留衍生内容（知识浏览“衍生文档”/派生 PDF）。
     _purge_derived_for_doc(doc_id)
@@ -809,18 +885,21 @@ def delete_uploads_batch(doc_ids: list) -> dict:
     doc_ids = [str(x) for x in (doc_ids or [])]
     if not doc_ids:
         return {"deleted": 0, "not_found": []}
-    ups = _load_uploads()
-    id_set = set(doc_ids)
-    new_ups = [u for u in ups if u.get("doc_id") not in id_set]
-    not_found = [d for d in doc_ids if not any(u.get("doc_id") == d for u in ups)]
-    deleted = len(ups) - len(new_ups)
-    if deleted == 0:
-        return {"deleted": 0, "not_found": not_found}
-    for d in doc_ids:
-        delete_upload_binary(d)
-        _purge_derived_for_doc(d)
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(new_ups, f, ensure_ascii=False, indent=2)
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        id_set = set(doc_ids)
+        new_ups = [u for u in ups if u.get("doc_id") not in id_set]
+        not_found = [d for d in doc_ids if not any(u.get("doc_id") == d for u in ups)]
+        deleted = len(ups) - len(new_ups)
+        if deleted == 0:
+            return {"deleted": 0, "not_found": not_found}
+        for d in doc_ids:
+            delete_upload_binary(d)
+            _purge_derived_for_doc(d)
+        _atomic_write_json(UPLOAD_FILE, new_ups)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -835,10 +914,15 @@ def reclassify_upload(doc_id: str, category: str) -> bool:
     """调整上传文档的归类分类，并同步移动原始二进制到新归类目录。"""
     if not category:
         return False
-    ups = _load_uploads()
-    found = False
-    for u in ups:
-        if u.get("doc_id") == doc_id:
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        found = False
+        for u in ups:
+            if u.get("doc_id") != doc_id:
+                continue
             old_path = _resolve_binary_path(u)
             u["category"] = category
             found = True
@@ -851,9 +935,35 @@ def reclassify_upload(doc_id: str, category: str) -> bool:
                 if os.path.abspath(old_path) != os.path.abspath(new_path):
                     try:
                         os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                        import shutil
-                        shutil.move(old_path, new_path)
-                        u["stored_path"] = new_rel
+                        # 【修复】目标已存在时 shutil.move 会抛异常（尤其 Windows），
+                        # 原实现被 except 静默吞掉，导致「分类已改、文件仍在旧目录」，
+                        # 物理归档与逻辑分类长期不一致（后续查 check_upload_storage
+                        # 会报缺文件）。这里显式处理目标已存在的场景：
+                        if os.path.exists(new_path):
+                            try:
+                                same = (os.path.getsize(old_path) == os.path.getsize(new_path)
+                                        and open(old_path, "rb").read()
+                                        == open(new_path, "rb").read())
+                            except Exception:
+                                same = False
+                            if same:
+                                os.remove(old_path)     # 内容一致：去重，保留目标
+                                u["stored_path"] = new_rel
+                            else:
+                                # 内容不同：改用带序号的唯一文件名，避免覆盖/丢失
+                                stem, e2 = os.path.splitext(new_rel)
+                                k = 1
+                                while os.path.exists(os.path.join(UPLOAD_DIR, "%s_%d%s" % (stem, k, e2))):
+                                    k += 1
+                                new_rel = "%s_%d%s" % (stem, k, e2)
+                                new_path = os.path.join(UPLOAD_DIR, new_rel)
+                                import shutil
+                                shutil.move(old_path, new_path)
+                                u["stored_path"] = new_rel
+                        else:
+                            import shutil
+                            shutil.move(old_path, new_path)
+                            u["stored_path"] = new_rel
                         # 清理旧目录
                         try:
                             od = os.path.dirname(old_path)
@@ -865,10 +975,9 @@ def reclassify_upload(doc_id: str, category: str) -> bool:
                         # 移动失败则保留原 stored_path，不破坏预览
                         pass
             break
-    if not found:
-        return False
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+        if not found:
+            return False
+        _atomic_write_json(UPLOAD_FILE, ups)
     # 归类影响检索分类，重建索引
     try:
         import rag_build_index
@@ -919,8 +1028,7 @@ def migrate_upload_storage() -> int:
         except Exception:
             pass
     if moved:
-        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-            json.dump(ups, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(UPLOAD_FILE, ups)
     return moved
 
 
@@ -949,8 +1057,7 @@ def dedupe_uploads():
     cleaned = list(seen.values())
     removed = len(ups) - len(cleaned)
     if removed:
-        with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(UPLOAD_FILE, cleaned)
     return removed
 
 
@@ -1057,8 +1164,7 @@ def soft_delete_upload(doc_id: str) -> bool:
             break
     if not found:
         return False
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -1086,8 +1192,7 @@ def soft_delete_uploads_batch(doc_ids: list) -> dict:
     not_found = [d for d in doc_ids if not any(u.get("doc_id") == d for u in ups)]
     if found == 0:
         return {"deleted": 0, "not_found": not_found}
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -1112,8 +1217,7 @@ def restore_upload(doc_id: str) -> bool:
             break
     if not found:
         return False
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -1189,8 +1293,7 @@ def set_upload_tags(doc_id: str, tags: list) -> bool:
             break
     if not found:
         return False
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     return True
 
 
@@ -1241,8 +1344,7 @@ def update_upload_text(doc_id: str, text: str) -> bool:
             break
     if not found:
         return False
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(ups, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(UPLOAD_FILE, ups)
     try:
         import rag_build_index
         rag_build_index.build_index()
@@ -1297,23 +1399,28 @@ def clear_all_documents(include_trash: bool = True) -> dict:
     默认同时清空回收站（include_trash=True），使知识库回到完全空白状态。
     返回统计 {removed_files, removed_entries}。
     """
-    ups = _load_uploads()
-    removed_files = 0
-    kept = []
-    for u in ups:
-        if not include_trash and u.get("deleted"):
-            kept.append(u)
-            continue
-        p = _resolve_binary_path(u)
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-                removed_files += 1
-            except Exception:
-                pass
-    with open(UPLOAD_FILE, "w", encoding="utf-8") as f:
-        json.dump(kept, f, ensure_ascii=False, indent=2)
-    removed_entries = len(ups) - len(kept)
+    # 全流程持锁：与后台 worker 的 update_upload_text_async / mark_extracting 互斥，
+    # 防止「清除中 worker 用旧快照写回」导致已删条目复活（幽灵文档）。
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        removed_files = 0
+        kept = []
+        for u in ups:
+            if not include_trash and u.get("deleted"):
+                kept.append(u)
+                continue
+            p = _resolve_binary_path(u)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed_files += 1
+                except Exception:
+                    pass
+        _atomic_write_json(UPLOAD_FILE, kept)
+        removed_entries = len(ups) - len(kept)
     try:
         _rebuild_index()
     except Exception:

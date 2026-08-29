@@ -120,6 +120,7 @@ app = Flask(__name__, static_folder=None)
 _EXTRACT_Q = _queue.Queue()
 _INDEX_DIRTY = threading.Event()      # 有待建索引的脏文档
 _EXTRACT_ABORT = threading.Event()   # 中止提取信号：set 后丢弃队列剩余任务
+_REBUILDING = threading.Event()      # 正在重建索引：防止空闲轮询重复触发重建
 _WORKER_STARTED = False
 
 
@@ -153,10 +154,19 @@ def _drain_extract_queue():
 
 
 def _bm25_rebuild_async():
-    """异步后台线程：全量重建 BM25（不阻塞提取 worker 取下一个任务）。"""
+    """异步后台线程：全量重建 BM25（不阻塞提取 worker 取下一个任务）。
+
+    【修复·重建风暴】原先 _INDEX_DIRTY 只在重建「完成后」才 clear，而重建（尤其
+    BM25 全量 + BGE 向量编码）耗时常超过 worker 的 1 秒轮询间隔，导致 worker
+    每秒都判定「脏」并再 spawn 一组重建线程 —— 线程无限叠加、CPU 打满、
+    索引文件被反复并发重写（生产事故根源之一）。
+    现改为：进入重建「前」立即抢锁 + 清脏标记，保证同一时刻只有一组重建在跑。
+    """
     def _run():
-        _rebuild_indexes()
-        _INDEX_DIRTY.clear()
+        try:
+            _rebuild_indexes()
+        finally:
+            _REBUILDING.clear()
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -186,7 +196,11 @@ def _extract_worker():
             # 向量此前在队列非空时只标脏、未单篇写盘（避免每篇全库 pickle 重写），
             # 故此处统一做 1 次全量 BGE 编码 + 1 次文件重写（批量场景 O(1) 开销）；
             # BM25 为纯分词、开销极低，同样统一重建一次。
-            if _INDEX_DIRTY.is_set():
+            # 抢锁式触发：先清脏标记 + 置 _REBUILDING，保证重建期间（可能数十秒）
+            # 后续每秒的空闲轮询不会再 spawn 新的重建线程。
+            if _INDEX_DIRTY.is_set() and not _REBUILDING.is_set():
+                _INDEX_DIRTY.clear()
+                _REBUILDING.set()
                 _bm25_rebuild_async()
                 _vec_rebuild_async()
             # 中止信号：清空剩余（理论上已空）并复位，避免再次入队时仍生效
@@ -1219,14 +1233,34 @@ def kb_doc_edit_text(doc_id):
 @app.route("/api/admin/init/clear", methods=["POST"])
 @admin_required()
 def admin_init_clear():
-    """清空全部文档（含回收站）+ 重建空索引。"""
+    """清空全部文档（含回收站）+ 重建空索引。
+
+    【修复·竞态】清除前必须先「中止 + 清空提取队列」，否则后台 worker 可能：
+      - 正在提取某篇文档，提取完成后用「清除前读到的旧列表」写回，
+        把已删除的文档条目复活（幽灵文档），或重建出含已删文档的索引。
+    流程：abort(丢弃在途任务) -> drain(清空队列) -> 等待重建完成 -> 清除。
+    """
     data = request.get_json(silent=True) or {}
     include_trash = data.get("include_trash", True)
     try:
+        # 1) 中止并清空提取队列，阻断后台写回
+        _EXTRACT_ABORT.set()
+        dropped = _drain_extract_queue()
+        # 2) 等待正在进行的索引重建结束，避免重建线程用到被删数据
+        for _ in range(50):        # 最多等 5 秒
+            if not _REBUILDING.is_set():
+                break
+            time.sleep(0.1)
+        # 3) 执行清除
         res = kb_store.clear_all_documents(include_trash=bool(include_trash))
+        # 4) 清脏标记，避免残留的脏状态触发一次空重建
+        _INDEX_DIRTY.clear()
+        res["dropped_tasks"] = dropped
         return jsonify({"ok": True, **res})
     except Exception as e:
         return jsonify({"error": "清除文档失败: %s" % e}), 500
+    finally:
+        _EXTRACT_ABORT.clear()
 
 
 @app.route("/api/admin/init/extract", methods=["POST"])
@@ -1238,9 +1272,16 @@ def admin_init_extract():
     队列空闲时统一重建索引；接口本身不阻塞，前端可立即关闭弹窗继续操作。
     """
     try:
-        docs = kb_store.iter_active_uploads()
+        docs = list(kb_store.iter_active_uploads())
+        # 【修复·竞态】必须先「复位」再「入队」，顺序不可颠倒。
+        # 原实现先 put 入队：后台 worker 可能在几毫秒内就取走任务并提取完成、
+        # 写回 text 与 indexed=1；随后主线程才执行 mark_extracting(ids)，
+        # 而它读的是复位前的旧快照（text 仍为空），写回后会把刚提取好的
+        # 文本抹成空串，导致「重新提取后文档反而变空」的诡异现象。
+        # 先复位再入队，则 worker 拿到的肯定是复位后的状态，回填顺序正确。
+        ids = [d["doc_id"] for d in docs if d.get("doc_id")]
+        reset_n = kb_store.mark_extracting(ids)
         queued = 0
-        ids = []
         for d in docs:
             if not d.get("doc_id"):
                 continue
@@ -1251,12 +1292,7 @@ def admin_init_extract():
                 "doc_id": d["doc_id"],
                 "cat_hint": d.get("category", "未分类"),
             })
-            ids.append(d["doc_id"])
             queued += 1
-        # 立即复位这批文档的识别状态与字数（indexed=0, text=""），使上传管理页
-        # 即时从「已识别/字数」变为「未识别/0」，直观反映「提取中」；后台 worker
-        # 跑完再逐篇写回。注意：复位在入队之后、保存之前，避免覆盖已入队任务的回填。
-        reset_n = kb_store.mark_extracting(ids)
         return jsonify({
             "ok": True,
             "queued": queued,
@@ -1285,13 +1321,15 @@ def admin_init_extract_one():
         target = next((u for u in ups if u.get("doc_id") == doc_id and not u.get("deleted")), None)
         if not target:
             return jsonify({"error": "文档不存在或已删除"}), 404
+        # 与批量重提取保持一致：先复位再入队，避免 worker 先跑完写回 text、
+        # 随后 mark_extracting 用旧快照覆盖，把刚提取的文本抹成空串。
+        reset_n = kb_store.mark_extracting([doc_id])
         _EXTRACT_Q.put({
             "filename": target.get("filename", doc_id),
             "category": target.get("category", "未分类"),
             "doc_id": doc_id,
             "cat_hint": target.get("category", "未分类"),
         })
-        reset_n = kb_store.mark_extracting([doc_id])
         return jsonify({
             "ok": True,
             "doc_id": doc_id,
