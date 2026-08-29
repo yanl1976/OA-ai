@@ -118,7 +118,7 @@ async function upload() {
   progress.value = { done: 0, total: files.value.length };
   try {
     // 后端支持一次性批量上传，仅重建一次索引
-    const r = await api.upload(files.value, category.value);
+    const r = await api.upload(files.value, category.value, false);
     const results = r.results || [];
     const okList = results.filter((x) => x.ok);
     const failList = results.filter((x) => !x.ok);
@@ -148,11 +148,85 @@ async function upload() {
     const ids = okList.map((x) => x.doc_id).filter(Boolean);
     if (ids.length) pollRecognition(ids);
   } catch (e) {
-    notify(e.message, "err");
+    // 409：分类与内容冲突，后端未落盘，弹窗请用户确认后重传
+    if (e.status === 409 && e.data && e.data.conflicts) {
+      conflicts.value = e.data.conflicts;
+      confirmOpen.value = true;
+      notify(e.message || "分类与文件内容不符，请确认", "warn");
+    } else {
+      notify(e.message, "err");
+    }
   } finally {
     uploading.value = false;
     progress.value = { done: 0, total: 0 };
   }
+}
+
+// ---- 分类冲突确认：由用户决定如何上传（后端不代劳，问题在源头解决）----
+const conflicts = ref([]);
+const confirmOpen = ref(false);
+
+// 采纳建议分类：把冲突文件改到建议分类后重新上传（其余文件保持原分类）
+async function uploadWithSuggested() {
+  confirmOpen.value = false;
+  const conflictNames = new Set(conflicts.value.map((c) => c.filename));
+  const conflictFiles = files.value.filter((f) => conflictNames.has(f.name));
+  if (!conflictFiles.length) return;
+  uploading.value = true;
+  try {
+    // 按建议分类逐个提交（不同文件建议分类可能不同）
+    const groups = {};
+    conflicts.value.forEach((c) => {
+      (groups[c.suggested_category] = groups[c.suggested_category] || []).push(c.filename);
+    });
+    const allIds = [];
+    for (const [cat, names] of Object.entries(groups)) {
+      const nameSet = new Set(names);
+      const gf = conflictFiles.filter((f) => nameSet.has(f.name));
+      if (!gf.length) continue;
+      const r = await api.upload(gf, cat, true);
+      allIds.push(...(r.results || []).map((x) => x.doc_id).filter(Boolean));
+    }
+    notify("已按建议分类上传 " + allIds.length + " 个文件", "ok");
+    files.value = [];
+    await loadCats();
+    emit("uploaded");
+    if (allIds.length) pollRecognition(allIds);
+  } catch (err2) {
+    notify(err2.message, "err");
+  } finally {
+    uploading.value = false;
+    conflicts.value = [];
+  }
+}
+
+// 仍按原分类上传：用户知情后自主决定，带 confirm_category=1 重传
+async function uploadKeepOriginal() {
+  confirmOpen.value = false;
+  const conflictNames = new Set(conflicts.value.map((c) => c.filename));
+  const conflictFiles = files.value.filter((f) => conflictNames.has(f.name));
+  if (!conflictFiles.length) return;
+  uploading.value = true;
+  try {
+    const r = await api.upload(conflictFiles, category.value, true);
+    notify("已按原分类上传 " + ((r.results || []).length) + " 个文件（提取规则可能与内容不符）", "warn");
+    files.value = [];
+    await loadCats();
+    emit("uploaded");
+    const ids = (r.results || []).map((x) => x.doc_id).filter(Boolean);
+    if (ids.length) pollRecognition(ids);
+  } catch (err3) {
+    notify(err3.message, "err");
+  } finally {
+    uploading.value = false;
+    conflicts.value = [];
+  }
+}
+
+function cancelUpload() {
+  confirmOpen.value = false;
+  conflicts.value = [];
+  notify("已取消，请重新选择分类后上传", "warn");
 }
 
 // ---- 上传后后台识别进度（轻量轮询，不阻塞上传完成提示）----
@@ -214,14 +288,40 @@ async function uploadZip() {
   zipUploading.value = true;
   zipResult.value = null;
   try {
-    const r = await api.uploadZip(zipFile.value, zipParent.value);
+    const r = await api.uploadZip(zipFile.value, zipParent.value, false);
     zipResult.value = r;
     const ok = (r.results || []).filter((x) => x.ok).length;
     const created = (r.created_categories || []).join("、");
     notify("目录上传完成：" + ok + " 个文件成功" + (created ? "，新建/复用分类：" + created : ""), "ok");
     zipFile.value = null;
   } catch (e) {
-    notify(e.message, "err");
+    // 409：zip 内有文件分类与内容冲突，展示清单请用户调整目录结构后重传
+    if (e.status === 409 && e.data && e.data.conflicts) {
+      zipConflicts.value = e.data.conflicts;
+      zipResult.value = e.data;
+      notify(e.message || "压缩包内有分类冲突，请调整目录结构后重新上传", "warn");
+    } else {
+      notify(e.message, "err");
+    }
+  } finally {
+    zipUploading.value = false;
+  }
+}
+
+// zip 冲突：用户调整目录后重传；确属误报可「忽略并上传」（带 confirm_category=1）
+const zipConflicts = ref([]);
+
+async function uploadZipIgnore() {
+  if (!zipFile.value) return;
+  zipUploading.value = true;
+  try {
+    const r = await api.uploadZip(zipFile.value, zipParent.value, true);
+    zipResult.value = r;
+    zipConflicts.value = [];
+    notify("已忽略冲突提示完成上传，请留意提取结果是否符合预期", "warn");
+    zipFile.value = null;
+  } catch (e2) {
+    notify(e2.message, "err");
   } finally {
     zipUploading.value = false;
   }
@@ -271,6 +371,30 @@ onMounted(loadCats);
     </p>
   </div>
 
+  <!-- 分类冲突确认弹窗：上传时校验发现分类与内容不符，交由用户决定（后端不自动纠正） -->
+  <div class="modal-mask" v-if="confirmOpen" @click.self="cancelUpload">
+    <div class="modal-box">
+      <h3 class="modal-title">⚠️ 分类与文件内容不符</h3>
+      <p class="modal-desc">下列文件所选分类与内容类型不一致，若直接上传会导致提取结果错乱。请选择处理方式：</p>
+      <ul class="conflict-list">
+        <li v-for="(c, i) in conflicts" :key="i">
+          <div class="conflict-name">{{ c.filename }}</div>
+          <div class="conflict-detail">{{ c.warning }}</div>
+        </li>
+      </ul>
+      <div class="modal-actions">
+        <button class="btn primary" :disabled="uploading" @click="uploadWithSuggested">
+          改用建议分类上传
+        </button>
+        <button class="btn" :disabled="uploading" @click="uploadKeepOriginal">
+          仍按原分类上传
+        </button>
+        <button class="btn danger" :disabled="uploading" @click="cancelUpload">取消</button>
+      </div>
+      <p class="modal-foot">提示：改用建议分类可保证提取结构正确；若确认分类无误，可选择「仍按原分类上传」。</p>
+    </div>
+  </div>
+
   <div class="card card-pad" style="max-width: 560px; margin-top: 18px">
     <h3 style="margin: 0 0 8px">批量目录上传（zip 压缩包）</h3>
     <p class="file-hint">把整个管理标准目录（含子文件夹）打包成 <b>zip</b> 上传，系统自动按 zip 内部文件夹名建立子类，并把文件归入对应分类与年份目录。已存在的同名分类会复用，不会重复创建。</p>
@@ -298,6 +422,20 @@ onMounted(loadCats);
           <span class="fsize" v-else style="color:#c0392b">{{ x.error }}</span>
         </li>
       </ul>
+      <!-- zip 内分类冲突：交由用户调整目录结构，不自动纠正 -->
+      <div class="cat-warn" v-if="zipConflicts.length">
+        <p class="cat-warn-title">⚠️ {{ zipConflicts.length }} 个文件分类与内容不符（未上传）</p>
+        <ul class="file-list">
+          <li v-for="(c, i) in zipConflicts" :key="i">
+            <span class="fname">{{ c.filename }}</span>
+            <span class="fsize cat-warn-text">{{ c.warning }}</span>
+          </li>
+        </ul>
+        <p class="cat-warn-foot">请调整 zip 目录结构（如把纪要单独放到「会议纪要」目录）后重新上传。</p>
+        <button class="btn sm" :disabled="zipUploading" @click="uploadZipIgnore" style="margin-top:8px">
+          忽略提示并上传
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -336,4 +474,43 @@ onMounted(loadCats);
 .recog-hint { margin-top: 8px; color: #b9770e; font-size: 13px; }
 .recog-hint .spin { display: inline-block; animation: recog-spin 1.2s linear infinite; }
 @keyframes recog-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+
+/* 分类冲突提示（上传校验拦截，交由用户确认） */
+.cat-warn {
+  margin-top: 12px; padding: 12px 14px;
+  border: 1px solid #fde68a; border-left: 4px solid #f59e0b;
+  border-radius: 8px; background: #fffbeb;
+}
+.cat-warn-title { margin: 0 0 8px; font-size: 13px; font-weight: 700; color: #b45309; }
+.cat-warn .file-list { margin: 0; }
+.cat-warn .file-list li { flex-wrap: wrap; }
+.cat-warn-text { color: #b45309; font-size: 12px; flex-basis: 100%; padding-left: 2px; }
+.cat-warn-foot { margin: 8px 0 0; font-size: 12px; color: var(--muted, #888); }
+
+/* 分类冲突确认弹窗 */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(15, 23, 42, .45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.modal-box {
+  background: var(--panel, #fff); border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .22);
+  max-width: 620px; width: 100%; max-height: 86vh; overflow: auto;
+  padding: 22px 24px;
+}
+.modal-title { margin: 0 0 8px; font-size: 17px; font-weight: 700; color: #b45309; }
+.modal-desc { margin: 0 0 12px; font-size: 13px; color: var(--muted, #666); line-height: 1.6; }
+.conflict-list {
+  list-style: none; margin: 0 0 16px; padding: 10px 12px;
+  background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
+  max-height: 260px; overflow: auto;
+}
+.conflict-list li { padding: 7px 0; border-bottom: 1px dashed #fde68a; }
+.conflict-list li:last-child { border-bottom: none; }
+.conflict-name { font-size: 13px; font-weight: 600; word-break: break-all; }
+.conflict-detail { font-size: 12px; color: #b45309; margin-top: 3px; line-height: 1.5; }
+.modal-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.modal-foot { margin: 12px 0 0; font-size: 12px; color: var(--muted, #888); line-height: 1.6; }
 </style>

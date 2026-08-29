@@ -222,7 +222,30 @@ def _do_extract_task(task):
         raw = f.read()
     # 分类：显式 hint 优先；否则按文件名+正文自动识别（在提取前确定，直接传给
     # extract()，避免 extract() 因拿不到 category 而回退嗅探、被 USE_LLM 误伤走 LLM 慢路径）
-    if cat_hint:
+    #
+    # 【分类自纠·关键】文件名是强信号：若文件名明确为「会议纪要/办公会」类，但既有
+    # 分类（cat_hint / init_cat）却落在管理标准/其它树，说明该分类是历史误判（多由
+    # zip 批量上传按目录建类、或早期版本缺陷导致）。此时必须按文件名纠正，否则
+    # category_to_kind 会把它当 standard/regulation 处理，导致纪要红头被粘连、
+    # 正文被金额数字乱切（实测「01.标准化类」下的纪要即为此种乱套）。
+    # 只有当文件名无纪要特征时，才尊重既有分类。
+    def _minutes_by_filename(name: str):
+        """文件名命中会议纪要特征时返回规范分类名，否则 None。"""
+        import re as _re_local
+        if not name:
+            return None
+        if _re_local.search(r"(总经理|总办|经理)?\s*办公会", name) or "总经理会议纪要" in name:
+            return "总经理会议纪要"
+        if _re_local.search(r"(专项|专题)", name) and "纪要" in name:
+            return "专项会议纪要"
+        if "会议纪要" in name or _re_local.search(r"纪要\s*〔?\s*\[?\d{4}", name):
+            return "会议纪要"
+        return None
+
+    _fn_cat = _minutes_by_filename(filename)
+    if _fn_cat:
+        cat = _fn_cat
+    elif cat_hint:
         cat = cat_hint
     else:
         # 先快速解码一次正文仅用于分类嗅探（轻量，不联网）；落盘分类 init_cat
@@ -668,6 +691,93 @@ def _auto_classify(filename, text):
     return best[1] if best else None
 
 
+def _minutes_by_filename(name: str):
+    """文件名命中会议纪要特征时返回规范分类名，否则 None。
+
+    文件名是判断文档类型最廉价且最可靠的信号，用于分类自纠与上传校验。
+    """
+    import re as _re_local
+    if not name:
+        return None
+    if _re_local.search(r"(总经理|总办|经理)?\s*办公会", name) or "总经理会议纪要" in name:
+        return "总经理会议纪要"
+    if _re_local.search(r"(专项|专题)", name) and "纪要" in name:
+        return "专项会议纪要"
+    if "会议纪要" in name or _re_local.search(r"纪要\s*〔?\s*\[?\d{4}", name):
+        return "会议纪要"
+    return None
+
+
+# 分类树 -> 文档大类（用于上传时的一致性校验）
+_CAT_FAMILY_STD_PREFIXES = (
+    "01.", "02.", "03.", "04.", "05.", "06.", "07.", "08.",
+    "09.", "10.", "11.", "12.", "13.", "14.", "15.",
+)
+
+
+def _family_of_category(cat: str):
+    """把分类名归到文档大类：minutes（纪要）/ standard（管理标准/规章）/ None（其它）。"""
+    if not cat:
+        return None
+    if "纪要" in cat:
+        return "minutes"
+    if cat.startswith(_CAT_FAMILY_STD_PREFIXES) or "标准" in cat or "管理标准分类" in cat:
+        return "standard"
+    if cat == "16.合规管理类":
+        return "regulation"
+    return None
+
+
+def _check_category_consistency(fname: str, chosen_cat: str, raw: bytes = None):
+    """【上传校验·只报不改】判断用户所选分类与文件实际类型是否冲突。
+
+    返回 (suggested_cat, warning)。
+      - 无冲突：(None, None)
+      - 冲突：(建议分类, 提示文案)
+
+    设计原则：本函数【只做校验、绝不改写分类】。冲突由前端呈现给用户，
+    由用户决定「改用建议分类 / 仍按原分类上传 / 取消上传」。问题在源头
+    （用户提交时）解决，而不是后端默默纠正——后端纠正会掩盖分类管理的
+    真实问题（如分类树建错、选错习惯等），故严格禁止。
+
+    判定优先级：文件名（强信号、零成本）> 正文嗅探（轻量解码，仅 PDF/DOCX）。
+    仅当用户显式选了分类（未选时 chosen_cat 为空，表示交给系统自动识别）才校验。
+    """
+    if not chosen_cat:
+        return None, None
+
+    # 1) 文件名判定
+    fn_cat = _minutes_by_filename(fname)
+    if fn_cat:
+        if _family_of_category(chosen_cat) != "minutes":
+            return fn_cat, ("文件名是「会议纪要」，但所选分类为「%s」。"
+                            "若按该分类上传，将按管理标准规则提取，会导致纪要正文被切碎。"
+                            "建议改为「%s」。" % (chosen_cat, fn_cat))
+        return None, None
+
+    # 2) 正文嗅探（仅在文件名无纪要特征时，避免大文件开销）
+    if raw:
+        try:
+            ext = os.path.splitext(fname)[1].lower()
+            probe = None
+            if ext == ".pdf":
+                probe = extract_text._decode_pdf(raw, category=chosen_cat)
+            elif ext == ".docx":
+                probe = extract_text._extract_docx(raw)
+            if probe:
+                sniff = extract_text.detect_kind(probe)
+                chosen_family = _family_of_category(chosen_cat)
+                if sniff == "minutes" and chosen_family != "minutes":
+                    return "会议纪要", ("正文内容识别为「会议纪要」，但所选分类为「%s」。"
+                                        "建议改为「会议纪要」类，否则提取结果会错乱。" % chosen_cat)
+                if sniff in ("standard", "regulation") and chosen_family == "minutes":
+                    return "管理标准分类", ("正文内容识别为「管理标准/规章」，但所选分类为「%s」。"
+                                            "建议改为管理标准类，否则提取结果会错乱。" % chosen_cat)
+        except Exception:  # noqa: BLE001
+            pass  # 嗅探失败不阻断上传，仅不提示
+    return None, None
+
+
 @app.route("/api/kb/upload", methods=["POST"])
 @login_required("kb.doc.upload")
 def kb_upload():
@@ -687,8 +797,12 @@ def kb_upload():
     # 直接回退为按文件名+正文自动识别分类。
     if req_cat and _re.match(r"^\d{4}年度$", req_cat):
         req_cat = ""
+    # confirm_category=1：用户已在前端确认「仍按所选分类上传」，此时不再拦截。
+    # 这样既保证冲突在源头暴露给用户，又允许用户在知情后自主决定。
+    confirm_override = request.form.get("confirm_category") in ("1", "true", "yes")
 
     results = []
+    conflicts = []
     for file in files:
         fname = file.filename or "未命名文档.txt"
         ext = os.path.splitext(fname)[1].lower()
@@ -704,6 +818,19 @@ def kb_upload():
         else:
             cat = "未分类"        # 暂占位，后台用正文重分类
             cat_explicit = False
+        # 【上传校验·源头拦截】所选分类与文件实际类型冲突时，不落盘、不纠正，
+        # 直接返回冲突详情，由前端请用户确认后重新提交（confirm_category=1 表示
+        # 用户已确认仍按原分类上传）。这样把问题拦在源头，避免后端默默改写分类。
+        if cat_explicit:
+            suggested, warn_msg = _check_category_consistency(fname, cat, raw)
+            if suggested and not confirm_override:
+                conflicts.append({
+                    "filename": fname,
+                    "chosen_category": cat,
+                    "suggested_category": suggested,
+                    "warning": warn_msg,
+                })
+                continue  # 该文件不落盘，等待用户确认
         # 仅落盘原始二进制 + 占位 entry（极快），文本提取与索引重建交给后台线程，
         # 上传接口立即返回，避免大文件 / 全量索引重建阻塞前端。
         try:
@@ -720,6 +847,16 @@ def kb_upload():
         results.append({"filename": fname, "ok": True, "doc_id": doc_id,
                         "category": cat if cat_explicit else "(识别中)",
                         "warn": "已保存，后台识别中"})
+
+    # 【源头拦截】存在分类冲突：本次不落盘这些文件，返回 409 + 冲突清单，
+    # 由前端弹窗请用户确认（改用建议分类 / 仍按原分类上传 / 取消）。
+    if conflicts:
+        return jsonify({
+            "ok": False,
+            "error": "分类与文件内容不符，请确认后再上传",
+            "conflicts": conflicts,
+            "results": results,     # 本次已成功上传的无冲突文件（可能为空）
+        }), 409
 
     ok_count = sum(1 for r in results if r.get("ok"))
     if ok_count == 0:
@@ -786,8 +923,11 @@ def kb_upload_zip():
         return jsonify({"error": "父分类「%s」不存在且无法创建" % parent_name}), 400
 
     raw_zip = f.read()
+    # confirm_category=1：用户已确认「仍按 zip 目录名分类上传」，跳过拦截
+    zip_confirm = request.form.get("confirm_category") in ("1", "true", "yes")
     created_cats = []
     results = []
+    zip_conflicts = []
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw_zip))
         bad = zf.testzip()
@@ -832,29 +972,53 @@ def kb_upload_zip():
                                 "error": "不支持格式 %s（已跳过）" % ext})
                 continue
             data = zf.read(n)
+            # 【上传校验·源头拦截】zip 的分类来自目录名，极易与内容不符（如把纪要
+            # 目录放在管理标准树下）。此处只校验不纠正：冲突文件跳过不落盘，整个
+            # zip 处理完后返回冲突清单，请用户调整目录结构后重传。
+            suggested, zip_warn = _check_category_consistency(base, final_cat_name, data)
+            if suggested and not zip_confirm:
+                zip_conflicts.append({
+                    "filename": n,
+                    "chosen_category": final_cat_name,
+                    "suggested_category": suggested,
+                    "warning": zip_warn,
+                })
+                continue  # 不落盘，等待用户确认
+            zip_cat = final_cat_name
             # 第一步：仅落盘原始二进制 + 占位 entry（与普通上传一致，极快）
             try:
-                doc_id = kb_store.save_upload_raw(base, final_cat_name, data)
+                doc_id = kb_store.save_upload_raw(base, zip_cat, data)
             except Exception as e:  # noqa: BLE001
                 results.append({"filename": n, "ok": False, "error": "保存失败: %s" % e})
                 continue
             # 第二步：入队，后台 worker 与普通上传共用 _EXTRACT_Q 完成提取+分类+索引
-            # cat_hint 传 zip 目录分类名，保留目录结构、不自动重分类
             _EXTRACT_Q.put({
                 "filename": base,
-                "category": final_cat_name,
+                "category": zip_cat,
                 "doc_id": doc_id,
-                "cat_hint": final_cat_name,
+                "cat_hint": zip_cat,
             })
             results.append({"filename": n, "ok": True, "doc_id": doc_id,
-                            "category": final_cat_name, "warn": "已保存，后台识别中"})
+                            "category": zip_cat, "warn": "已保存，后台识别中"})
     except zipfile.BadZipFile:
         return jsonify({"error": "不是有效的 zip 文件"}), 400
     finally:
         pass
 
-    ok_count = sum(1 for r in results if r.get("ok"))
     created_cats = sorted(set(created_cats))
+
+    # 【源头拦截】zip 内存在分类冲突：冲突文件未落盘，返回冲突清单请用户
+    # 调整 zip 目录结构后重传（或确认忽略后带 confirm_category=1 重传）。
+    if zip_conflicts:
+        return jsonify({
+            "ok": False,
+            "error": "压缩包内有文件的分类与内容不符，请调整目录结构后重新上传",
+            "conflicts": zip_conflicts,
+            "results": results,
+            "created_categories": created_cats,
+        }), 409
+
+    ok_count = sum(1 for r in results if r.get("ok"))
     if ok_count == 0:
         return jsonify({"ok": False, "results": results, "error": "所有文件均处理失败",
                         "created_categories": created_cats}), 400

@@ -20,6 +20,9 @@ async function req(method, url, body, isForm) {
   if (!resp.ok) {
     const err = new Error(data.error || `请求失败(${resp.status})`);
     err.status = resp.status;
+    // 保留完整响应体：上传分类校验冲突(409)时，前端需要读取 conflicts 清单
+    // 以便弹窗请用户确认，仅有 message 不足以支撑交互。
+    err.data = data;
     throw err;
   }
   return data;
@@ -56,18 +59,21 @@ export const api = {
   createCategory: (b) => api.post("/api/kb/category", b),
   updateCategory: (id, b) => api.put("/api/kb/category/" + id, b),
   deleteCategory: (id) => api.del("/api/kb/category/" + id),
-  upload: (files, category) => {
+  upload: (files, category, confirmCategory) => {
     const fd = new FormData();
     // 支持批量：files 为 File 数组，统一以 files[] 提交；兼容单个 File
     const arr = Array.isArray(files) ? files : [files];
     arr.forEach((f) => fd.append("files", f));
     fd.append("category", category);
+    // confirm_category=1：用户已确认「仍按所选分类上传」，后端不再拦截
+    if (confirmCategory) fd.append("confirm_category", "1");
     return api.postForm("/api/kb/upload", fd);
   },
-  uploadZip: (file, parent) => {
+  uploadZip: (file, parent, confirmCategory) => {
     const fd = new FormData();
     fd.append("file", file);
     if (parent) fd.append("parent", parent);
+    if (confirmCategory) fd.append("confirm_category", "1");
     return api.postForm("/api/kb/upload-zip", fd);
   },
   deleteDocument: (id) => api.del("/api/kb/document/" + id),
