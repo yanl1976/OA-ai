@@ -551,14 +551,19 @@ def category_ancestor_ids(conn, category_node_name: str):
 
 
 def sync_category_permissions(conn=None, cur=None):
-    """同步分类维度的权限行（每个分类节点 × {浏览,查询,下载}）。
+    """同步分类维度的权限行（仅顶级分类 × {浏览,查询,下载}）。
+
+    设计简化（2026-08-29）：权限点只在「顶级分类」上生成，子分类不在权限表中单独列出，
+    而是在运行时沿祖先链继承顶级权限（见 check_cat_action / category_ancestor_ids）。
+    本库顶级分类固定为「管理标准」「会议纪要」两个，因此稳定只有 2×3=6 条分类权限。
 
     职责：
-      1. 为分类树中每个节点生成 kb.cat.<id>.{view,search,download} 权限行（INSERT OR IGNORE）。
-      2. 存量迁移：角色若拥有旧全量权限 kb.view → 授予全部节点 view；kb.search → 全部节点 search。
+      1. 仅对 parent_id IS NULL 的顶级节点生成 kb.cat.<id>.{view,search,download} 权限行；
+         同时清理所有非顶级的 kb.cat.* 存量权限行（子分类不再单列）。
+      2. 存量迁移：角色若拥有旧全量权限 kb.view → 授予全部顶级节点 view；kb.search → 全部顶级节点 search。
          迁移后从角色移除旧 key（彻底切到分类维度）。
-      3. 新创建的节点权限默认授予 admin 角色（保持管理员全量可见）；全新库下 editor/viewer
-         也授予全节点 view+search（默认全量只读，后续可由管理员收窄）。
+      3. 默认授权：admin 授予全部顶级权限（保持管理员全量可见）；全新库下 editor/viewer
+         也授予全部顶级 view+search（默认全量只读，子分类经继承自动获得，后续可由管理员收窄）。
     支持传入 (conn, cur) 融入外部事务。
     """
     own = conn is None
@@ -567,15 +572,17 @@ def sync_category_permissions(conn=None, cur=None):
         cur = conn.cursor()
     cats = conn.execute(
         "SELECT id, name, parent_id FROM categories ORDER BY parent_id IS NULL DESC, sort_order, id").fetchall()
+    # 仅顶级节点参与权限点生成与授权
+    top_cats = [c for c in cats if c["parent_id"] is None]
 
-    # 1) 生成分类权限行
+    # 1) 生成分类权限行（仅顶级）
     perm_rows = []
-    for c in cats:
+    for c in top_cats:
         for action in CAT_ACTIONS:
             key = cat_perm_key(c["id"], action)
             label = CAT_ACTION_LABELS[action]
             name = "%s · %s" % (c["name"], label)
-            desc = "分类【%s】的%s权限" % (c["name"], label)
+            desc = "分类【%s】的%s权限（子分类继承）" % (c["name"], label)
             perm_rows.append((key, name, desc, "分类权限"))
     for key, name, desc, group in perm_rows:
         cur.execute(
@@ -585,19 +592,26 @@ def sync_category_permissions(conn=None, cur=None):
                     (name, desc, group, key))
     perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
 
-    # 2) 存量迁移：kb.view/kb.search → 全节点 view/search
+    # 1b) 清理非顶级的存量 kb.cat.* 权限（子分类不再单列，避免权限表膨胀/重复）
+    top_keys = {cat_perm_key(c["id"], a) for c in top_cats for a in CAT_ACTIONS}
+    for r in cur.execute(
+            "SELECT id,`key` FROM permissions WHERE `key` LIKE 'kb.cat.%'").fetchall():
+        if r["key"] not in top_keys:
+            cur.execute("DELETE FROM role_permissions WHERE permission_id=?", (r["id"],))
+            cur.execute("DELETE FROM permissions WHERE id=?", (r["id"],))
+
+    # 2) 存量迁移：kb.view/kb.search → 顶级节点 view/search
     role_rows = cur.execute(
         "SELECT rp.role_id, rp.permission_id, p.`key` FROM role_permissions rp "
         "JOIN permissions p ON p.id=rp.permission_id").fetchall()
     roles_with_view = {r["role_id"] for r in role_rows if r["key"] == "kb.view"}
     roles_with_search = {r["role_id"] for r in role_rows if r["key"] == "kb.search"}
-    all_node_perms = [cat_perm_key(c["id"], a) for c in cats for a in ("view", "search")]
     for role_id in set(list(roles_with_view) + list(roles_with_search)):
         want = set()
         if role_id in roles_with_view:
-            want.update(cat_perm_key(c["id"], "view") for c in cats)
+            want.update(cat_perm_key(c["id"], "view") for c in top_cats)
         if role_id in roles_with_search:
-            want.update(cat_perm_key(c["id"], "search") for c in cats)
+            want.update(cat_perm_key(c["id"], "search") for c in top_cats)
         for k in want:
             if k in perm_ids:
                 cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
@@ -608,11 +622,11 @@ def sync_category_permissions(conn=None, cur=None):
             cur.execute("DELETE FROM role_permissions WHERE permission_id=?", (perm_ids[old_key],))
             cur.execute("DELETE FROM permissions WHERE id=?", (perm_ids[old_key],))
 
-    # 3) 默认授权：admin 全量；全新库（角色尚未拥有任何 kb.cat.*）的 editor/viewer 授全节点 view+search
+    # 3) 默认授权：admin 全量；全新库（角色尚未拥有任何 kb.cat.*）的 editor/viewer 授顶级 view+search
     admin_id = cur.execute("SELECT id FROM roles WHERE name='admin'").fetchone()
     if admin_id:
         admin_id = admin_id["id"]
-        for k in [cat_perm_key(c["id"], a) for c in cats for a in CAT_ACTIONS]:
+        for k in [cat_perm_key(c["id"], a) for c in top_cats for a in CAT_ACTIONS]:
             if k in perm_ids:
                 cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
                             (admin_id, perm_ids[k]))
@@ -627,7 +641,7 @@ def sync_category_permissions(conn=None, cur=None):
         if has_cat:
             continue  # 已手动配置过，不覆盖
         for a in ("view", "search"):
-            for k in [cat_perm_key(c["id"], a) for c in cats]:
+            for k in [cat_perm_key(c["id"], a) for c in top_cats]:
                 if k in perm_ids:
                     cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
                                 (rid, perm_ids[k]))
