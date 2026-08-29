@@ -2,9 +2,52 @@
 import { ref, onMounted, inject, computed } from "vue";
 import { api } from "../api.js";
 import Modal from "./Modal.vue";
+import CategoryManage from "./CategoryManage.vue";
+import UploadManage from "./UploadManage.vue";
+import TrashManage from "./TrashManage.vue";
+import UserManage from "./UserManage.vue";
+import RoleManage from "./RoleManage.vue";
+import PermissionView from "./PermissionView.vue";
+import AuditLog from "./AuditLog.vue";
 
 const notify = inject("notify");
+const user = inject("user");
 const loading = ref(true);
+
+// 管理功能卡片：点击后进入二级页面（在系统设置内嵌渲染）
+const sub = ref(null); // 当前二级页 key，null 表示显示卡片网格
+const subViews = {
+  CategoryManage,
+  UploadManage,
+  TrashManage,
+  UserManage,
+  RoleManage,
+  PermissionView,
+  AuditLog,
+};
+const adminCards = [
+  { key: "CategoryManage", icon: "🗂", title: "分类管理", desc: "管理知识库分类与层级", perm: "kb.category.manage" },
+  { key: "UploadManage", icon: "🗃", title: "上传管理", desc: "查看与管理已上传文档", perm: "kb.upload.manage" },
+  { key: "TrashManage", icon: "🗑", title: "回收站", desc: "恢复或彻底删除软删除文档", perm: "kb.upload.manage" },
+  { key: "UserManage", icon: "👤", title: "用户管理", desc: "管理系统用户与启用状态", perm: "user.view" },
+  { key: "RoleManage", icon: "🎭", title: "角色管理", desc: "管理角色与权限分配", perm: "role.manage" },
+  { key: "PermissionView", icon: "🔐", title: "权限目录", desc: "查看系统内置权限项", perm: "permission.view" },
+  { key: "AuditLog", icon: "📜", title: "操作日志", desc: "查看系统操作审计记录", perm: "system.manage" },
+];
+const visibleAdminCards = computed(() => {
+  const perms = (user && user.value && user.value.permissions) || [];
+  return adminCards.filter((c) => {
+    if (!c.perm) return true;
+    if (c.perm === "cat:view") return perms.some((p) => p.startsWith("kb.cat.") && p.endsWith(".view"));
+    return perms.includes(c.perm);
+  });
+});
+function openSub(key) {
+  sub.value = key;
+}
+function backToCards() {
+  sub.value = null;
+}
 
 const features = ref([]);
 const stats = ref(null);
@@ -174,22 +217,50 @@ onMounted(load);
 </script>
 
 <template>
-  <h2>系统管理</h2>
+  <h2>系统设置</h2>
   <p class="muted">集中管理系统功能开关、检索索引、数据统计与运行信息，点击卡片进入设置。</p>
 
+  <!-- 二级页面：管理功能 -->
+  <div v-if="sub" class="sub-view">
+    <button class="btn sm" @click="backToCards">← 返回系统设置</button>
+    <component :is="subViews[sub]" />
+  </div>
+
+  <!-- 卡片网格 -->
+  <template v-else>
   <div v-if="loading" class="loading">加载中…</div>
-  <div v-else class="sys-card-grid">
-    <div
-      v-for="c in cards"
-      :key="c.key"
-      class="sys-card"
-      :class="{ warn: c.key !== 'features' && statusText(c.key) === '索引缺失' }"
-      @click="activeCard = c.key"
-    >
-      <div class="sys-card-icon">{{ c.icon }}</div>
-      <div class="sys-card-title">{{ c.title }}</div>
-      <div class="sys-card-desc">{{ c.desc }}</div>
-      <div class="sys-card-status">{{ statusText(c.key) }}</div>
+  <div v-else>
+    <!-- 管理功能入口卡片 -->
+    <h3 class="sub-title">管理功能</h3>
+    <div class="sys-card-grid">
+      <div
+        v-for="c in visibleAdminCards"
+        :key="c.key"
+        class="sys-card admin-card"
+        @click="openSub(c.key)"
+      >
+        <div class="sys-card-icon">{{ c.icon }}</div>
+        <div class="sys-card-title">{{ c.title }}</div>
+        <div class="sys-card-desc">{{ c.desc }}</div>
+        <div class="sys-card-go">进入 →</div>
+      </div>
+    </div>
+
+    <!-- 系统维护卡片 -->
+    <h3 class="sub-title">系统维护</h3>
+    <div class="sys-card-grid">
+      <div
+        v-for="c in cards"
+        :key="c.key"
+        class="sys-card"
+        :class="{ warn: c.key !== 'features' && statusText(c.key) === '索引缺失' }"
+        @click="activeCard = c.key"
+      >
+        <div class="sys-card-icon">{{ c.icon }}</div>
+        <div class="sys-card-title">{{ c.title }}</div>
+        <div class="sys-card-desc">{{ c.desc }}</div>
+        <div class="sys-card-status">{{ statusText(c.key) }}</div>
+      </div>
     </div>
   </div>
 

@@ -217,6 +217,14 @@ a { color: var(--primary); text-decoration: none; }
 .sys-card-desc { color: var(--muted); font-size: 12.5px; margin-top: 6px; min-height: 34px; }
 .sys-card-status { margin-top: 14px; font-size: 12px; font-weight: 600; color: var(--primary); }
 .sys-card.warn .sys-card-status { color: #b45309; }
+.sub-title { font-size: 15px; font-weight: 700; margin: 22px 0 10px; color: var(--text); }
+.sub-title:first-of-type { margin-top: 4px; }
+.admin-card { cursor: pointer; }
+.admin-card .sys-card-go { margin-top: 14px; font-size: 12px; font-weight: 600; color: var(--primary); }
+.sub-view { animation: fade-in .15s ease; }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+.no-access { padding: 60px; text-align: center; color: var(--text); }
+.no-access h2 { color: #b45309; }
 
 .feat-list { display: flex; flex-direction: column; gap: 10px; }
 .feat-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 10px; }

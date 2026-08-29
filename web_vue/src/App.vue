@@ -21,6 +21,7 @@ import DocDetail from "./components/DocDetail.vue";
 import ChatView from "./components/ChatView.vue";
 
 const user = ref(null);
+const isAdmin = computed(() => user.value?.role_name === "admin");
 const loading = ref(true);
 const current = ref("Dashboard");
 const toast = reactive({ show: false, msg: "", type: "" });
@@ -59,6 +60,7 @@ function openDocDetail(docId) {
 }
 function navigate(key) {
   if (key === "DocDetail") return;
+  if (key === "SystemManage" && !isAdmin.value) return; // 系统设置仅管理员可访问
   current.value = key;
 }
 window.addEventListener("nav", (e) => navigate(e.detail));
@@ -87,21 +89,9 @@ const groups = [
     ],
   },
   {
-    title: "管理",
-    items: [
-      { key: "CategoryManage", label: "分类管理", icon: "🗂", perm: "kb.category.manage" },
-      { key: "UploadManage", label: "上传管理", icon: "🗃", perm: "kb.upload.manage" },
-      { key: "TrashManage", label: "回收站", icon: "🗑", perm: "kb.upload.manage" },
-      { key: "UserManage", label: "用户管理", icon: "👤", perm: "user.view" },
-      { key: "RoleManage", label: "角色管理", icon: "🎭", perm: "role.manage" },
-      { key: "PermissionView", label: "权限目录", icon: "🔐", perm: "permission.view" },
-    ],
-  },
-  {
     title: "系统管理",
     items: [
-      { key: "SystemManage", label: "系统设置", icon: "🛠", perm: "system.manage" },
-      { key: "AuditLog", label: "操作日志", icon: "📜", perm: "system.manage" },
+      { key: "SystemManage", label: "系统设置", icon: "🛠", adminOnly: true },
     ],
   },
 ];
@@ -114,6 +104,7 @@ const visibleItems = computed(() => {
     .map((g) => ({
       title: g.title,
       items: g.items.filter((it) => {
+        if (it.adminOnly) return isAdmin.value; // 系统设置仅管理员可见
         if (!it.perm) return true;
         if (it.perm === "cat:view") return hasCatView;
         if (it.perm === "cat:search") return hasCatSearch;
@@ -194,7 +185,11 @@ const views = {
       </div>
 
       <div class="content">
-        <component :is="views[current]" :docId="detailDocId" />
+        <div v-if="current === 'SystemManage' && !isAdmin" class="no-access">
+          <h2>无访问权限</h2>
+          <p class="muted">系统设置仅限管理员访问。如需使用该功能请联系系统管理员。</p>
+        </div>
+        <component v-else :is="views[current]" :docId="detailDocId" />
       </div>
     </div>
 
