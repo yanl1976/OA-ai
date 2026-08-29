@@ -36,6 +36,7 @@
 """
 import os
 import sys
+import subprocess
 import json
 import secrets
 import functools
@@ -1722,6 +1723,76 @@ def adm_uploads_check():
     """诊断：列出所有『原文件不存在』的上传文档，便于定位/修复存储问题。"""
     missing = kb_store.check_upload_storage()
     return jsonify({"missing": missing, "missing_count": len(missing)})
+
+
+# ===================== 系统名称 / 版本 =====================
+# 系统名称：可编辑，持久化于 config/system_settings.json（仅此一项需持久化）。
+# 版本号：由 git 提交次数派生（每次 git 更新即重新定义），不持久化。
+#   规则：基准 1.0.0 对应 0 次提交；每位满 10 进位 -> 1.{commits//10}.{commits%10}
+#   例如 55 次提交 -> 1.5.5。
+_SYSTEM_SETTINGS_FILE = os.path.join(KB_ROOT, "config", "system_settings.json")
+_DEFAULT_SYSTEM_NAME = "OA-AI 知识库"
+_GIT_COMMITS_CACHE = {"value": None}
+
+
+def _read_system_name():
+    try:
+        with open(_SYSTEM_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        name = (data.get("system_name") or "").strip()
+        return name or _DEFAULT_SYSTEM_NAME
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_SYSTEM_NAME
+
+
+def _write_system_name(name):
+    os.makedirs(os.path.dirname(_SYSTEM_SETTINGS_FILE), exist_ok=True)
+    with open(_SYSTEM_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"system_name": name}, f, ensure_ascii=False, indent=2)
+
+
+def _git_commits():
+    """返回当前部署仓库的 git 提交总数（进程级缓存，重启后随 git 更新重算）。"""
+    if _GIT_COMMITS_CACHE["value"] is not None:
+        return _GIT_COMMITS_CACHE["value"]
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=KB_ROOT, stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "ignore").strip()
+        n = int(out)
+    except Exception:  # noqa: BLE001
+        n = 0
+    _GIT_COMMITS_CACHE["value"] = n
+    return n
+
+
+def _compute_version(commits):
+    return "1.%d.%d" % (commits // 10, commits % 10)
+
+
+@app.route("/api/system/info")
+@login_required()
+def sys_info():
+    commits = _git_commits()
+    return jsonify({
+        "system_name": _read_system_name(),
+        "version": _compute_version(commits),
+        "commits": commits,
+    })
+
+
+@app.route("/api/system/info", methods=["PUT"])
+@login_required("system.manage")
+def sys_info_set():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("system_name") or "").strip()
+    if not name:
+        return jsonify({"error": "系统名称不能为空"}), 400
+    if len(name) > 60:
+        return jsonify({"error": "系统名称过长（≤60字符）"}), 400
+    _write_system_name(name)
+    return jsonify({"system_name": name, "version": _compute_version(_git_commits())})
 
 
 # ===================== 会议纪要二次生成 API =====================

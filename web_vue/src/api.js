@@ -146,6 +146,8 @@ export const api = {
   stats: () => api.get("/api/admin/stats"),
   vectorStats: () => api.get("/api/admin/vector_stats"),
   health: () => api.get("/api/health"),
+  systemInfo: () => api.get("/api/system/info"),
+  setSystemName: (name) => api.put("/api/system/info", { system_name: name }),
 
   // 会议纪要二次生成（衍生版本）
   derivedList: (sourceDocId) =>

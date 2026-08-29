@@ -53,6 +53,7 @@ const features = ref([]);
 const stats = ref(null);
 const health = ref(null);
 const vecStats = ref(null);
+const sysInfo = ref({ system_name: "", version: "", commits: 0 });
 
 const activeCard = ref(null); // 当前打开的弹窗 key
 const reindexing = ref(false);
@@ -61,18 +62,20 @@ const me = ref(null); // 当前登录用户
 async function load() {
   loading.value = true;
   try {
-    const [f, s, h, v, m] = await Promise.all([
+    const [f, s, h, v, m, si] = await Promise.all([
       api.features(),
       api.stats(),
       api.health(),
       api.vectorStats(),
       api.me(),
+      api.systemInfo(),
     ]);
     features.value = f.features || [];
     stats.value = s;
     health.value = h;
     vecStats.value = v;
     me.value = (m && m.user) || null;
+    sysInfo.value = si || { system_name: "", version: "", commits: 0 };
   } catch (e) {
     notify(e.message, "err");
   } finally {
@@ -188,12 +191,33 @@ async function initAbort() {
   }
 }
 
+// ============ 系统名称设定 ============
+const nameDraft = ref("");
+const nameBusy = ref(false);
+
+async function saveSystemName() {
+  const name = nameDraft.value.trim();
+  if (!name) { notify("系统名称不能为空", "err"); return; }
+  nameBusy.value = true;
+  try {
+    const r = await api.setSystemName(name);
+    sysInfo.value.system_name = r.system_name;
+    notify("系统名称已更新", "ok");
+    activeCard.value = null;
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    nameBusy.value = false;
+  }
+}
+
 const cards = computed(() => {
   const base = [
     { key: "features", icon: "⚙", title: "功能开关", desc: "开启或关闭系统功能模块" },
     { key: "index", icon: "🔎", title: "检索索引", desc: "全文检索向量索引状态与重建" },
     { key: "stats", icon: "📊", title: "数据统计", desc: "文档、用户与分类统计概览" },
     { key: "info", icon: "💡", title: "系统信息", desc: "运行环境与版本信息" },
+    { key: "sysname", icon: "🏷", title: "系统名称", desc: "设定系统名称与查看版本" },
   ];
   if (isAdmin.value) {
     base.splice(2, 0, { key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引" });
@@ -209,6 +233,7 @@ function statusText(key) {
     const ok = health.value && health.value.status === "ok";
     return ok ? "运行正常" : "需关注";
   }
+  if (key === "sysname") return `v${sysInfo.value.version || "—"}`;
   if (key === "init") return "3 项操作";
   return "";
 }
@@ -389,6 +414,38 @@ onMounted(load);
     </div>
     <template #actions>
       <button class="btn" @click="activeCard = null">关闭</button>
+    </template>
+  </Modal>
+
+  <!-- 系统名称设定 -->
+  <Modal :show="activeCard === 'sysname'" title="系统名称设定" @close="activeCard = null">
+    <div class="info-rows">
+      <div class="info-row">
+        <span>系统名称</span>
+        <b v-if="!isAdmin" class="mono">{{ sysInfo.system_name || "—" }}</b>
+      </div>
+    </div>
+    <div v-if="isAdmin" class="form-row">
+      <label>系统名称</label>
+      <input
+        v-model="nameDraft"
+        class="inp"
+        maxlength="60"
+        placeholder="请输入系统名称"
+        @focus="nameDraft === '' ? (nameDraft = sysInfo.system_name) : null"
+      />
+    </div>
+    <p v-if="!isAdmin" class="muted">仅管理员可修改系统名称。</p>
+    <div class="info-rows" style="margin-top: 12px">
+      <div class="info-row"><span>版本号</span><b class="mono">v{{ sysInfo.version || "—" }}</b></div>
+      <div class="info-row"><span>Git 提交次数</span><b class="mono">{{ sysInfo.commits ?? "—" }}</b></div>
+      <div class="info-row"><span>版本规则</span><b class="muted" style="font-weight:normal">基准 1.0.0，每次 Git 提交累加，每位满 10 进位</b></div>
+    </div>
+    <template #actions>
+      <button class="btn" @click="activeCard = null">关闭</button>
+      <button v-if="isAdmin" class="btn primary" :disabled="nameBusy" @click="saveSystemName">
+        {{ nameBusy ? "保存中…" : "保存" }}
+      </button>
     </template>
   </Modal>
   </div>
