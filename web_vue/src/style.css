@@ -216,6 +216,9 @@ a { color: var(--primary); text-decoration: none; }
 }
 .sys-card:hover { border-color: var(--primary); transform: translateY(-2px); box-shadow: 0 6px 18px rgba(37,99,235,.12); }
 .sys-card.warn { border-color: #fde68a; background: #fffbeb; }
+.sys-card.danger { border-color: #fca5a5; background: #fef2f2; }
+.sys-card.danger:hover { border-color: #ef4444; box-shadow: 0 6px 18px rgba(239,68,68,.14); }
+.sys-card.danger .sys-card-status { color: #b91c1c; }
 .sys-card-icon { font-size: 26px; margin-bottom: 12px; }
 .sys-card-title { font-size: 16px; font-weight: 700; }
 .sys-card-desc { color: var(--muted); font-size: 12.5px; margin-top: 6px; min-height: 34px; }

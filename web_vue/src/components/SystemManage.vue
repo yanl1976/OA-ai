@@ -212,6 +212,7 @@ async function saveSystemName() {
 }
 
 const cards = computed(() => {
+  // 系统维护卡片：顺序即展示顺序（管理员额外在末尾追加高危的「系统初始化」）
   const base = [
     { key: "features", icon: "⚙", title: "功能开关", desc: "开启或关闭系统功能模块" },
     { key: "index", icon: "🔎", title: "检索索引", desc: "全文检索向量索引状态与重建" },
@@ -220,10 +221,22 @@ const cards = computed(() => {
     { key: "sysname", icon: "🏷", title: "系统名称", desc: "设定系统名称与查看版本" },
   ];
   if (isAdmin.value) {
-    base.splice(2, 0, { key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引" });
+    base.push({ key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引", danger: true });
   }
   return base;
 });
+
+// 统一卡片网格：管理功能（进入二级页）与系统维护（弹窗）合并展示，不再分区。
+const allCards = computed(() => {
+  const subs = visibleAdminCards.value.map((c) => ({ ...c, group: "sub" }));
+  const mains = cards.value.map((c) => ({ ...c, group: "main" }));
+  return [...subs, ...mains];
+});
+
+function onCardClick(c) {
+  if (c.group === "sub") openSub(c.key);
+  else activeCard.value = c.key;
+}
 
 function statusText(key) {
   if (key === "features") return `${enabledCount.value}/${features.value.length} 已开启`;
@@ -256,36 +269,20 @@ onMounted(load);
     <div v-else>
       <div v-if="loading" class="loading">加载中…</div>
       <div v-else>
-        <!-- 管理功能入口卡片 -->
-        <h3 class="sub-title">管理功能</h3>
+        <!-- 统一卡片网格：管理功能入口 + 系统维护 合并展示 -->
         <div class="sys-card-grid">
           <div
-            v-for="c in visibleAdminCards"
-            :key="c.key"
-            class="sys-card admin-card"
-            @click="openSub(c.key)"
-          >
-            <div class="sys-card-icon">{{ c.icon }}</div>
-            <div class="sys-card-title">{{ c.title }}</div>
-            <div class="sys-card-desc">{{ c.desc }}</div>
-            <div class="sys-card-go">进入 →</div>
-          </div>
-        </div>
-
-        <!-- 系统维护卡片 -->
-        <h3 class="sub-title">系统维护</h3>
-        <div class="sys-card-grid">
-          <div
-            v-for="c in cards"
-            :key="c.key"
+            v-for="c in allCards"
+            :key="c.group + ':' + c.key"
             class="sys-card"
-            :class="{ warn: c.key !== 'features' && statusText(c.key) === '索引缺失' }"
-            @click="activeCard = c.key"
+            :class="{ 'admin-card': c.group === 'sub', warn: c.group === 'main' && c.key !== 'features' && statusText(c.key) === '索引缺失', danger: c.danger }"
+            @click="onCardClick(c)"
           >
             <div class="sys-card-icon">{{ c.icon }}</div>
             <div class="sys-card-title">{{ c.title }}</div>
             <div class="sys-card-desc">{{ c.desc }}</div>
-            <div class="sys-card-status">{{ statusText(c.key) }}</div>
+            <div v-if="c.group === 'sub'" class="sys-card-go">进入 →</div>
+            <div v-else class="sys-card-status">{{ statusText(c.key) }}</div>
           </div>
         </div>
       </div>
