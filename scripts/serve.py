@@ -554,13 +554,23 @@ def kb_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "缺少参数 q"}), 400
+    # 域选择：用户可在前端主动选定检索范围（顶层分类名）；留空表示"全部我有权限的"。
+    # 越权防护：选定域必须先通过账号授权校验，否则拒绝（防前端篡改越权选域）。
+    sel_cat = request.args.get("category", "").strip()
+    cat_allow = None
+    if sel_cat:
+        if not admin.check_cat_action(perms, sel_cat, "search"):
+            return jsonify({"error": "无权检索该分类域"}), 403
+        # 展开为「选中域 + 其全部后代」的白名单类型名集合，传入 hybrid_search 硬约束
+        cat_allow = set([sel_cat] + admin.get_category_descendants(sel_cat))
     try:
         top_k = int(request.args.get("top_k", 20))
-        results = kb_search_mod.hybrid_search(q, top_k)
-        # 按分类查询(search)权限过滤（静默过滤无权限类型）
+        results = kb_search_mod.hybrid_search(q, top_k, categories=cat_allow)
+        # 兜底：按分类查询(search)权限过滤（静默过滤无权限类型，防白名单边界遗漏）
         results = [r for r in results
                    if admin.check_cat_action(perms, r.get("category"), "search")]
-        return jsonify({"query": q, "count": len(results), "results": results})
+        return jsonify({"query": q, "count": len(results), "results": results,
+                        "scope": sel_cat or "all"})
     except FileNotFoundError as e:
         return jsonify({"error": str(e), "hint": "请先运行 app/rag_build_index.py 构建索引"}), 500
     except Exception as e:  # noqa: BLE001
@@ -1629,14 +1639,21 @@ def api_query():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "缺少参数 q"}), 400
+    sel_cat = request.args.get("category", "").strip()
+    cat_allow = None
+    if sel_cat:
+        if perms and not admin.check_cat_action(perms, sel_cat, "search"):
+            return jsonify({"error": "无权检索该分类域"}), 403
+        cat_allow = set([sel_cat] + admin.get_category_descendants(sel_cat))
     try:
         top_k = int(request.args.get("top_k", 20))
-        results = kb_search_mod.hybrid_search(q, top_k)
+        results = kb_search_mod.hybrid_search(q, top_k, categories=cat_allow)
         # 按分类查询(search)权限过滤（静默过滤无权限类型）
         if perms:
             results = [r for r in results
                        if admin.check_cat_action(perms, r.get("category"), "search")]
-        return jsonify({"query": q, "count": len(results), "results": results})
+        return jsonify({"query": q, "count": len(results), "results": results,
+                        "scope": sel_cat or "all"})
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 500
     except Exception as e:  # noqa: BLE001
@@ -1699,9 +1716,18 @@ def _build_chat_prompt(question: str, contexts: list, scope_names: list) -> str:
     return system
 
 
-def _retrieve_for_chat(question: str, perms: set, top_k: int = 4) -> list:
-    """检索并按对话分类权限（search）过滤；返回 top_k 个命中文档（含 text/regions）。"""
-    raw = kb_search_mod.hybrid_search(question, top_k=top_k * 4)
+def _retrieve_for_chat(question: str, perms: set, top_k: int = 4, category: str = None) -> list:
+    """检索并按对话分类权限（search）过滤；返回 top_k 个命中文档（含 text/regions）。
+
+    category: 用户前端主动选定的检索域（顶层类型名）。若提供，先校验授权，再展开为
+        白名单（含后代）硬约束召回；None 表示"全部我有权限的"（仍受账号权限过滤）。
+    """
+    cat_allow = None
+    if category:
+        if not admin.check_cat_action(perms, category, "search"):
+            return []
+        cat_allow = set([category] + admin.get_category_descendants(category))
+    raw = kb_search_mod.hybrid_search(question, top_k=top_k * 4, categories=cat_allow)
     filtered = [r for r in raw if admin.check_cat_action(perms, r.get("category"), "search")]
     return filtered[:top_k]
 
@@ -1731,6 +1757,32 @@ def kb_chat_scope():
     """返回当前用户可对话的范围（类型名列表），供前端展示边界提示。"""
     perms = set(admin.get_user_permissions(session.get("user_id")))
     return jsonify({"domains": _chat_scope_names(perms)})
+
+
+@app.route("/api/kb/accessible-categories")
+@login_required()
+def kb_accessible_categories():
+    """返回当前用户被授权的顶层分类（供前端检索/对话域切换下拉）。
+
+    每项含：node（分类树节点名，如"管理标准分类"）、label（文档类型名，如"管理标准"）、
+    has_search（是否有查询权限）。前端据此渲染下拉选项；默认项"全部"由前端自行加。
+    """
+    perms = set(admin.get_user_permissions(session.get("user_id")))
+    cats = admin.list_categories(only_enabled=False)
+    tops = [c for c in cats if c.get("parent_id") is None]
+    out = []
+    for t in tops:
+        subtree = [t["name"]] + (admin.get_category_descendants(t["name"]) or [])
+        has_search = any(admin.check_cat_action(perms, n, "search") for n in subtree)
+        if not has_search:
+            continue
+        label = t["name"]
+        for k, v in admin.TYPE_ALIASES.items():
+            if v == label:
+                label = k
+                break
+        out.append({"node": t["name"], "label": label, "has_search": True})
+    return jsonify({"categories": out})
 
 
 @app.route("/api/kb/chat/sessions", methods=["GET", "POST"])
@@ -1804,6 +1856,13 @@ def kb_chat():
     if not scope_names:
         return jsonify({"error": "当前账号无可对话的分类权限（需分类的查询权限）"}), 403
 
+    # 1b) 域选择：用户可前端主动选定对话范围（顶层类型名）；留空 = 全部授权域。
+    #     越权防护：选定域必须先通过账号授权校验（防前端篡改越权选域）。
+    sel_cat = (data.get("category") or "").strip()
+    if sel_cat:
+        if not admin.check_cat_action(perms, sel_cat, "search"):
+            return jsonify({"error": "无权在该分类域对话"}), 403
+
     # 2) 会话：复用或新建
     sid = data.get("session_id")
     if sid:
@@ -1835,7 +1894,7 @@ def kb_chat():
     hits = []
     seen_doc = set()
     for sq in sub_queries:
-        for h in _retrieve_for_chat(sq, perms, top_k=top_k):
+        for h in _retrieve_for_chat(sq, perms, top_k=top_k, category=sel_cat or None):
             d = h.get("doc_id")
             if d in seen_doc:
                 continue
@@ -1885,6 +1944,7 @@ def kb_chat():
         "answer": answer,
         "refs": refs,
         "scope": scope_names,
+        "selected_scope": sel_cat or "all",
     })
 
 

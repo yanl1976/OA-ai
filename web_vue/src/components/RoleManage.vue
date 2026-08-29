@@ -180,23 +180,22 @@ onMounted(load);
           <span class="cat-col-act">查询</span>
           <span class="cat-col-act">下载</span>
         </div>
-        <div v-for="c in catTree()" :key="'cat-' + c.id" class="cat-matrix-row"
-             :style="{ paddingLeft: (12 + c.depth * 20) + 'px' }">
+        <div v-for="c in catTree().filter(t => t.depth === 0)" :key="'cat-' + c.id" class="cat-matrix-row">
           <span class="cat-col-name">{{ c.name }}</span>
           <span class="cat-col-act">
             <input type="checkbox" :checked="catChecked(c, 'view')"
-                   @change="toggleCatPerm(c, 'view', true)" title="级联勾选其下全部子类" />
+                   @change="toggleCatPerm(c, 'view', true)" title="勾选将级联应用到其下全部子类" />
           </span>
           <span class="cat-col-act">
             <input type="checkbox" :checked="catChecked(c, 'search')"
-                   @change="toggleCatPerm(c, 'search', true)" title="级联勾选其下全部子类" />
+                   @change="toggleCatPerm(c, 'search', true)" title="勾选将级联应用到其下全部子类" />
           </span>
           <span class="cat-col-act">
             <input type="checkbox" :checked="catChecked(c, 'download')"
-                   @change="toggleCatPerm(c, 'download', true)" title="级联勾选其下全部子类" />
+                   @change="toggleCatPerm(c, 'download', true)" title="勾选将级联应用到其下全部子类" />
           </span>
         </div>
-        <p class="muted cat-hint">勾选父分类的某操作会级联应用到其全部子类；取消则一并取消。可为不同子类单独授权以实现精细化控制。新增分类会自动出现在此矩阵中。</p>
+        <p class="muted cat-hint">权限仅需在顶层分类设置：勾选某顶层分类的某操作会自动级联应用到其全部子类（子类无需单独设置，自动继承父级权限）。新增顶层分类会自动出现在此矩阵中。</p>
       </div>
 
       <!-- 其他（非分类）权限网格 -->

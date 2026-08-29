@@ -8,6 +8,19 @@ const results = ref([]);
 const searching = ref(false);
 const done = ref(false);
 
+// 检索范围（域切换）：下拉选项来自后端 accessible-categories；空 = 全部授权域
+const selScope = ref("");
+const accessCats = ref([]);
+async function loadScopes() {
+  try {
+    const r = await api.accessibleCategories();
+    accessCats.value = r.categories || [];
+  } catch (e) {
+    accessCats.value = [];
+  }
+}
+loadScopes();
+
 // 选中文件后右侧展示详情
 const selected = ref(null); // 选中的检索结果项
 const docText = ref(""); // 选中文档全文
@@ -167,7 +180,7 @@ async function doSearch() {
   docText.value = "";
   renderedHtml.value = "";
   try {
-    const r = await api.search(kw.value.trim(), 50);
+    const r = await api.search(kw.value.trim(), 50, selScope.value || undefined);
     results.value = r.results || [];
     done.value = true;
     // 默认选中第一个结果并加载内容
@@ -273,6 +286,10 @@ const selectedLabel = computed(() => {
       placeholder="输入关键词或语义描述，回车检索"
       @keyup.enter="doSearch"
     />
+    <select v-model="selScope" class="input" style="max-width: 200px" title="检索范围">
+      <option value="">全部（我有权限的）</option>
+      <option v-for="c in accessCats" :key="c.node" :value="c.node">{{ c.label }}</option>
+    </select>
     <button class="btn primary" :disabled="searching" @click="doSearch">
       {{ searching ? "检索中…" : "检索" }}
     </button>

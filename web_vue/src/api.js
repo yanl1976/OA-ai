@@ -46,8 +46,12 @@ export const api = {
     return api.get("/api/kb/documents?" + q.toString());
   },
   document: (docId) => api.get("/api/kb/document?doc_id=" + encodeURIComponent(docId)),
-  search: (q, topK) =>
-    api.get("/api/kb/search?q=" + encodeURIComponent(q) + "&top_k=" + (topK || 5)),
+  search: (q, topK, category) => {
+    let url = "/api/kb/search?q=" + encodeURIComponent(q) + "&top_k=" + (topK || 5);
+    if (category) url += "&category=" + encodeURIComponent(category);
+    return api.get(url);
+  },
+  accessibleCategories: () => api.get("/api/kb/accessible-categories"),
 
   createCategory: (b) => api.post("/api/kb/category", b),
   updateCategory: (id, b) => api.put("/api/kb/category/" + id, b),
@@ -161,10 +165,11 @@ export const api = {
   chatSessionMessages: (sid) => api.get("/api/kb/chat/session/" + sid),
   chatDeleteSession: (sid) => api.del("/api/kb/chat/session/" + sid),
   chatRenameSession: (sid, title) => api.post("/api/kb/chat/session/" + sid + "/rename", { title }),
-  chatSend: (sessionId, question, topK) =>
+  chatSend: (sessionId, question, topK, category) =>
     api.post("/api/kb/chat", {
       session_id: sessionId || undefined,
       question,
       top_k: topK,
+      category: category || undefined,
     }),
 };

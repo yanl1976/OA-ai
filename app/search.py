@@ -232,7 +232,7 @@ def _aggregate_doc_score(chunk_list):
     return float(sum(top))
 
 
-def hybrid_search(query: str, top_k: int = 20):
+def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     """混合检索（文档级聚合重排 + 相对阈值过滤 + 每文档 top-N chunk 拼接）。
 
     科学范式（dense + sparse hybrid retrieval）:
@@ -242,11 +242,17 @@ def hybrid_search(query: str, top_k: int = 20):
       4. 相对阈值过滤：归一化后低于 (最高分 * MIN_REL) 的长尾文档直接剔除；
       5. 对保留文档取最相关前 MAX_CHUNKS_PER_DOC 个 chunk 按原文顺序拼接为 content，
          既保证答案片段不丢失，又避免整本文档碎片噪声灌入 LLM。
+
+    categories: 可选的文档分类白名单（类型名列表，如 ["管理标准", "会议纪要"] 或
+        含子类名）。若提供，则只在白名单分类的 chunk 参与召回与融合——实现"按域硬约束"
+        而非"全量召回后过滤"，既节省算力又杜绝越权片段进入结果。为 None 时不过滤。
     """
     query = (query or "").strip()
     if not query:
         return []
     qtokens = _tokenize(query)
+    # 分类白名单（归一化为集合，O(1) 判定）
+    _cat_allow = set(categories) if categories else None
 
     # ---- 向量语义召回（保留同一文档的全部命中 chunk）----
     # 【性能】BGE 模型冷启动需 ~20s（sentence-transformers 初始化要联网 HEAD 校验权重 +
@@ -268,6 +274,8 @@ def hybrid_search(query: str, top_k: int = 20):
     for meta, score in vec_pairs:
         d = meta.get("doc_id")
         if d is None:
+            continue
+        if _cat_allow is not None and meta.get("category") not in _cat_allow:
             continue
         vec_chunks.setdefault(d, []).append((meta, score))
 
@@ -312,6 +320,8 @@ def hybrid_search(query: str, top_k: int = 20):
         for c, final_sc, _raw_sc, _boost in rescored[: top_k * 3]:
             d = c.get("doc_id")
             if d is None:
+                continue
+            if _cat_allow is not None and c.get("category") not in _cat_allow:
                 continue
             bm25_chunks.setdefault(d, []).append((c, final_sc))
     except FileNotFoundError:

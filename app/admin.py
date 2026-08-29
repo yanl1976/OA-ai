@@ -73,6 +73,13 @@ DEFAULT_ROLES = {
         "graph.view", "derived.manage"]},
     "viewer": {"desc": "只读访客，仅可浏览与检索", "perms": [
         "graph.view"]},
+    # 示例角色（非内置，可删改）：仅声明非分类维度权限骨架；
+    # 其分类维度的检索/浏览/下载范围需管理员在「角色管理」中按顶层分类勾选
+    # （勾顶层即级联继承其全部子类，无需逐子类设置）。
+    "领导":   {"desc": "公司领导：可在授权分类域内检索/对话（分类域由管理员勾选）", "builtin": 0, "perms": [
+        "graph.view"]},
+    "秘书":   {"desc": "办公室秘书：通常仅授权「会议纪要」域的检索/对话/二次生成", "perms": [
+        "kb.doc.upload", "derived.manage", "graph.view"], "builtin": 0},
 }
 
 # 默认管理员
@@ -245,10 +252,11 @@ def _seed(conn, cur):
     sync_category_permissions(conn=conn, cur=cur)
     # 重新读取权限 id 映射（已含动态分类权限）
     perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
-    # 角色
+    # 角色（builtin 标志控制是否允许删除；示例角色 builtin=0 可删改）
     for rname, meta in DEFAULT_ROLES.items():
-        cur.execute("INSERT OR IGNORE INTO roles(name, description, builtin) VALUES (?,?,1)",
-                    (rname, meta["desc"]))
+        is_builtin = int(meta.get("builtin", 1))
+        cur.execute("INSERT OR IGNORE INTO roles(name, description, builtin) VALUES (?,?,?)",
+                    (rname, meta["desc"], is_builtin))
         rid = cur.execute("SELECT id FROM roles WHERE name=?", (rname,)).fetchone()["id"]
         for pk in meta["perms"]:
             if pk in perm_ids:

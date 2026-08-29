@@ -5,6 +5,8 @@ import { api } from "../api.js";
 const notify = inject("notify");
 
 const scope = ref([]);            // 可对话范围（域名称）
+const accessCats = ref([]);       // 可对话域（含 node/label，供下拉）
+const selScope = ref("");         // 当前选中的检索域（空=全部授权域）
 const sessions = ref([]);
 const activeId = ref(null);
 const messages = ref([]);          // {role, content, refs}
@@ -19,6 +21,12 @@ async function loadScope() {
     scope.value = r.domains || [];
   } catch (e) {
     scope.value = [];
+  }
+  try {
+    const c = await api.accessibleCategories();
+    accessCats.value = c.categories || [];
+  } catch (e) {
+    accessCats.value = [];
   }
 }
 
@@ -98,7 +106,7 @@ async function send() {
   input.value = "";
   scrollBottom();
   try {
-    const r = await api.chatSend(activeId.value, q, 5);
+    const r = await api.chatSend(activeId.value, q, 5, selScope.value || undefined);
     if (!activeId.value) {
       activeId.value = r.session_id;
       await loadSessions();
@@ -181,8 +189,12 @@ onMounted(async () => {
     <!-- 右侧对话区 -->
     <section class="chat-main">
       <div class="chat-scope" v-if="scope.length">
-        对话范围（按您的权限）：<b>{{ scope.join("、") }}</b>
-        <span class="scope-note">· 仅可基于上述范围的文档作答</span>
+        对话范围：
+        <select v-model="selScope" class="scope-select" title="选择对话范围">
+          <option value="">全部（我有权限的）</option>
+          <option v-for="c in accessCats" :key="c.node" :value="c.node">{{ c.label }}</option>
+        </select>
+        <span class="scope-note">· 仅基于所选范围的文档作答</span>
       </div>
       <div class="chat-scope denied" v-else>
         当前账号无对话权限，请联系管理员开通「对话」权限。
