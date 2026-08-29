@@ -27,6 +27,12 @@ const current = ref("Dashboard");
 const toast = reactive({ show: false, msg: "", type: "" });
 let toastTimer = null;
 
+// 系统名称：与系统设置中的「系统名称」卡片同步（来自 /api/system/info）
+const systemName = ref("OA-AI 知识库");
+function setSystemName(name) {
+  if (name) systemName.value = name;
+}
+
 // 跨页跳转：从衍生版本页跳回原版文档 / 跳到某衍生版本
 const pendingDocId = ref(null);
 const pendingDerivedId = ref(null);
@@ -73,6 +79,8 @@ provide("pendingDocId", pendingDocId);
 provide("pendingDerivedId", pendingDerivedId);
 provide("openDerivedForDoc", openDerivedForDoc);
 provide("pendingDerivedSourceId", pendingDerivedSourceId);
+provide("systemName", systemName);
+provide("setSystemName", setSystemName);
 
 // 导航：按权限过滤。perm 为所需权限 key，无 perm 表示人人可见。
 const groups = [
@@ -126,6 +134,13 @@ onMounted(async () => {
     if (r.user) user.value = r.user;
   } catch (e) {
     /* 未登录 */
+  }
+  // 加载系统名称（与系统设置同步）
+  try {
+    const si = await api.systemInfo();
+    if (si && si.system_name) systemName.value = si.system_name;
+  } catch (e) {
+    /* 取不到则用默认 */
   } finally {
     loading.value = false;
   }
@@ -159,7 +174,7 @@ const views = {
 
   <div v-else class="app-shell">
     <div class="topbar">
-      <div class="brand">OA 知识库门户</div>
+      <div class="brand">{{ systemName }}</div>
       <div class="user">
         <span>👤 {{ user.display_name || user.username }}</span>
         <span class="muted">（{{ user.role_name || "—" }}）</span>

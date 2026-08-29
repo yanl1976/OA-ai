@@ -54,6 +54,8 @@ const stats = ref(null);
 const health = ref(null);
 const vecStats = ref(null);
 const sysInfo = ref({ system_name: "", version: "", commits: 0 });
+const setSystemName = inject("setSystemName");
+const sysNameGlobal = inject("systemName");
 
 const activeCard = ref(null); // 当前打开的弹窗 key
 const reindexing = ref(false);
@@ -202,6 +204,9 @@ async function saveSystemName() {
   try {
     const r = await api.setSystemName(name);
     sysInfo.value.system_name = r.system_name;
+    // 同步更新首页左上角的全局系统名称
+    if (setSystemName) setSystemName(r.system_name);
+    if (sysNameGlobal) sysNameGlobal.value = r.system_name;
     notify("系统名称已更新", "ok");
     activeCard.value = null;
   } catch (e) {
