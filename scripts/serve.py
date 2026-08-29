@@ -121,6 +121,10 @@ _EXTRACT_Q = _queue.Queue()
 _INDEX_DIRTY = threading.Event()      # 有待建索引的脏文档
 _EXTRACT_ABORT = threading.Event()   # 中止提取信号：set 后丢弃队列剩余任务
 _REBUILDING = threading.Event()      # 正在重建索引：防止空闲轮询重复触发重建
+# 空闲确认计数：worker 每轮 timeout=1s，连续 N 轮队列为空才认定「真正空闲」。
+# 避免入队间隙「队列短暂为空」就误判空闲、反复触发全量重建。
+_IDLE_TICKS = [0]
+_IDLE_CONFIRM_TICKS = 3              # 约 3 秒持续空闲后才触发全量重建
 _WORKER_STARTED = False
 
 
@@ -198,7 +202,18 @@ def _extract_worker():
             # BM25 为纯分词、开销极低，同样统一重建一次。
             # 抢锁式触发：先清脏标记 + 置 _REBUILDING，保证重建期间（可能数十秒）
             # 后续每秒的空闲轮询不会再 spawn 新的重建线程。
-            if _INDEX_DIRTY.is_set() and not _REBUILDING.is_set():
+            # 入队与提取并发时，队列会「短暂为空」（后续任务尚未入队）。此时若立刻
+            # 触发全量重建，会导致重建被反复打断/重启（每来一批新任务就重建一次）。
+            # 这里做「空闲确认」：连续若干次轮询（约 3 秒）队列都为空，才认为真正
+            # 空闲并触发重建；期间若来新任务则计数器归零。
+            if _EXTRACT_Q.empty():
+                _IDLE_TICKS[0] += 1
+            else:
+                _IDLE_TICKS[0] = 0
+
+            if (_IDLE_TICKS[0] >= _IDLE_CONFIRM_TICKS and _INDEX_DIRTY.is_set()
+                    and not _REBUILDING.is_set()):
+                _IDLE_TICKS[0] = 0
                 _INDEX_DIRTY.clear()
                 _REBUILDING.set()
                 _bm25_rebuild_async()
@@ -296,17 +311,16 @@ def _do_extract_task(task):
     #   - 队列【空】时（即单篇 / 最后一篇）：直接增量 upsert，使该篇立即可搜，
     #     不触发全量 rebuild（单篇增量反而更省）。
     # BM25 同理（不支持单篇增量，始终标记脏、空闲时统一 rebuild 一次，纯分词开销极低）。
-    if _EXTRACT_Q.empty():
-        try:
-            doc = kb_store.get_document(doc_id)
-            if doc:
-                n = vec_store.upsert_document(doc)
-                print("[background] 向量增量更新: %s (%s, +%d chunks)" % (filename, cat, n))
-        except Exception as e:  # noqa: BLE001
-            print("[background] 向量增量失败 %s: %s" % (filename, e))
-    else:
-        print("[background] 向量延迟到队列清空后统一重建（跳过本篇单写）: %s (%s)" % (filename, cat))
-    _INDEX_DIRTY.set()  # BM25 仍全量，空闲时统一重建
+    # 向量索引策略（性能关键）：
+    #   ！【修复·提取卡死的根因】原先「队列空就单篇 upsert」的分支已被移除。
+    #   该判定存在竞态：入队与提取并发，worker 处理第 1 篇时队列常恰好为空
+    #   （后续任务尚未入队），于是第 1 篇就走 upsert_document；而该函数首次调用
+    #   会触发 get_embedder() 加载 BGE 模型（SentenceTransformer 初始化，首次需
+    #   联网/读盘，耗时可达数分钟且不抛异常），直接在 worker 线程内阻塞 ——
+    #   表现为「上传 N 篇只提取 1 篇就卡住，且无任何报错」。
+    #   现统一改为：始终只标记脏，由【独立后台线程】在队列空闲后做 1 次全量重建。
+    #   即使 BGE 首次加载慢，也只阻塞重建线程，不影响提取继续消费队列。
+    _INDEX_DIRTY.set()  # 标脏：BM25 与向量都在空闲时统一全量重建
 
 
 def start_extract_worker():

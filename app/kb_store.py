@@ -11,6 +11,8 @@
 import os
 import re
 import json
+import time
+import random
 import threading
 import hashlib
 
@@ -51,18 +53,45 @@ def store_lock():
 
 
 def _atomic_write_json(path: str, data) -> None:
-    """原子写 JSON：先写同名临时文件并 fsync，再 os.replace 覆盖目标。
+    """原子写 JSON：先写临时文件并 fsync，再 os.replace 覆盖目标。
 
     保证任意时刻读取该文件都拿到完整合法的 JSON，不会出现半截/损坏内容。
+
+    【健壮性·Windows】两点加固：
+      1) 临时文件名加入「进程ID+线程ID+随机数」：原实现仅用 PID，同一进程内
+         多线程并发写同一文件时共用同一 tmp 名，会互相覆盖/争抢句柄。
+      2) os.replace 带重试：Windows 上杀毒软件、文件索引器、甚至本进程刚关闭的
+         句柄未完全释放时，替换会抛 [WinError 5] 拒绝访问。实测 40 篇批量提取
+         中有 2 篇因此失败（表现为「提取任务失败: 拒绝访问」）。退避重试即可。
     """
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    tmp = os.path.join(d, ".tmp_" + os.path.basename(path) + ".%d" % os.getpid())
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    tmp = os.path.join(
+        d, ".tmp_%s.%d.%d.%d" % (os.path.basename(path), os.getpid(),
+                                 threading.get_ident() % 100000,
+                                 random.randint(1000, 9999)))
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # 带退避的重试替换
+        last_err = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError as e:
+                last_err = e
+                time.sleep(0.05 * (attempt + 1))
+        # 最终仍失败：抛出以便上层记录，而不是静默丢数据
+        raise last_err
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def _stable_hash(*parts) -> str:
