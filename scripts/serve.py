@@ -883,6 +883,29 @@ def kb_upload():
                     "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"})
 
 
+# 「年度归档目录」识别：2026 / 2026年度 / 2026 年 这类目录只是归档年份，
+# 不是业务分类。zip 建分类树时必须把它们剥离，否则会把「2026年度」建成
+# 真实分类，既污染分类树，又使最终分类名取成年度（导致分类校验失效、误判冲突）。
+_YEAR_DIR_RE = _re.compile(r"^((?:19|20)\d{2})\s*(?:\u5e74\u5ea6|\u5e74)?$")
+
+
+def _split_year_segs(path_segs):
+    """把目录路径段拆分为 (业务分类段列表, 年度 or None)。
+
+    例：["01.标准化类", "2026年度"] -> (["01.标准化类"], 2026)
+        ["会议纪要", "2025"]        -> (["会议纪要"], 2025)
+    """
+    cat_segs, year = [], None
+    for seg in path_segs:
+        s = (seg or "").strip()
+        m = _YEAR_DIR_RE.match(s)
+        if m:
+            year = int(m.group(1))
+            continue          # 年度层不作为分类
+        cat_segs.append(seg)
+    return cat_segs, year
+
+
 def _ensure_category(name: str, parent_id):
     """存在则返回分类 id，不存在则在指定父级下创建。失败返回 None。"""
     try:
@@ -939,6 +962,12 @@ def kb_upload_zip():
     raw_zip = f.read()
     # confirm_category=1：用户已确认「仍按 zip 目录名分类上传」，跳过拦截
     zip_confirm = request.form.get("confirm_category") in ("1", "true", "yes")
+    # conflict_policy：冲突文件的处置策略（仅对未 confirm 的冲突文件生效）
+    #   skip    (默认) 跳过冲突文件，其余照常上传，冲突清单回传给用户
+    #   suggest       冲突文件改用建议分类上传
+    #   keep          冲突文件仍按 zip 目录分类上传（用户已知情）
+    _pol = (request.form.get("conflict_policy") or "skip").strip().lower()
+    conflict_policy = _pol if _pol in ("skip", "suggest", "keep") else "skip"
     created_cats = []
     results = []
     zip_conflicts = []
@@ -954,8 +983,14 @@ def kb_upload_zip():
         if not names:
             return jsonify({"error": "压缩包内没有可处理的文件"}), 400
         # 若所有文件首段目录相同（用户把整个目录打包），剥离该顶层
+        # 【修复·顶层剥离条件过宽】原逻辑「所有文件首段目录相同就剥离该层」，
+        # 会把真实的子分类层也剥掉：例如 zip 结构为「01.标准化类/2026年度/xx.pdf」
+        # 且父分类选「管理标准分类」时，首段恒为「01.标准化类」→ 被剥离 →
+        # 文件全部错误地归到父分类「管理标准分类」，丢失子分类信息。
+        # 正确条件：仅当顶层目录名 == 所选父分类名（用户把父目录也一起打包了，
+        # 属于冗余层）时才剥离；否则该层是真实分类，必须保留。
         top_segs = set(n.split("/")[0] for n in names)
-        strip_top = (len(top_segs) == 1)
+        strip_top = (len(top_segs) == 1 and parent_name in top_segs)
 
         for n in names:
             parts = n.split("/")
@@ -965,10 +1000,18 @@ def kb_upload_zip():
                 continue
             base = parts[-1]
             ext = os.path.splitext(base)[1].lower()
-            # 逐级建分类（parts[:-1] 为分类路径）
+            # 【修复】先从目录路径中剥离「年度归档层」再建分类。
+            # 原实现把 parts[:-1] 整段都当分类建，于是「2026年度」被建成真实分类，
+            # 最终分类名也随之取成「2026年度」，造成两个后果：
+            #   1) 分类树被「2026年度」这类非业务节点污染；
+            #   2) 分类校验按「2026年度」判断类别（_family_of_category 返回 None），
+            #      使会议纪要类文件被误判为冲突，进而触发整包拒绝 ——
+            #      这正是「上传压缩包被拒」的根因。
+            cat_segs, zip_year = _split_year_segs(parts[:-1])
+            # 逐级建分类（cat_segs 为剥离年度层后的分类路径）
             cur_parent = parent_id
             path_parts = []
-            for seg in parts[:-1]:
+            for seg in cat_segs:
                 path_parts.append(seg)
                 cid = _ensure_category(seg, cur_parent)
                 if cid is None:
@@ -986,19 +1029,29 @@ def kb_upload_zip():
                                 "error": "不支持格式 %s（已跳过）" % ext})
                 continue
             data = zf.read(n)
-            # 【上传校验·源头拦截】zip 的分类来自目录名，极易与内容不符（如把纪要
-            # 目录放在管理标准树下）。此处只校验不纠正：冲突文件跳过不落盘，整个
-            # zip 处理完后返回冲突清单，请用户调整目录结构后重传。
+            # 【上传校验·源头拦截·按文件处理】
+            # zip 是批量入口，一个包常有几十上百个文件。原实现「只要有 1 个文件
+            # 冲突就整包返回 409」，既过于严格（一个文件废掉整批），还会造成
+            # 数据重复：无冲突文件其实已经落盘，用户按提示「重新上传」就会重复入库。
+            # 现改为按文件处理：冲突文件按策略处置，其余文件照常上传，
+            # 最后统一在 skipped 清单里告知用户哪几个没传、为什么。
             suggested, zip_warn = _check_category_consistency(base, final_cat_name, data)
             if suggested and not zip_confirm:
-                zip_conflicts.append({
-                    "filename": n,
-                    "chosen_category": final_cat_name,
-                    "suggested_category": suggested,
-                    "warning": zip_warn,
-                })
-                continue  # 不落盘，等待用户确认
-            zip_cat = final_cat_name
+                if conflict_policy == "suggest":
+                    zip_cat = suggested       # 采纳建议分类上传
+                elif conflict_policy == "keep":
+                    zip_cat = final_cat_name  # 用户知情，仍按原分类上传
+                else:
+                    # 默认 skip：跳过该文件（不落盘），其余文件继续
+                    zip_conflicts.append({
+                        "filename": n,
+                        "chosen_category": final_cat_name,
+                        "suggested_category": suggested,
+                        "warning": zip_warn,
+                    })
+                    continue
+            else:
+                zip_cat = final_cat_name
             # 第一步：仅落盘原始二进制 + 占位 entry（与普通上传一致，极快）
             try:
                 doc_id = kb_store.save_upload_raw(base, zip_cat, data)
@@ -1021,26 +1074,25 @@ def kb_upload_zip():
 
     created_cats = sorted(set(created_cats))
 
-    # 【源头拦截】zip 内存在分类冲突：冲突文件未落盘，返回冲突清单请用户
-    # 调整 zip 目录结构后重传（或确认忽略后带 confirm_category=1 重传）。
-    if zip_conflicts:
-        return jsonify({
-            "ok": False,
-            "error": "压缩包内有文件的分类与内容不符，请调整目录结构后重新上传",
-            "conflicts": zip_conflicts,
-            "results": results,
-            "created_categories": created_cats,
-        }), 409
-
     ok_count = sum(1 for r in results if r.get("ok"))
-    if ok_count == 0:
+
+    # 【批量语义】zip 是批量入口，个别文件冲突不再废掉整包：
+    # 无冲突文件已正常上传，冲突文件按策略跳过并回传 skipped 清单，
+    # 由用户针对这几个文件单独处理（调整目录或单独上传）。
+    # 只有「全部失败」才返回错误——避免误导用户重传整包造成重复入库。
+    if ok_count == 0 and not zip_conflicts:
         return jsonify({"ok": False, "results": results, "error": "所有文件均处理失败",
                         "created_categories": created_cats}), 400
 
-    # 与普通上传一致：不在此同步建索引，交给后台 worker 在队列空闲时统一重建。
-    return jsonify({"ok": True, "results": results, "count": ok_count,
-                    "created_categories": created_cats,
-                    "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"})
+    payload = {"ok": True, "results": results, "count": ok_count,
+               "created_categories": created_cats,
+               "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"}
+    if zip_conflicts:
+        payload["skipped"] = zip_conflicts
+        payload["skipped_count"] = len(zip_conflicts)
+        payload["note"] = ("已上传 %d 个文件；另有 %d 个文件因分类与内容不符被跳过，"
+                           "请调整其所在目录后单独上传。" % (ok_count, len(zip_conflicts)))
+    return jsonify(payload)
 
 
 @app.route("/api/kb/document/<doc_id>", methods=["DELETE"])

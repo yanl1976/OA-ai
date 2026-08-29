@@ -69,11 +69,13 @@ export const api = {
     if (confirmCategory) fd.append("confirm_category", "1");
     return api.postForm("/api/kb/upload", fd);
   },
-  uploadZip: (file, parent, confirmCategory) => {
+  uploadZip: (file, parent, confirmCategory, conflictPolicy) => {
     const fd = new FormData();
     fd.append("file", file);
     if (parent) fd.append("parent", parent);
     if (confirmCategory) fd.append("confirm_category", "1");
+    // 冲突文件处置策略：skip(跳过) / suggest(改用建议分类) / keep(仍按原分类)
+    if (conflictPolicy) fd.append("conflict_policy", conflictPolicy);
     return api.postForm("/api/kb/upload-zip", fd);
   },
   deleteDocument: (id) => api.del("/api/kb/document/" + id),

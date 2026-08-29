@@ -288,44 +288,31 @@ async function uploadZip() {
   zipUploading.value = true;
   zipResult.value = null;
   try {
-    const r = await api.uploadZip(zipFile.value, zipParent.value, false);
+    const r = await api.uploadZip(zipFile.value, zipParent.value, false, zipPolicy.value);
     zipResult.value = r;
+    zipConflicts.value = r.skipped || [];
     const ok = (r.results || []).filter((x) => x.ok).length;
     const created = (r.created_categories || []).join("、");
-    notify("目录上传完成：" + ok + " 个文件成功" + (created ? "，新建/复用分类：" + created : ""), "ok");
+    const skipped = (r.skipped || []).length;
+    if (skipped) {
+      notify(
+        "已上传 " + ok + " 个文件；" + skipped + " 个因分类与内容不符被跳过（详见下方清单）",
+        "warn"
+      );
+    } else {
+      notify("目录上传完成：" + ok + " 个文件成功" + (created ? "，新建/复用分类：" + created : ""), "ok");
+    }
     zipFile.value = null;
   } catch (e) {
-    // 409：zip 内有文件分类与内容冲突，展示清单请用户调整目录结构后重传
-    if (e.status === 409 && e.data && e.data.conflicts) {
-      zipConflicts.value = e.data.conflicts;
-      zipResult.value = e.data;
-      notify(e.message || "压缩包内有分类冲突，请调整目录结构后重新上传", "warn");
-    } else {
-      notify(e.message, "err");
-    }
+    notify(e.message, "err");
   } finally {
     zipUploading.value = false;
   }
 }
 
-// zip 冲突：用户调整目录后重传；确属误报可「忽略并上传」（带 confirm_category=1）
+// zip 内冲突文件的处置策略：skip(跳过) / suggest(改用建议分类) / keep(仍按原分类)
+const zipPolicy = ref("skip");
 const zipConflicts = ref([]);
-
-async function uploadZipIgnore() {
-  if (!zipFile.value) return;
-  zipUploading.value = true;
-  try {
-    const r = await api.uploadZip(zipFile.value, zipParent.value, true);
-    zipResult.value = r;
-    zipConflicts.value = [];
-    notify("已忽略冲突提示完成上传，请留意提取结果是否符合预期", "warn");
-    zipFile.value = null;
-  } catch (e2) {
-    notify(e2.message, "err");
-  } finally {
-    zipUploading.value = false;
-  }
-}
 
 onMounted(loadCats);
 </script>
@@ -409,6 +396,15 @@ onMounted(loadCats);
       <input class="input" type="file" accept=".zip" @change="onZipFile" />
       <p class="file-hint" v-if="zipFile">{{ zipFile.name }}（{{ fmtSize(zipFile.size) }}）</p>
     </div>
+    <div class="field">
+      <label>分类冲突处理</label>
+      <select class="input" v-model="zipPolicy">
+        <option value="skip">跳过冲突文件（推荐，其余照常上传）</option>
+        <option value="suggest">冲突文件改用建议分类上传</option>
+        <option value="keep">冲突文件仍按目录分类上传</option>
+      </select>
+      <p class="file-hint">当文件所在目录与内容类型不符时（如纪要放在标准目录下）的处理方式。选「跳过」不会因个别文件影响整批上传。</p>
+    </div>
     <button class="btn primary" :disabled="zipUploading || !zipFile" @click="uploadZip">
       {{ zipUploading ? "处理中…" : "上传目录(zip)" }}
     </button>
@@ -422,19 +418,19 @@ onMounted(loadCats);
           <span class="fsize" v-else style="color:#c0392b">{{ x.error }}</span>
         </li>
       </ul>
-      <!-- zip 内分类冲突：交由用户调整目录结构，不自动纠正 -->
+      <!-- zip 内被跳过的冲突文件：不废整包，仅提示这几个需单独处理 -->
       <div class="cat-warn" v-if="zipConflicts.length">
-        <p class="cat-warn-title">⚠️ {{ zipConflicts.length }} 个文件分类与内容不符（未上传）</p>
+        <p class="cat-warn-title">⚠️ {{ zipConflicts.length }} 个文件分类与内容不符（已跳过，未上传）</p>
         <ul class="file-list">
           <li v-for="(c, i) in zipConflicts" :key="i">
             <span class="fname">{{ c.filename }}</span>
             <span class="fsize cat-warn-text">{{ c.warning }}</span>
           </li>
         </ul>
-        <p class="cat-warn-foot">请调整 zip 目录结构（如把纪要单独放到「会议纪要」目录）后重新上传。</p>
-        <button class="btn sm" :disabled="zipUploading" @click="uploadZipIgnore" style="margin-top:8px">
-          忽略提示并上传
-        </button>
+        <p class="cat-warn-foot">
+          其余文件已正常上传。请调整这几个文件所在目录（如把纪要单独放到「会议纪要」目录）后单独上传，
+          或将上方策略改为「改用建议分类」再传一次。
+        </p>
       </div>
     </div>
   </div>
