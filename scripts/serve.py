@@ -896,7 +896,7 @@ def kb_uploads_list():
 
 
 @app.route("/api/kb/upload-status")
-@login_required("kb.upload")
+@login_required("kb.doc.upload")
 def kb_upload_status():
     """轻量查询若干上传文档的识别进度（供前端轮询展示后台提取状态）。
 
