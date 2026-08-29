@@ -840,6 +840,13 @@ def delete_category(cat_id: int):
 # ============ 功能开关 ============
 def list_features() -> list:
     conn = _conn()
+    # 幂等补种：确保 DEFAULT_FEATURES 中新增的开关（如 watermark_enabled）在旧库中也存在，
+    # 否则 set_feature 的 UPDATE 会因找不到行而静默失效（Flask 启动不调用 init_db）。
+    for key, name, desc, en in DEFAULT_FEATURES:
+        conn.execute(
+            "INSERT OR IGNORE INTO feature_flags(`key`, name, description, enabled) VALUES (?,?,?,?)",
+            (key, name, desc, en))
+    conn.commit()
     rows = conn.execute(
         "SELECT `key`, name, description, enabled FROM feature_flags ORDER BY `key`").fetchall()
     conn.close()
