@@ -1548,7 +1548,9 @@ def adm_role_create():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "角色名称不能为空"}), 400
-    rid = admin.create_role(name, data.get("description", ""), data.get("permissions", []))
+    # 与 update_role 一致：使用关键字参数，避免签名调整后位置传参错位
+    rid = admin.create_role(name, description=data.get("description", ""),
+                            perms=data.get("permissions", []))
     return jsonify({"ok": True, "id": rid})
 
 
@@ -1558,8 +1560,19 @@ def adm_role_update(rid):
     if request.method == "PUT":
         data = request.get_json(silent=True) or {}
         try:
-            admin.update_role(rid, data.get("name"), data.get("description"),
-                              data.get("permissions"))
+            # 【修复·参数错位】此前按位置传参 (rid, name, description, permissions)，
+            # 但 update_role 签名是 (role_id, description, perms, name)，
+            # 于是 name 收到了 list、description 收到了 name、perms 收到了 description，
+            # 执行「UPDATE roles SET name=?」时绑定 list 直接报
+            #   Error binding parameter 1: type 'list' is not supported
+            # 且一旦侥幸不报错就会把角色名/描述/权限互相写错。
+            # 改为关键字参数，杜绝顺序依赖。
+            admin.update_role(
+                rid,
+                name=data.get("name"),
+                description=data.get("description"),
+                perms=data.get("permissions"),
+            )
         except Exception as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"ok": True})

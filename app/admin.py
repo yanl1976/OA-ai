@@ -346,6 +346,32 @@ def create_role(name: str, description: str, perms: list) -> int:
 
 
 def update_role(role_id: int, description: str = None, perms: list = None, name: str = None):
+    """更新角色（名称/描述/权限）。
+
+    【入参防御·修复】调用方曾按位置传参导致 name 收到 list、perms 收到 str，
+    执行 SQL 时报「type 'list' is not supported」，且侥幸不报错时会把角色
+    名/描述/权限互相写错。这里对类型做强校验：
+      - name / description 必须是字符串（空串合法，None 表示不改）
+      - perms 必须是 list/tuple，且元素为字符串；None 表示不改
+    类型不符直接抛 ValueError，由路由返回 400，避免脏数据入库。
+    """
+    if name is not None:
+        if isinstance(name, (list, tuple, dict)):
+            raise ValueError("角色名称必须是字符串，收到 %s" % type(name).__name__)
+        name = str(name).strip()
+        if not name:
+            raise ValueError("角色名称不能为空")
+    if description is not None:
+        if isinstance(description, (list, tuple, dict)):
+            raise ValueError("角色描述必须是字符串，收到 %s" % type(description).__name__)
+        description = str(description)
+    if perms is not None:
+        if isinstance(perms, str):
+            raise ValueError("权限列表必须是数组，收到字符串")
+        if not isinstance(perms, (list, tuple)):
+            raise ValueError("权限列表必须是数组，收到 %s" % type(perms).__name__)
+        perms = [str(p) for p in perms if isinstance(p, (str, int))]
+
     conn = _conn()
     cur = conn.cursor()
     if name is not None:
