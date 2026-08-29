@@ -77,29 +77,12 @@ function togglePerm(key) {
 function toggleCatPerm(cat, action, cascade) {
   const key = catPermKey(cat.id, action);
   const has = form.value.permissions.includes(key);
-  if (cascade) {
-    const ids = [cat.id];
-    // 收集后代
-    const byParent = {};
-    (categories.value || []).forEach((c) => (byParent[c.parent_id || 0] = byParent[c.parent_id || 0] || []).push(c));
-    const stack = [cat.id];
-    while (stack.length) {
-      const cur = stack.pop();
-      (byParent[cur] || []).forEach((ch) => { ids.push(ch.id); stack.push(ch.id); });
-    }
-    if (has) {
-      // 取消：移除该操作的所有相关 key
-      form.value.permissions = form.value.permissions.filter(
-        (k) => !ids.some((id) => k === catPermKey(id, action))
-      );
-    } else {
-      ids.forEach((id) => {
-        const k = catPermKey(id, action);
-        if (!form.value.permissions.includes(k)) form.value.permissions.push(k);
-      });
-    }
+  // 简化授权模型：仅在顶层分类设置权限；子类权限由后端沿分类祖先链自动继承
+  // （check_cat_action 会向上查找父级权限），因此不展开写入子类 key，避免冗余。
+  if (has) {
+    form.value.permissions = form.value.permissions.filter((k) => k !== key);
   } else {
-    togglePerm(key);
+    if (!form.value.permissions.includes(key)) form.value.permissions.push(key);
   }
 }
 function catChecked(cat, action) {
