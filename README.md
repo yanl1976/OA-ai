@@ -326,6 +326,56 @@ git fetch origin main && git reset --hard origin/main
 >
 > ⚠️ 此方式只更新被 git 跟踪的文件，**索引仍需重建**，且不会迁移 `.env`、`venv` 等未入库数据。
 
+**实战案例（2026-08-29，真实踩坑记录）**：
+
+生产执行 `git pull origin main` 被拒绝，报两类冲突：
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+        app/admin.py  app/search.py  scripts/serve.py
+        web_vue/src/api.js  web_vue/src/components/ChatView.vue
+        web_vue/src/components/RoleManage.vue  web_vue/src/components/SearchView.vue
+error: The following untracked working tree files would be overwritten by merge:
+        scripts/start.sh
+```
+
+**排查与处理（零丢失）**：
+
+1. 先对所有冲突文件做哈希比对，确认生产工作区内容与 `origin/main` **逐一一致**（假脏，非真改动）：
+
+   ```bash
+   for f in app/admin.py app/search.py scripts/serve.py \
+            web_vue/src/api.js web_vue/src/components/ChatView.vue \
+            web_vue/src/components/RoleManage.vue web_vue/src/components/SearchView.vue \
+            scripts/start.sh; do
+     printf "%-45s local=%s remote=%s\n" "$f" \
+       "$(git hash-object "$f")" "$(git rev-parse origin/main:"$f")"
+   done
+   # 输出：8 个文件 local 与 remote 哈希全部相等 → 可安全丢弃工作区
+   ```
+
+   > 哈希一致即证明这些"未提交改动"纯属 `deploy_from_local.py` 整目录直传造成的假脏，
+   > 实际内容相同，**丢弃零损失**。若任一文件哈希不一致，则应先 `git stash` 或人工 diff 保留真改动。
+
+2. 确认一致后，强制同步（fetch 确保 origin/main 最新，再 reset）：
+
+   ```bash
+   git fetch origin main && git reset --hard origin/main
+   # HEAD is now at f4d31a9 ...
+   git status          # On branch main / Your branch is up to date with 'origin/main'
+   git pull origin main # Already up to date.
+   ```
+
+3. 重启服务（按需）：
+
+   ```bash
+   sudo systemctl restart kb && sleep 8 && systemctl is-active kb   # → active
+   ```
+
+**结论**：假脏冲突的根因是"先 deploy 后 commit/push"，让生产工作区文件比 git HEAD 新。
+根治办法仍是**部署前先 `git commit && git push`**，使本地、生产、远端三者同源，此后 `git pull` 不再报冲突。
+哈希比对这一步是关键安全阀——务必先确认一致再 `reset --hard`，切勿对未知改动盲 reset。
+
 ### 首次安装（全新机器）
 
 ```bash
