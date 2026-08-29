@@ -1053,8 +1053,10 @@ def kb_upload_zip():
             else:
                 zip_cat = final_cat_name
             # 第一步：仅落盘原始二进制 + 占位 entry（与普通上传一致，极快）
+            # year 传 zip 目录中的年度层：既保证归档到正确年度目录，
+            # 也降低同分类下同名文件发生 doc_id 冲突的概率（配合冲突检测兜底）。
             try:
-                doc_id = kb_store.save_upload_raw(base, zip_cat, data)
+                doc_id = kb_store.save_upload_raw(base, zip_cat, data, year=zip_year)
             except Exception as e:  # noqa: BLE001
                 results.append({"filename": n, "ok": False, "error": "保存失败: %s" % e})
                 continue
@@ -1084,14 +1086,44 @@ def kb_upload_zip():
         return jsonify({"ok": False, "results": results, "error": "所有文件均处理失败",
                         "created_categories": created_cats}), 400
 
+    failed = [r for r in results if not r.get("ok")]
+
+    # 【数量自检】zip 是批量入口，文件多、易因「同名同大小导致 doc_id 冲突覆盖」
+    # 或「格式不支持」等原因少传。这里把「压缩包内文件数 vs 实际入库数」做对账，
+    # 差异直接回传并在 note 中提示，避免用户事后才发现数量对不上。
     payload = {"ok": True, "results": results, "count": ok_count,
                "created_categories": created_cats,
+               "total_in_zip": len(names),
+               "uploaded": ok_count,
+               "failed": failed,
                "note": "文件已保存，文本识别与索引将在后台完成，稍候即可检索"}
+
+    notes = []
     if zip_conflicts:
         payload["skipped"] = zip_conflicts
         payload["skipped_count"] = len(zip_conflicts)
-        payload["note"] = ("已上传 %d 个文件；另有 %d 个文件因分类与内容不符被跳过，"
-                           "请调整其所在目录后单独上传。" % (ok_count, len(zip_conflicts)))
+        notes.append("%d 个文件因分类与内容不符被跳过（详见 skipped）"
+                     % len(zip_conflicts))
+    if failed:
+        notes.append("%d 个文件处理失败（详见 failed）" % len(failed))
+
+    accounted = ok_count + len(zip_conflicts) + len(failed)
+    if accounted != len(names):
+        # 有文件既没成功、也没被记为跳过/失败 —— 说明发生了静默覆盖，必须告警
+        payload["count_mismatch"] = {
+            "in_zip": len(names),
+            "accounted": accounted,
+            "unaccounted": len(names) - accounted,
+        }
+        notes.append("注意：压缩包内 %d 个文件，仅 %d 个有明确结果，"
+                     "可能有个别文件因重名同大小被覆盖，请核对数量"
+                     % (len(names), accounted))
+
+    if notes:
+        payload["note"] = "已上传 %d 个文件；%s。" % (ok_count, "；".join(notes))
+    elif ok_count != len(names):
+        payload["note"] = ("压缩包内 %d 个文件，实际入库 %d 个，请核对。"
+                           % (len(names), ok_count))
     return jsonify(payload)
 
 

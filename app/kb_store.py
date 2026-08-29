@@ -622,44 +622,97 @@ def _doc_id_for(filename: str, category: str, raw_bytes: bytes) -> str:
     return "up_%d" % (int(_stable_hash(filename, category, len(raw_bytes))[:12], 16) % (10 ** 12))
 
 
-def save_upload_raw(filename: str, category: str, raw_bytes: bytes) -> str:
+def _resolve_doc_id_conflict(doc_id: str, raw_bytes: bytes, ups: list) -> str:
+    """解决 doc_id 冲突：已存在且内容不同时，生成唯一变体 id。
+
+    【修复·静默丢文件】doc_id = hash(文件名+分类+字节数)，不含年度/目录。
+    因此 zip 里「01.标准化类/2025年度/A.pdf」与「01.标准化类/2026年度/A.pdf」
+    （同名、同分类、恰好同字节数）会算出同一个 doc_id；而磁盘文件名就是
+    doc_id，后写的会【直接覆盖】先写的，json 条目也随之 update 覆盖 ——
+    文件静默丢失、无任何报错（正是「压缩包 183 个文件只上传 179 个」的原因）。
+
+    策略：
+      - 内容相同  -> 复用原 doc_id（重复上传幂等，不产生重复条目）
+      - 内容不同  -> 追加序号派生新 id，直到不冲突（保住两个文件）
+    这样既不改变已有无冲突文档的 doc_id（向后兼容），又避免覆盖丢文件。
+    """
+    existing = None
+    for u in ups:
+        if u.get("doc_id") == doc_id:
+            existing = u
+            break
+    if existing is None:
+        return doc_id
+
+    # 与已存在文件比对内容
+    old_path = _resolve_binary_path(existing)
+    same = False
+    if old_path and os.path.exists(old_path):
+        try:
+            same = open(old_path, "rb").read() == raw_bytes
+        except Exception:
+            same = False
+    if same:
+        return doc_id          # 幂等：同一文件重复上传，复用原条目
+
+    # 内容不同 -> 派生唯一 id
+    for i in range(1, 1000):
+        alt = "up_%d" % (int(_stable_hash(doc_id, i)[:12], 16) % (10 ** 12))
+        if not any(u.get("doc_id") == alt for u in ups):
+            return alt
+    return doc_id
+
+
+def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = None) -> str:
     """仅落盘原始二进制 + 占位 entry（text 暂空），极快，供上传接口同步返回。
 
     真正的文本提取/结构化（extract + post_process）由后台任务异步补写，
     见 update_upload_text()。返回稳定 doc_id。
+
+    year：归档年度。zip 批量上传时应传入「目录中的年度层」（如 2026年度），
+    否则不同年度的同名文件会归到同一年度目录、并更容易触发 doc_id 冲突。
+    不传时回退为从文件名中解析年份。
     """
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(UPLOAD_FILES_DIR, exist_ok=True)
     ext = os.path.splitext(filename)[1].lower()
-    doc_id = _doc_id_for(filename, category, raw_bytes)
-    year = _extract_year(filename, "")
-    stored_rel = None
-    mimetype = None
-    if raw_bytes is not None:
-        rel = _stored_rel_for(category, year, doc_id, ext)
-        abs_path = os.path.join(UPLOAD_DIR, rel)
-        try:
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "wb") as f:
-                f.write(raw_bytes)
-            if os.path.exists(abs_path) and os.path.getsize(abs_path) == len(raw_bytes):
-                stored_rel = rel
-                mimetype = mimetype_for_ext(ext)
-            else:
-                try:
-                    if os.path.exists(abs_path):
-                        os.remove(abs_path)
-                except Exception:
-                    pass
-        except Exception:
-            stored_rel = None
+    # 优先使用调用方指定的年度（zip 目录层），回退到文件名解析
+    if year is None:
+        year = _extract_year(filename, "")
+
     # 「读-改-写」必须整体持锁：并发上传同一文件时，两个线程可能同时读到旧列表、
     # 各自 append 后再写回，造成后写覆盖先写（丢条目）或结构错乱。
+    # 冲突检测与落盘也在锁内，保证 doc_id 判定的原子性。
     with _STORE_LOCK:
         ups = _load_uploads()
         if not isinstance(ups, list):
             ups = []
         ups = [u for u in ups if isinstance(u, dict)]
+
+        doc_id = _doc_id_for(filename, category, raw_bytes)
+        doc_id = _resolve_doc_id_conflict(doc_id, raw_bytes, ups)
+
+        stored_rel = None
+        mimetype = None
+        if raw_bytes is not None:
+            rel = _stored_rel_for(category, year, doc_id, ext)
+            abs_path = os.path.join(UPLOAD_DIR, rel)
+            try:
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                with open(abs_path, "wb") as f:
+                    f.write(raw_bytes)
+                if os.path.exists(abs_path) and os.path.getsize(abs_path) == len(raw_bytes):
+                    stored_rel = rel
+                    mimetype = mimetype_for_ext(ext)
+                else:
+                    try:
+                        if os.path.exists(abs_path):
+                            os.remove(abs_path)
+                    except Exception:
+                        pass
+            except Exception:
+                stored_rel = None
+
         entry = {"doc_id": doc_id, "filename": filename, "category": category,
                  "pages": 1, "label": filename,
                  "text": "", "created_at": _now(),
