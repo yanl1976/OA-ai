@@ -176,6 +176,10 @@ a { color: var(--primary); text-decoration: none; }
   width: 520px; max-width: 94vw; max-height: 90vh; overflow: auto;
   background: #fff; border-radius: 14px; padding: 22px; box-shadow: var(--shadow);
 }
+.modal.modal-wide {
+  width: 860px; max-width: 96vw; max-height: none; overflow: visible;
+}
+.modal-wide .perm-grid { grid-template-columns: repeat(3, 1fr); }
 .modal h3 { margin: 0 0 16px; }
 .modal .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 

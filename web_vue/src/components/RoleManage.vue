@@ -143,7 +143,7 @@ onMounted(load);
     </table>
   </div>
 
-  <Modal :show="showModal" :title="editing ? '编辑角色' : '新建角色'" @close="showModal = false">
+  <Modal :show="showModal" :title="editing ? '编辑角色' : '新建角色'" :wide="true" @close="showModal = false">
     <div class="field">
       <label>角色名称</label>
       <input class="input" v-model="form.name" />
