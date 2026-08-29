@@ -217,52 +217,54 @@ onMounted(load);
 </script>
 
 <template>
-  <h2>系统设置</h2>
-  <p class="muted">集中管理系统功能开关、检索索引、数据统计与运行信息，点击卡片进入设置。</p>
+  <div class="sys-manage">
+    <h2>系统设置</h2>
+    <p class="muted">集中管理系统功能开关、检索索引、数据统计与运行信息，点击卡片进入设置。</p>
 
-  <!-- 二级页面：管理功能 -->
-  <div v-if="sub" class="sub-view">
-    <button class="btn sm" @click="backToCards">← 返回系统设置</button>
-    <component :is="subViews[sub]" />
-  </div>
-
-  <!-- 卡片网格 -->
-  <template v-else>
-  <div v-if="loading" class="loading">加载中…</div>
-  <div v-else>
-    <!-- 管理功能入口卡片 -->
-    <h3 class="sub-title">管理功能</h3>
-    <div class="sys-card-grid">
-      <div
-        v-for="c in visibleAdminCards"
-        :key="c.key"
-        class="sys-card admin-card"
-        @click="openSub(c.key)"
-      >
-        <div class="sys-card-icon">{{ c.icon }}</div>
-        <div class="sys-card-title">{{ c.title }}</div>
-        <div class="sys-card-desc">{{ c.desc }}</div>
-        <div class="sys-card-go">进入 →</div>
-      </div>
+    <!-- 二级页面：管理功能 -->
+    <div v-if="sub" class="sub-view">
+      <button class="btn sm" @click="backToCards">← 返回系统设置</button>
+      <component :is="subViews[sub]" />
     </div>
 
-    <!-- 系统维护卡片 -->
-    <h3 class="sub-title">系统维护</h3>
-    <div class="sys-card-grid">
-      <div
-        v-for="c in cards"
-        :key="c.key"
-        class="sys-card"
-        :class="{ warn: c.key !== 'features' && statusText(c.key) === '索引缺失' }"
-        @click="activeCard = c.key"
-      >
-        <div class="sys-card-icon">{{ c.icon }}</div>
-        <div class="sys-card-title">{{ c.title }}</div>
-        <div class="sys-card-desc">{{ c.desc }}</div>
-        <div class="sys-card-status">{{ statusText(c.key) }}</div>
+    <!-- 卡片网格 -->
+    <div v-else>
+      <div v-if="loading" class="loading">加载中…</div>
+      <div v-else>
+        <!-- 管理功能入口卡片 -->
+        <h3 class="sub-title">管理功能</h3>
+        <div class="sys-card-grid">
+          <div
+            v-for="c in visibleAdminCards"
+            :key="c.key"
+            class="sys-card admin-card"
+            @click="openSub(c.key)"
+          >
+            <div class="sys-card-icon">{{ c.icon }}</div>
+            <div class="sys-card-title">{{ c.title }}</div>
+            <div class="sys-card-desc">{{ c.desc }}</div>
+            <div class="sys-card-go">进入 →</div>
+          </div>
+        </div>
+
+        <!-- 系统维护卡片 -->
+        <h3 class="sub-title">系统维护</h3>
+        <div class="sys-card-grid">
+          <div
+            v-for="c in cards"
+            :key="c.key"
+            class="sys-card"
+            :class="{ warn: c.key !== 'features' && statusText(c.key) === '索引缺失' }"
+            @click="activeCard = c.key"
+          >
+            <div class="sys-card-icon">{{ c.icon }}</div>
+            <div class="sys-card-title">{{ c.title }}</div>
+            <div class="sys-card-desc">{{ c.desc }}</div>
+            <div class="sys-card-status">{{ statusText(c.key) }}</div>
+          </div>
+        </div>
       </div>
     </div>
-  </div>
 
   <!-- 功能开关 -->
   <Modal :show="activeCard === 'features'" title="功能开关" @close="activeCard = null">
@@ -389,4 +391,5 @@ onMounted(load);
       <button class="btn" @click="activeCard = null">关闭</button>
     </template>
   </Modal>
+  </div>
 </template>
