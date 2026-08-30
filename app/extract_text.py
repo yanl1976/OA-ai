@@ -759,14 +759,75 @@ def _decode_pdf_pymupdf(raw: bytes, category: str = None) -> str:
             page_lines.append(txt)
         if page_lines:
             parts.append("\n".join(page_lines))
-    doc.close()
 
     # 页与页之间用 \f（form feed，PDF 语义即分页）连接，而非 \n\n。
     # 这样 _clean_pdf_text 能精准识别「换页导致的换行」：跨页相邻两行若本属
     # 同一段落（前一行未以句末标点 / 议题序号结束，后一行也非议题 / 公文要素
     # 开头），则应合并而非断段——否则正文跨页处会被错误地切成两个段落。
     text = "\f".join(parts)
-    return _post_clean_pdf_text(text)
+    text = _post_clean_pdf_text(text)
+
+    # 扫描件降级：PyMuPDF 文本层为空（图像型 PDF / 扫描件）时，逐页渲染为
+    # 图片再交给 Tesseract OCR。仅当确实没有文本时才触发，避免对正常 PDF
+    # 做无谓的渲染开销。OCR 文本同样走 _post_clean_pdf_text（其中的编号粘连
+    # 清理规则原本就是为 OCR 输出设计的），故在上方统一清洗即可。
+    if not text.strip():
+        # 注意：本函数顶部已 doc.close()，此处不再重复 close（重复 close 会抛
+        # RuntimeError('document closed')）；OCR 分支内部会重新打开独立 doc。
+        return _decode_pdf_ocr(raw, category=category)
+    doc.close()
+    return text
+
+
+def _decode_pdf_ocr(raw: bytes, category: str = None) -> str:
+    """扫描件降级 OCR：把 PDF 每页渲染成图片，用 Tesseract 识别文字。
+
+    依赖：系统层 Tesseract-OCR 引擎 + 中文语言包（chi_sim）。引擎路径可用
+    环境变量 TESSERACT_CMD 覆盖（默认走 PATH）。未安装或识别失败时返回空串，
+    由 extract() 统一给出「可能为扫描件」告警，不让后台提取任务崩溃。
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    _cmd = os.environ.get("TESSERACT_CMD")
+    if _cmd:
+        pytesseract.pytesseract.tesseract_cmd = _cmd
+
+    # 语言：默认中英文都试；含中文用 chi_sim+eng，避免只装 eng 时漏中文。
+    _lang = os.environ.get("TESSERACT_LANG", "chi_sim+eng")
+
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception:
+        return ""
+
+    pages_txt = []
+    try:
+        for page in doc:
+            # 渲染为图片：缩放 2 倍提升小字号识别率（dpi≈150）。
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img = pix.tobytes("png")
+            from PIL import Image
+            import io as _io
+            with Image.open(_io.BytesIO(img)) as im:
+                try:
+                    ocr = pytesseract.image_to_string(im, lang=_lang)
+                except Exception:
+                    ocr = ""
+            if ocr and ocr.strip():
+                pages_txt.append(ocr.strip())
+    except Exception:
+        pass
+    finally:
+        doc.close()
+
+    return "\f".join(pages_txt)
 
 
 def _decode_pdf_pdfplumber(raw: bytes) -> str:
