@@ -252,15 +252,37 @@ def run_task(task, dry_run=False, limit=None, force=False):
         except Exception as e:  # noqa: BLE001
             stats["errors"].append("时间范围解析失败: %s" % e)
 
-    # 3) 拉流程列表
+    # 3) 拉流程列表（分页翻完全部，避免只拿首页导致第 N 页之后的单据永久丢失）
     ct_pair = [ct_start, ct_end] if (ct_start or ct_end) else None
+    flows = []
     try:
-        resp = find_flows(
-            form_code_ids=[form_code_id] if form_code_id else None,
-            status=task.get("status") or None,
-            create_time=ct_pair,
-        )
-        flows = (resp or {}).get("list") or [] if isinstance(resp, dict) else (resp or [])
+        page = 1
+        page_size = 50
+        while True:
+            resp = find_flows(
+                form_code_ids=[form_code_id] if form_code_id else None,
+                status=task.get("status") or None,
+                create_time=ct_pair,
+                page_number=page,
+                page_size=page_size,
+            )
+            batch = (resp or {}).get("list") or [] if isinstance(resp, dict) else (resp or [])
+            flows.extend(batch)
+            # 提前退出：本页不足一页（已到末页）
+            if len(batch) < page_size:
+                break
+            # 以服务端返回的 total 为准（有则用它，避免多翻一次空页）
+            total = (resp or {}).get("total") if isinstance(resp, dict) else None
+            try:
+                total = int(total) if total is not None else None
+            except (TypeError, ValueError):  # noqa: BLE001
+                total = None
+            if total is not None and len(flows) >= total:
+                break
+            page += 1
+            if page > 500:  # 安全阀，防接口异常时无限翻页
+                logger.warning("翻页超过 500 页，停止继续翻页（已取 %d 条）", len(flows))
+                break
     except Exception as e:  # noqa: BLE001
         stats["errors"].append("拉取流程列表失败: %s" % e)
         return stats
@@ -290,13 +312,16 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 alive_suffix.add(m.group(1))
 
     # 实际处理上限：取「调试 limit」与「任务配置的 batch_size」较小值。
-    # 二者皆空 → 不限制（处理全部匹配单据）。
+    # batch_size 留空/0/负数 → 视为不限（按计划全部拉取）；
+    # 仅当显式配置了正数时才限制单次处理条数。
     batch_size = task.get("batch_size")
     try:
         if batch_size is not None:
             batch_size = int(batch_size)
     except (TypeError, ValueError):  # noqa: BLE001
         batch_size = None
+    if batch_size is not None and batch_size <= 0:
+        batch_size = None  # 0 / 负数 → 不限
     if batch_size is not None and limit is not None:
         batch_size = min(batch_size, int(limit))
     elif limit is not None:

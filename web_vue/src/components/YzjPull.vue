@@ -72,7 +72,7 @@ function blankTask() {
     target_category: "会议纪要",
     download_attachments: true,
     index_into_kb: true,
-    batch_size: 10,
+    batch_size: 0,
     interval_sec: 3,
     schedule: "daily",
     schedule_hour: 2,
@@ -364,8 +364,8 @@ onUnmounted(stopPoll);
             </div>
             <div class="row">
               <label>每次拉取数量</label>
-              <input class="inp" type="number" min="1" v-model.number="editing.batch_size" />
-              <span class="hint">单次最多处理几条流程（防 IP 被封）</span>
+              <input class="inp" type="number" min="0" v-model.number="editing.batch_size" />
+              <span class="hint">0 或留空 = 不限（拉取全部）；设正整数则单次最多处理该条数</span>
             </div>
             <div class="row">
               <label>拉取间隔(秒)</label>
