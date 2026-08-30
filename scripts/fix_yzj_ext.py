@@ -253,24 +253,28 @@ def main():
             groups.setdefault(h, []).append((u, ap))
 
         dups = {h: v for h, v in groups.items() if len(v) > 1}
-        print("内容相同的重复组: %d 组" % len(dups))
+        print("原则：仅处理「内容 md5 完全相同」的组，每组保留 1 份、删除其余较晚的。")
+        print("      文件名不同但 md5 相同的，是同一份文件被重复拉取，属冗余；")
+        print("      文件名带 YYYYMMDD_ 前缀但 md5 各不相同的，是不同日期的真实文档，不受影响。")
+        print("\n内容相同的重复组: %d 组" % len(dups))
 
         to_remove = []
         for h, items in dups.items():
-            # 排序打分：优先保留「text 非空」「文件名不带日期前缀」「创建更早」的那份
+            # 排序打分：同一 md5 组内保留 1 份、删除其余。
+            # 判据只用「创建时间」与「text 是否非空」，**不使用文件名前缀**：
+            # 带 YYYYMMDD_ 前缀的文件可能是「重名但内容不同」的真实文档
+            # （如不同日期的天传所例会，md5 各不相同，本就不会进入本流程），
+            # 用前缀当判据会误导；同组内 md5 已相同，删较晚那份最稳妥。
             def score(it):
                 u, _ap = it
                 has_text = 1 if (u.get("text") or "").strip() else 0
-                fn = u.get("filename") or ""
-                # 带日期前缀（如 20260731_）的说明是重名时产生的次选，优先级低
-                import re as _re
-                has_prefix = 1 if _re.match(r"^\d{8}_", fn) else 0
                 created = u.get("created_at") or ""
-                return (-has_text, has_prefix, created)
+                return (-has_text, created)
 
             items_sorted = sorted(items, key=score)
             keep, drop = items_sorted[0], items_sorted[1:]
-            print("\n  保留: %s" % keep[0].get("filename"))
+            print("\n  [md5=%s] 共 %d 份（内容完全相同）" % (h[:10], len(items)))
+            print("  保留: %s" % keep[0].get("filename"))
             print("        text=%d字 created=%s" % (
                 len(keep[0].get("text") or ""), keep[0].get("created_at")))
             for u, ap in drop:
