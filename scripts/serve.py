@@ -1828,8 +1828,11 @@ def yzj_pulled_docs():
         page_size = int(request.args.get("page_size", 100))
     except ValueError:
         page, page_size = 1, 100
+    # 读取搜索关键词：前端 UploadManage 的「云之家拉取」标签页会传 q，
+    # 旧实现把查询词写死为 ""，导致该标签下搜索框完全失效（只返回全量列表）。
+    q = (request.args.get("q") or "").strip()
     try:
-        res = kb_store.list_uploads("", page, page_size, source_filter="yunzhijia")
+        res = kb_store.list_uploads(q, page, page_size, source_filter="yunzhijia")
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
     return jsonify(res)
