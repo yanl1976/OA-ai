@@ -272,6 +272,39 @@ def _collect_attachment_files(form_data):
     return files
 
 
+def _doc_date_prefix(form_data, flow=None):
+    """取单据业务日期，生成「YYYYMMDD_」文件名前缀。
+
+    背景：云之家同类单据的附件名常完全相同（实测「天传所集团生产经营工作
+    例会会议纪要」一份模板下 15 份附件同名），落盘后重名难以区分。
+    故用单据日期做前缀。优先级：
+      1) Da_0  —— 业务/会议日期（语义最准，每条例会各不相同）
+      2) _S_DATE / flow.createTime —— 单据提交时间
+    取不到时返回空串（不强制加前缀）。
+    """
+    ts = None
+    wm = form_data if isinstance(form_data, dict) else {}
+    for code in ("Da_0", "_S_DATE"):
+        v = (wm.get(code) or {}).get("value")
+        if isinstance(v, (int, float)) and v > 0:
+            ts = v
+            break
+    if ts is None and isinstance(flow, dict):
+        for key in ("createTime", "finishTime", "submitTime"):
+            v = flow.get(key)
+            if isinstance(v, (int, float)) and v > 0:
+                ts = v
+                break
+    if not ts:
+        return ""
+    try:
+        if ts > 1e12:  # 毫秒
+            ts = ts / 1000.0
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d") + "_"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # ---------------- 单次任务执行 ----------------
 def _safe_filename(name):
     """把云之家返回的文件名清洗为可用作落盘的文件名（移除路径分隔与非法字符）。"""
@@ -602,6 +635,11 @@ def run_task(task, dry_run=False, limit=None, force=False):
                     uniq = base + ".ofd"
                 else:  # origin：沿用原文件扩展名，拿不到则按 .docx 兜底
                     uniq = base + (decl_ext.lower() if decl_ext else ".docx")
+                # 加「单据日期_」前缀：同类单据附件名常完全相同（实测同一模板下
+                # 15 份「天传所集团生产经营工作例会会议纪要」重名），加日期后可区分。
+                _prefix = _doc_date_prefix(form_data, fl)
+                if _prefix and not base.startswith(_prefix):
+                    uniq = _prefix + uniq
                 # 自动归类（按文件名/标题关键词匹配分类树，校验存在，否则兜底 target_category）
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
