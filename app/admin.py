@@ -786,15 +786,45 @@ def create_category(name: str, description: str = "", sort_order: int = 0,
         conn.close()
 
 
+def _cascade_rename_category_docs(old_name: str, new_name: str):
+    """分类改名级联：把 user_documents.json 中 category==old_name 的文档统一改为 new_name。
+
+    通过 kb_store.reclassify_upload 处理，保证逻辑分类与物理存储目录一并迁移，
+    不产生孤儿文档。kb_store 反向依赖本模块，故此处惰性导入以避免循环依赖。
+    """
+    try:
+        from kb_store import reclassify_upload
+    except Exception:  # noqa: BLE001
+        return
+    import json as _json
+    from kb_store import _load_uploads, _STORE_LOCK, _save_uploads  # noqa: F401
+    # 先收集受影响的 doc_id，再逐个 reclassify（reclassify 内部会加锁并落盘）
+    affected = []
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        for u in ups:
+            if isinstance(u, dict) and u.get("category") == old_name:
+                affected.append(u.get("doc_id"))
+    for doc_id in affected:
+        try:
+            reclassify_upload(doc_id, new_name)
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def update_category(cat_id: int, name: str = None, description: str = None,
                     sort_order: int = None, status: int = None, parent_id: object = None):
     conn = _conn()
     try:
         cur = conn.cursor()
+        old_name = None
         if name is not None:
             # 同级（同 parent_id）范围内查重，排除自身
-            row = conn.execute("SELECT parent_id FROM categories WHERE id=?", (cat_id,)).fetchone()
+            row = conn.execute("SELECT parent_id, name FROM categories WHERE id=?", (cat_id,)).fetchone()
             ppid = row["parent_id"] if row else None
+            old_name = row["name"] if row else None
             dup = conn.execute(
                 "SELECT 1 FROM categories WHERE name=? AND id<>? AND (parent_id IS ? OR parent_id = ?)",
                 (name, cat_id, ppid, ppid)).fetchone()
@@ -814,6 +844,10 @@ def update_category(cat_id: int, name: str = None, description: str = None,
                 raise ValueError("不能将分类设为自身的上级")
             cur.execute("UPDATE categories SET parent_id=? WHERE id=?", (parent_id, cat_id))
         conn.commit()
+        # 级联：分类改名后，把散落在旧名称下的孤儿文档一并归到新名称，
+        # 避免「分类树已改名、文档 category 仍是旧名」造成的挂空/断链。
+        if name is not None and old_name is not None and name != old_name:
+            _cascade_rename_category_docs(old_name, name)
     except sqlite3.IntegrityError:
         conn.rollback()
         raise ValueError("分类名称在该分类下已存在")
