@@ -241,70 +241,130 @@ onMounted(load);
       <span v-for="j in jobs" :key="j.id" class="job">{{ j.id }} → {{ j.next_run }}</span>
     </div>
 
-    <!-- 编辑器 -->
-    <Modal :show="showEditor" :title="(tasks.some(x=>x.id===editing?.id)?'编辑':'新建')+'拉取任务'" @close="showEditor=false">
-      <div v-if="editing" class="form">
-        <div class="row"><label>任务名</label><input class="inp" v-model="editing.name" placeholder="如：会议纪要" /></div>
-        <div class="row">
-          <label>云之家模板</label>
-          <select class="inp" v-model="editing.template_name">
-            <option value="">-- 手动填写模板名 --</option>
-            <option v-for="tp in templates" :key="tp.formCodeId" :value="tp.name">{{ tp.name }}（{{ tp.typeName }}）</option>
-          </select>
-        </div>
-        <div class="row"><label>或模板ID</label><input class="inp" v-model="editing.form_code_id" placeholder="留空则按模板名匹配" /></div>
-        <div class="row">
-          <label>拉取状态</label>
-          <select class="inp" v-model="editing.status"><option v-for="s in STATUS_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
-        </div>
-        <div class="row">
-          <label>时间范围</label>
-          <select class="inp" v-model="editing.time_range"><option v-for="s in TIME_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
-        </div>
-        <div class="row" v-if="editing.time_range==='recent_days'"><label>近 N 天</label><input class="inp" type="number" v-model.number="editing.recent_days" /></div>
-        <div class="row" v-if="editing.time_range==='custom'">
-          <label>起 / 止</label>
-          <input class="inp" type="date" v-model="editing.start_date" /> ~ <input class="inp" type="date" v-model="editing.end_date" />
-        </div>
-        <div class="row"><label>目标分类</label><input class="inp" v-model="editing.target_category" placeholder="知识库分类名" /></div>
-        <div class="row">
-          <label>下载附件</label>
-          <input type="checkbox" v-model="editing.download_attachments" />
-        </div>
-        <div class="row">
-          <label>入知识库索引</label>
-          <input type="checkbox" v-model="editing.index_into_kb" />
-        </div>
-        <div class="row">
-          <label>每次拉取数量</label>
-          <input class="inp" type="number" min="1" v-model.number="editing.batch_size" />
-          <span class="hint">单次最多处理几条流程（防 IP 被封）</span>
-        </div>
-        <div class="row">
-          <label>拉取间隔(秒)</label>
-          <input class="inp" type="number" min="0" step="0.5" v-model.number="editing.interval_sec" />
-          <span class="hint">每条流程处理完后的等待秒数（限流）</span>
-        </div>
-        <div class="row">
-          <label>计划</label>
-          <select class="inp" v-model="editing.schedule"><option v-for="s in SCHEDULE_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
-        </div>
-        <div class="row" v-if="editing.schedule!=='manual'">
-          <label>执行时间</label>
-          <template v-if="editing.schedule==='weekly'">
-            <select class="inp" v-model.number="editing.schedule_weekday"><option v-for="w in WEEKDAYS" :key="w.v" :value="w.v">{{ w.t }}</option></select>
-          </template>
-          <input class="inp" type="number" min="0" max="23" v-model.number="editing.schedule_hour" /> 时
-          <input class="inp" type="number" min="0" max="59" v-model.number="editing.schedule_minute" /> 分
+    <!-- 编辑器：自包含弹窗（Teleport 到 body，不依赖外部组件） -->
+    <Teleport to="body">
+      <div v-if="showEditor" class="yzj-modal-mask" @click.self="showEditor=false">
+        <div class="yzj-modal">
+          <div class="yzj-modal-head">
+            <span>{{ (tasks.some(x=>x.id===editing?.id) ? '编辑' : '新建') }}拉取任务</span>
+            <button class="yzj-modal-x" @click="showEditor=false">×</button>
+          </div>
+          <div v-if="editing" class="yzj-modal-body form">
+            <div class="row"><label>任务名</label><input class="inp" v-model="editing.name" placeholder="如：会议纪要" /></div>
+            <div class="row">
+              <label>云之家模板</label>
+              <select class="inp" v-model="editing.template_name">
+                <option value="">-- 手动填写模板名 --</option>
+                <option v-for="tp in templates" :key="tp.formCodeId" :value="tp.name">{{ tp.name }}（{{ tp.typeName }}）</option>
+              </select>
+            </div>
+            <div class="row"><label>或模板ID</label><input class="inp" v-model="editing.form_code_id" placeholder="留空则按模板名匹配" /></div>
+            <div class="row">
+              <label>拉取状态</label>
+              <select class="inp" v-model="editing.status"><option v-for="s in STATUS_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
+            </div>
+            <div class="row">
+              <label>时间范围</label>
+              <select class="inp" v-model="editing.time_range"><option v-for="s in TIME_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
+            </div>
+            <div class="row" v-if="editing.time_range==='recent_days'"><label>近 N 天</label><input class="inp" type="number" v-model.number="editing.recent_days" /></div>
+            <div class="row" v-if="editing.time_range==='custom'">
+              <label>起 / 止</label>
+              <input class="inp" type="date" v-model="editing.start_date" /> ~ <input class="inp" type="date" v-model="editing.end_date" />
+            </div>
+            <div class="row"><label>目标分类</label><input class="inp" v-model="editing.target_category" placeholder="知识库分类名" /></div>
+            <div class="row">
+              <label>下载附件</label>
+              <input type="checkbox" v-model="editing.download_attachments" />
+            </div>
+            <div class="row">
+              <label>入知识库索引</label>
+              <input type="checkbox" v-model="editing.index_into_kb" />
+            </div>
+            <div class="row">
+              <label>每次拉取数量</label>
+              <input class="inp" type="number" min="1" v-model.number="editing.batch_size" />
+              <span class="hint">单次最多处理几条流程（防 IP 被封）</span>
+            </div>
+            <div class="row">
+              <label>拉取间隔(秒)</label>
+              <input class="inp" type="number" min="0" step="0.5" v-model.number="editing.interval_sec" />
+              <span class="hint">每条流程处理完后的等待秒数（限流）</span>
+            </div>
+            <div class="row">
+              <label>计划</label>
+              <select class="inp" v-model="editing.schedule"><option v-for="s in SCHEDULE_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
+            </div>
+            <div class="row" v-if="editing.schedule!=='manual'">
+              <label>执行时间</label>
+              <template v-if="editing.schedule==='weekly'">
+                <select class="inp" v-model.number="editing.schedule_weekday"><option v-for="w in WEEKDAYS" :key="w.v" :value="w.v">{{ w.t }}</option></select>
+              </template>
+              <input class="inp" type="number" min="0" max="23" v-model.number="editing.schedule_hour" /> 时
+              <input class="inp" type="number" min="0" max="59" v-model.number="editing.schedule_minute" /> 分
+            </div>
+          </div>
+          <div class="yzj-modal-foot">
+            <button class="btn" :disabled="saving" @click="showEditor=false">关闭</button>
+            <button class="btn primary" :disabled="saving" @click="saveTask">{{ saving ? "保存中…" : "保存" }}</button>
+          </div>
         </div>
       </div>
-      <template #actions>
-        <button class="btn" :disabled="saving" @click="showEditor=false">关闭</button>
-        <button class="btn primary" :disabled="saving" @click="saveTask">{{ saving ? "保存中…" : "保存" }}</button>
-      </template>
-    </Modal>
+    </Teleport>
   </div>
 </template>
+
+<style scoped>
+.yzj-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px 16px;
+  z-index: 1000;
+  overflow: auto;
+}
+.yzj-modal {
+  background: #fff;
+  width: min(680px, 100%);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+}
+.yzj-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid #eee;
+  font-size: 16px;
+  font-weight: 600;
+}
+.yzj-modal-x {
+  border: none;
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #888;
+}
+.yzj-modal-x:hover { color: #333; }
+.yzj-modal-body {
+  padding: 16px 18px;
+  max-height: 64vh;
+  overflow: auto;
+}
+.yzj-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid #eee;
+}
+</style>
 
 <style scoped>
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
