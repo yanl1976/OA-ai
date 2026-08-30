@@ -172,6 +172,21 @@ export const api = {
   // 允许二次生成的分类集合（id+name，后端按 id 规则动态计算，改名自动同步）
   derivedAllowedCategories: () => api.get("/api/derived/allowed-categories"),
 
+  // ============ 云之家审批单据拉取任务 ============
+  yzjTemplates: () => api.get("/api/yzj/templates"),
+  yzjTasks: () => api.get("/api/yzj/tasks"),
+  yzjTaskCreate: (task) => api.post("/api/yzj/tasks", { task }),
+  yzjTaskUpdate: (id, task) => api.put("/api/yzj/tasks/" + id, { task }),
+  yzjTaskDelete: (id) => api.del("/api/yzj/tasks/" + id),
+  yzjTaskRun: (id, opts) => api.post("/api/yzj/run/" + id, opts || {}),
+  yzjPulledDocs: (params) => {
+    const q = new URLSearchParams();
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") q.set(k, v);
+    });
+    return api.get("/api/yzj/pulled-docs?" + q.toString());
+  },
+
   // ============ 对话式智能问答 ============
   chatScope: () => api.get("/api/kb/chat/scope"),
   chatSessions: () => api.get("/api/kb/chat/sessions"),

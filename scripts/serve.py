@@ -1704,7 +1704,93 @@ def adm_feature_set(key):
     return jsonify({"ok": True})
 
 
-@app.route("/api/admin/reindex", methods=["POST"])
+# ===================== 云之家审批单据拉取任务 =====================
+@app.route("/api/yzj/templates")
+@login_required("system.manage")
+def yzj_templates():
+    from yunzhijia_client import get_templates
+    try:
+        tpls = get_templates() or []
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"templates": [{"formCodeId": t.get("formCodeId"),
+                                   "name": t.get("title"),
+                                   "typeName": t.get("category")} for t in tpls]})
+
+
+@app.route("/api/yzj/tasks")
+@login_required("system.manage")
+def yzj_tasks_list():
+    import yzj_pull
+    return jsonify({"tasks": yzj_pull.load_tasks(), "jobs": yzj_pull.list_scheduler_jobs()})
+
+
+@app.route("/api/yzj/tasks", methods=["POST"])
+@login_required("system.manage")
+def yzj_task_create():
+    import yzj_pull
+    body = request.get_json(silent=True) or {}
+    task = body.get("task") or body
+    if not task.get("id"):
+        return jsonify({"error": "任务 id 必填"}), 400
+    yzj_pull.upsert_task(task)
+    return jsonify({"ok": True, "task": task})
+
+
+@app.route("/api/yzj/tasks/<task_id>", methods=["PUT"])
+@login_required("system.manage")
+def yzj_task_update(task_id):
+    import yzj_pull
+    body = request.get_json(silent=True) or {}
+    task = body.get("task") or body
+    task["id"] = task_id
+    yzj_pull.upsert_task(task)
+    return jsonify({"ok": True, "task": task})
+
+
+@app.route("/api/yzj/tasks/<task_id>", methods=["DELETE"])
+@login_required("system.manage")
+def yzj_task_delete(task_id):
+    import yzj_pull
+    yzj_pull.delete_task(task_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/yzj/run/<task_id>", methods=["POST"])
+@login_required("system.manage")
+def yzj_task_run(task_id):
+    import yzj_pull
+    body = request.get_json(silent=True) or {}
+    task = yzj_pull.get_task(task_id)
+    if not task:
+        return jsonify({"error": "任务不存在"}), 404
+    dry = bool(body.get("dry_run"))
+    limit = body.get("limit")
+    force = bool(body.get("force"))
+    try:
+        stats = yzj_pull.run_task(task, dry_run=dry, limit=limit, force=force)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "stats": stats})
+
+
+@app.route("/api/yzj/pulled-docs")
+@login_required("system.manage")
+def yzj_pulled_docs():
+    """云之家已拉取文档清单（source=yunzhijia），供拉取设置页直接展示本次/历史拉取结果。"""
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 100))
+    except ValueError:
+        page, page_size = 1, 100
+    try:
+        res = kb_store.list_uploads("", page, page_size, source_filter="yunzhijia")
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    return jsonify(res)
+
+
+
 @login_required("system.manage")
 def adm_reindex():
     try:
@@ -2469,6 +2555,13 @@ if __name__ == "__main__":
         print("[警告] 上传文件归类迁移失败（不影响服务启动）:", e)
     # 后台预热语义向量模型，避免首次检索冷启动卡顿（非阻塞）
     _warmup_vector_index()
+    # 启动云之家审批单据拉取定时调度器（注册已启用且有 cron 计划的任务）
+    try:
+        import yzj_pull
+        yzj_pull.start_scheduler()
+        print("[信息] 云之家拉取调度器已启动")
+    except Exception as e:  # noqa: BLE001
+        print("[警告] 云之家拉取调度器启动失败（手动触发仍可用）:", e)
     host = os.environ.get("KB_API_HOST", "0.0.0.0")
     port = int(os.environ.get("KB_API_PORT", "8080"))
     print(f"知识库管理服务启动: http://{host}:{port}/  (KB_ROOT={KB_ROOT})")

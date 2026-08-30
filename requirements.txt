@@ -7,3 +7,6 @@ flask==3.0.3
 gunicorn==22.0.0
 # 语义向量（BGE 中文嵌入，替代旧 feature-hashing）：离线可用，加载失败时自动回退哈希方案
 sentence-transformers==6.0.0
+# 云之家拉取后台定时调度（可选增强）：未安装时自动降级为手动触发 + CLI(cron) 调用，
+# 无需强制依赖；装上后 serve.py 启动时自动注册 cron 计划任务。
+APScheduler==3.10.4

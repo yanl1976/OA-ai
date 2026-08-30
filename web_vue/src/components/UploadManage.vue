@@ -94,8 +94,15 @@ async function loadCats() {
 async function load() {
   loading.value = true;
   try {
-    const r = await api.uploads({ q: q.value, page: page.value, page_size: pageSize,
-      source: activeTab.value });
+    let r;
+    if (activeTab.value === "yunzhijia") {
+      // 云之家拉取标签走专用接口（权限 system.manage，与上传管理模块一致），
+      // 避免 /api/kb/uploads 的 kb.upload.manage 权限拦截导致列表为空。
+      r = await api.yzjPulledDocs({ q: q.value, page: page.value, page_size: pageSize });
+    } else {
+      r = await api.uploads({ q: q.value, page: page.value, page_size: pageSize,
+        source: activeTab.value });
+    }
     items.value = r.items || [];
     total.value = r.total || 0;
   } catch (e) {

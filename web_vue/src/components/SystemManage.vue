@@ -9,6 +9,7 @@ import UserManage from "./UserManage.vue";
 import RoleManage from "./RoleManage.vue";
 import PermissionView from "./PermissionView.vue";
 import AuditLog from "./AuditLog.vue";
+import YzjPull from "./YzjPull.vue";
 
 const notify = inject("notify");
 const user = inject("user");
@@ -24,6 +25,7 @@ const subViews = {
   RoleManage,
   PermissionView,
   AuditLog,
+  YzjPull,
 };
 const adminCards = [
   { key: "CategoryManage", icon: "🗂", title: "分类管理", desc: "管理知识库分类与层级", perm: "kb.category.manage" },
@@ -33,6 +35,7 @@ const adminCards = [
   { key: "RoleManage", icon: "🎭", title: "角色管理", desc: "管理角色与权限分配", perm: "role.manage" },
   { key: "PermissionView", icon: "🔐", title: "权限目录", desc: "查看系统内置权限项", perm: "permission.view" },
   { key: "AuditLog", icon: "📜", title: "操作日志", desc: "查看系统操作审计记录", perm: "system.manage" },
+  { key: "YzjPull", icon: "☁", title: "云之家数据拉取", desc: "配置与管理云之家审批单据拉取计划", perm: "system.manage" },
 ];
 const visibleAdminCards = computed(() => {
   const perms = (user && user.value && user.value.permissions) || [];

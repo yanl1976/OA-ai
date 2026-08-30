@@ -33,6 +33,9 @@ config/.env.*
 **/.env
 !.env.example
 !config/.env.example
+# 云之家拉取任务配置与去重记录（运行时生成，含本地拉取状态，不入库）
+config/yzj_pull_tasks.json
+config/.yzj_pull_synced.json
 
 # 索引重建前的本地备份（_backup_index_<时间戳>/）。
 # 曾误入库：生产部署时不上传该目录，git 便认为文件被删除（D），
