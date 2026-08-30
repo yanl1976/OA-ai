@@ -1782,6 +1782,15 @@ def yzj_task_run(task_id):
             if p:
                 p["running"] = False
                 p.setdefault("stats", {})["errors"] = p["stats"].get("errors", []) + ["%s" % e]
+        finally:
+            # 兜底：异常退出时把已处理部分的去重记录落盘，避免下次重复拉取
+            try:
+                yzj_pull.flush_task_synced(task_id)
+            except Exception:  # noqa: BLE001
+                pass
+            p = yzj_pull.get_progress(task_id)
+            if p:
+                p["running"] = False
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     return jsonify({"ok": True, "task_id": task_id, "started": True})

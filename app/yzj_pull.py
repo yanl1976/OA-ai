@@ -46,6 +46,25 @@ def reset_progress(task_id):
     _ABORT.pop(task_id, None)
 
 
+def flush_task_synced(task_id):
+    """兜底保存去重记录。
+
+    run_task 正常情况下每条处理完都会增量保存；但若因未预料的异常提前退出，
+    调用方（调度器 / 接口层）应在 finally 中调用本函数，把已处理部分的
+    去重记录落盘，避免「文档已入库但去重丢失」造成下次重复拉取。
+    """
+    p = _PROGRESS.get(task_id)
+    d = (p or {}).get("_synced")
+    if not isinstance(d, dict) or not d:
+        return False
+    try:
+        _save_synced(d)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("兜底保存去重记录失败: %s", e)
+        return False
+
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
@@ -148,8 +167,30 @@ def _load_synced():
 
 
 def _save_synced(d):
-    with open(SYNCED_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+    """原子写入去重记录。
+
+    先写临时文件再 os.replace 覆盖：拉取任务可能长时间运行，若直接写目标文件，
+    进程在写一半时被中断会留下截断/损坏的 JSON，导致下次启动 `json.load` 失败、
+    去重记录被整体丢弃（进而全量重复拉取）。原子替换可保证目标文件始终完整。
+    """
+    tmp = SYNCED_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SYNCED_FILE)
+    except Exception:  # noqa: BLE001
+        # 兜底：原子写失败时退回直接写，尽量不丢进度
+        try:
+            with open(SYNCED_FILE, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("保存去重记录失败: %s", e)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------- 附件控件识别（通用，不写死 Od_0） ----------------
@@ -370,6 +411,10 @@ def run_task(task, dry_run=False, limit=None, force=False):
         _PROGRESS[task_id]["total"] = len(flows)
         _PROGRESS[task_id]["stats"] = stats
     synced = _load_synced()
+    # 把 synced 引用挂到运行态：若 run_task 因未预料异常提前退出，
+    # 调用方可通过 flush_task_synced(task_id) 兜底保存，避免整轮进度丢失。
+    if task_id in _PROGRESS:
+        _PROGRESS[task_id]["_synced"] = synced
     cat = task.get("target_category") or "会议纪要"
 
     # 存活索引：用于「手动删除拉取文件后再次拉取能重新拉回」的判断。
@@ -412,12 +457,31 @@ def run_task(task, dry_run=False, limit=None, force=False):
     if interval_sec < 0:
         interval_sec = 0
 
+    # 整轮运行时长上限（秒）：兜底防「卡住无进展」。
+    # 单个网络请求本身有超时（view_form_inst 15s / download_file 60s），
+    # 但异常组合下仍可能拖很久；超过上限则保存已处理进度后有序退出，
+    # 配合增量保存的 synced，下次重跑会接着拉，不会重复已完成的单据。
+    max_runtime_sec = task.get("max_runtime_sec", 3600)
+    try:
+        max_runtime_sec = float(max_runtime_sec)
+    except (TypeError, ValueError):  # noqa: BLE001
+        max_runtime_sec = 3600
+    if max_runtime_sec <= 0:
+        max_runtime_sec = 3600
+    _t_start = time.time()
+
     processed = 0
     for idx, fl in enumerate(flows):
         # 中止检查：前端请求终止时，本轮之后立即退出（已下载的保留，未处理的跳过）
         if _ABORT.get(task_id):
             logger.info("任务 %s 被用户中止，已处理 %d/%d", task_id, processed, len(flows))
             stats["aborted"] = True
+            break
+        # 运行时长上限：超时则有序退出（进度已增量保存，下次续拉）
+        if time.time() - _t_start > max_runtime_sec:
+            logger.warning("任务 %s 达到运行时长上限 %ss，已处理 %d/%d 后退出（下次续拉）",
+                           task_id, max_runtime_sec, processed, len(flows))
+            stats["timeout"] = True
             break
         if batch_size is not None and processed >= batch_size:
             break
@@ -575,6 +639,15 @@ def run_task(task, dry_run=False, limit=None, force=False):
             _PROGRESS[task_id]["processed"] = processed
             _PROGRESS[task_id]["stats"] = stats
 
+        # 增量持久化：每处理完一条就落盘去重记录。
+        # 旧实现只在整轮结束后保存一次，导致任务中途中断（网络/重启/超时）时
+        # 「文档已入库但去重记录丢失」，下次重跑会重复拉取、且总停在同一位置。
+        # 每条保存后即可断点续传，中断也不丢进度。
+        try:
+            _save_synced(synced)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("增量保存去重记录失败: %s", e)
+
         # 限流：每条流程处理完后间隔 interval_sec 秒，防止请求过密被封 IP
         if interval_sec > 0 and not (batch_size is not None and processed >= batch_size):
             time.sleep(interval_sec)
@@ -628,10 +701,14 @@ def start_scheduler():
 
 
 def _safe_run(task):
+    tid = task.get("id")
     try:
         run_task(task)
     except Exception as e:  # noqa: BLE001
         logger.warning("云之家拉取任务 %s 执行异常: %s", task.get("name"), e)
+    finally:
+        # 兜底：异常退出时也要把已处理部分的去重记录落盘（增量保存之外的保险）
+        flush_task_synced(tid)
 
 
 def shutdown_scheduler():
