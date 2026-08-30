@@ -273,11 +273,15 @@ def _do_extract_task(task):
         return None
 
     _fn_cat = _minutes_by_filename(filename)
-    if _fn_cat:
+    # 【精准落盘·手动优先】用户手动选的分类直接采用，后台不做任何校验/自纠/归一；
+    # 仅当用户未手动选分类（cat_hint 为空）时，才按文件名/正文自动识别落类。
+    if cat_hint:
+        cat = cat_hint          # 手动选什么就落什么（含「周工作例会会议纪要」等任何子类）
+    elif _fn_cat:
+        # 未手动选 + 文件名命中强信号（如专有纪要文件名）→ 用文件名自纠
         cat = _fn_cat
-    elif cat_hint:
-        cat = cat_hint
     else:
+        # 完全自动：init_cat 优先，否则正文嗅探
         # 先快速解码一次正文仅用于分类嗅探（轻量，不联网）；落盘分类 init_cat
         # 若已是有效标准/纪要/合规类，直接复用，无需重新嗅探。
         _ext0 = os.path.splitext(filename)[1].lower()
@@ -829,12 +833,8 @@ def kb_upload():
     # 直接回退为按文件名+正文自动识别分类。
     if req_cat and _re.match(r"^\d{4}年度$", req_cat):
         req_cat = ""
-    # confirm_category=1：用户已在前端确认「仍按所选分类上传」，此时不再拦截。
-    # 这样既保证冲突在源头暴露给用户，又允许用户在知情后自主决定。
-    confirm_override = request.form.get("confirm_category") in ("1", "true", "yes")
 
     results = []
-    conflicts = []
     for file in files:
         fname = file.filename or "未命名文档.txt"
         ext = os.path.splitext(fname)[1].lower()
@@ -843,26 +843,16 @@ def kb_upload():
                             "error": "不支持的文件格式: %s（支持 txt/md/csv/docx/xlsx/pptx/pdf）" % ext})
             continue
         raw = file.read()
-        # 分类：用户显式选择优先（作为后台 hint，不重分）；否则留空，后台按正文自动识别
+        # 分类：用户显式选择优先（作为后台 hint，不重分、不校验、不改写）；
+        # 否则留空，后台按正文自动识别。
         if req_cat:
             cat = req_cat
             cat_explicit = True
         else:
             cat = "未分类"        # 暂占位，后台用正文重分类
             cat_explicit = False
-        # 【上传校验·源头拦截】所选分类与文件实际类型冲突时，不落盘、不纠正，
-        # 直接返回冲突详情，由前端请用户确认后重新提交（confirm_category=1 表示
-        # 用户已确认仍按原分类上传）。这样把问题拦在源头，避免后端默默改写分类。
-        if cat_explicit:
-            suggested, warn_msg = _check_category_consistency(fname, cat, raw)
-            if suggested and not confirm_override:
-                conflicts.append({
-                    "filename": fname,
-                    "chosen_category": cat,
-                    "suggested_category": suggested,
-                    "warning": warn_msg,
-                })
-                continue  # 该文件不落盘，等待用户确认
+        # 【说明】后台不再做分类与内容的冲突校验 / 文件名自纠——用户在前端提交时
+        # 已由确认框明确看到「文件类型 + 所选分类」，手动选什么就落什么（精准落盘）。
         # 仅落盘原始二进制 + 占位 entry（极快），文本提取与索引重建交给后台线程，
         # 上传接口立即返回，避免大文件 / 全量索引重建阻塞前端。
         try:
@@ -880,16 +870,8 @@ def kb_upload():
                         "category": cat if cat_explicit else "(识别中)",
                         "warn": "已保存，后台识别中"})
 
-    # 【源头拦截】存在分类冲突：本次不落盘这些文件，返回 409 + 冲突清单，
-    # 由前端弹窗请用户确认（改用建议分类 / 仍按原分类上传 / 取消）。
-    if conflicts:
-        return jsonify({
-            "ok": False,
-            "error": "分类与文件内容不符，请确认后再上传",
-            "conflicts": conflicts,
-            "results": results,     # 本次已成功上传的无冲突文件（可能为空）
-        }), 409
-
+    # 【说明】不再做分类冲突拦截：用户在前端提交确认框已确认「文件类型+所选分类」，
+    # 手动选什么就落什么，后台不重写、不 409。仅按处理结果返回成功/失败。
     ok_count = sum(1 for r in results if r.get("ok"))
     if ok_count == 0:
         return jsonify({"ok": False, "results": results,
@@ -1252,6 +1234,53 @@ def kb_upload_delete_batch():
         return jsonify({"error": "doc_ids 必须为非空数组"}), 400
     result = kb_store.soft_delete_uploads_batch(doc_ids)
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/kb/uploads/batch/reclassify", methods=["POST"])
+@login_required("kb.upload.manage")
+def kb_upload_reclassify_batch():
+    """上传文件管理：批量调整归类，并自动对受影响文档触发后台识别提取+重建索引。
+
+    请求体 {"doc_ids": [...], "category": "目标分类"}。
+    对每个文档：① 改 metadata 归类；② 复位识别状态；③ 入队后台重提取（与「内容提取」
+    同一路径），使分类改动后立即按新分类重新提取文本、重建可检索索引。接口不阻塞。
+    """
+    data = request.get_json(silent=True) or {}
+    doc_ids = data.get("doc_ids")
+    category = (data.get("category") or "").strip()
+    if not isinstance(doc_ids, list) or not doc_ids:
+        return jsonify({"error": "doc_ids 必须为非空数组"}), 400
+    if not category:
+        return jsonify({"error": "分类不能为空"}), 400
+    try:
+        ups = kb_store._load_uploads()
+        done, failed = [], []
+        for doc_id in doc_ids:
+            target = next((u for u in ups if u.get("doc_id") == doc_id and not u.get("deleted")), None)
+            if not target:
+                failed.append(doc_id)
+                continue
+            if not kb_store.reclassify_upload(doc_id, category):
+                failed.append(doc_id)
+                continue
+            # 复位识别状态并触发后台重提取（分类改动 → 配套识别提取自动执行）
+            kb_store.mark_extracting([doc_id])
+            _EXTRACT_Q.put({
+                "filename": target.get("filename", doc_id),
+                "category": category,
+                "doc_id": doc_id,
+                "cat_hint": category,
+            })
+            done.append(doc_id)
+        return jsonify({
+            "ok": True,
+            "done": done,
+            "failed": failed,
+            "category": category,
+            "note": "已批量调整归类 %d 个，并自动提交后台识别提取+索引重建" % len(done),
+        })
+    except Exception as e:
+        return jsonify({"error": "批量调整归类失败: %s" % e}), 500
 
 
 # ===================== 回收站 =====================
@@ -1735,20 +1764,30 @@ _DEFAULT_SYSTEM_NAME = "OA-AI 知识库"
 _GIT_COMMITS_CACHE = {"value": None}
 
 
-def _read_system_name():
+def _read_system_settings():
     try:
         with open(_SYSTEM_SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        name = (data.get("system_name") or "").strip()
-        return name or _DEFAULT_SYSTEM_NAME
     except Exception:  # noqa: BLE001
-        return _DEFAULT_SYSTEM_NAME
+        data = {}
+    name = (data.get("system_name") or "").strip()
+    return {
+        "system_name": name or _DEFAULT_SYSTEM_NAME,
+        "copyright": (data.get("copyright") or "").strip(),
+    }
 
 
-def _write_system_name(name):
+def _read_system_name():
+    return _read_system_settings()["system_name"]
+
+
+def _write_system_settings(name, copyright=""):
     os.makedirs(os.path.dirname(_SYSTEM_SETTINGS_FILE), exist_ok=True)
     with open(_SYSTEM_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"system_name": name}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"system_name": name, "copyright": copyright or ""},
+            f, ensure_ascii=False, indent=2,
+        )
 
 
 def _git_commits():
@@ -1774,9 +1813,11 @@ def _compute_version(commits):
 @app.route("/api/system/info")
 @login_required()
 def sys_info():
+    settings = _read_system_settings()
     commits = _git_commits()
     return jsonify({
-        "system_name": _read_system_name(),
+        "system_name": settings["system_name"],
+        "copyright": settings["copyright"],
         "version": _compute_version(commits),
         "commits": commits,
     })
@@ -1791,8 +1832,15 @@ def sys_info_set():
         return jsonify({"error": "系统名称不能为空"}), 400
     if len(name) > 60:
         return jsonify({"error": "系统名称过长（≤60字符）"}), 400
-    _write_system_name(name)
-    return jsonify({"system_name": name, "version": _compute_version(_git_commits())})
+    copyright = (data.get("copyright") or "").strip()
+    if len(copyright) > 200:
+        return jsonify({"error": "版权信息过长（≤200字符）"}), 400
+    _write_system_settings(name, copyright)
+    return jsonify({
+        "system_name": name,
+        "copyright": copyright,
+        "version": _compute_version(_git_commits()),
+    })
 
 
 # ===================== 会议纪要二次生成 API =====================

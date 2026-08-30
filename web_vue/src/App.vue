@@ -29,6 +29,8 @@ let toastTimer = null;
 
 // 系统名称：与系统设置中的「系统名称」卡片同步（来自 /api/system/info）
 const systemName = ref("OA-AI 知识库");
+const copyright = ref("");
+const version = ref("");
 function setSystemName(name) {
   if (name) systemName.value = name;
 }
@@ -88,6 +90,8 @@ provide("openDerivedForDoc", openDerivedForDoc);
 provide("pendingDerivedSourceId", pendingDerivedSourceId);
 provide("systemName", systemName);
 provide("setSystemName", setSystemName);
+provide("copyright", copyright);
+provide("version", version);
 provide("watermarkOn", watermarkOn);
 provide("watermarkText", watermarkText);
 provide("setWatermark", setWatermark);
@@ -164,10 +168,14 @@ onMounted(async () => {
   } catch (e) {
     /* 未登录 */
   }
-  // 加载系统名称（与系统设置同步）
+  // 加载系统名称 / 版权 / 版本（与系统设置同步）
   try {
     const si = await api.systemInfo();
-    if (si && si.system_name) systemName.value = si.system_name;
+    if (si) {
+      if (si.system_name) systemName.value = si.system_name;
+      copyright.value = si.copyright || "";
+      version.value = si.version || "";
+    }
   } catch (e) {
     /* 取不到则用默认 */
   }
@@ -210,7 +218,7 @@ const views = {
   <Login v-else-if="!user" @ok="(u) => (user = u)" />
 
   <div v-else class="app-shell">
-    <div class="topbar">
+    <div class="topbar sky">
       <div class="brand">{{ systemName }}</div>
       <div class="user">
         <span>👤 {{ user.display_name || user.username }}</span>
@@ -244,6 +252,14 @@ const views = {
         <component v-else :is="views[current]" :docId="detailDocId" />
       </div>
     </div>
+
+    <!-- 底部状态栏：TEDRI logo 蓝（稍浅于顶部通栏），居中显示版权与版本 -->
+    <footer class="statusbar statusbar-sky">
+      <span v-if="copyright" class="sb-copy">{{ copyright }}</span>
+      <span v-if="copyright && version" class="sb-sep">·</span>
+      <span v-if="version" class="sb-ver">版本 v{{ version }}</span>
+      <span v-if="!copyright && !version" class="muted">OA-AI 知识库</span>
+    </footer>
 
     <div v-if="toast.show" class="toast" :class="toast.type">{{ toast.msg }}</div>
 

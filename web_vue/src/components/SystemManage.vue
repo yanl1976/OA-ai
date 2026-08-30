@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, inject, computed } from "vue";
+import { ref, onMounted, inject, computed, watch } from "vue";
 import { api } from "../api.js";
 import Modal from "./Modal.vue";
 import CategoryManage from "./CategoryManage.vue";
@@ -53,9 +53,14 @@ const features = ref([]);
 const stats = ref(null);
 const health = ref(null);
 const vecStats = ref(null);
-const sysInfo = ref({ system_name: "", version: "", commits: 0 });
-const setSystemName = inject("setSystemName");
-const sysNameGlobal = inject("systemName");
+const sysInfo = ref({ system_name: "", version: "", commits: 0, copyright: "" });
+// 注入 App.vue 提供的响应式状态（均为 ref）与 setter 函数。
+// 注意：App.vue 仅 provide 了 systemName/copyright/version 三个 ref 与 setSystemName 函数，
+// 并未提供 setCopyright/setVersion，故同步时需直接对 ref.value 赋值（不要当作函数调用）。
+const setSystemName = inject("setSystemName"); // 函数
+const sysNameGlobal = inject("systemName");    // ref
+const setCopyright = inject("copyright");       // ref（非函数）
+const setVersion = inject("version");           // ref（非函数）
 
 // 页面水印开关（与全局 App.vue 提供的 watermarkOn 同步）
 const watermarkOn = inject("watermarkOn");
@@ -213,26 +218,63 @@ async function initAbort() {
 
 // ============ 系统名称设定 ============
 const nameDraft = ref("");
+const copyDraft = ref("");
 const nameBusy = ref(false);
 
 async function saveSystemName() {
   const name = nameDraft.value.trim();
-  if (!name) { notify("系统名称不能为空", "err"); return; }
+  const copy = copyDraft.value.trim();
+  // 本地兜底校验：后端对 system_name(≤60)/copyright(≤200) 有长度限制，
+  // 先给出清晰的本地报错，避免把超长内容打到后端才含糊报错。
+  if (!name) { notify("保存失败：系统名称不能为空", "err"); return; }
+  if ([...name].length > 60) {
+    notify(`保存失败：系统名称过长（${[...name].length}/60 个字符）`, "err");
+    return;
+  }
+  if ([...copy].length > 200) {
+    notify(`保存失败：版权信息过长（${[...copy].length}/200 个字符）`, "err");
+    return;
+  }
   nameBusy.value = true;
   try {
-    const r = await api.setSystemName(name);
+    const r = await api.setSystemName(name, copy);
     sysInfo.value.system_name = r.system_name;
-    // 同步更新首页左上角的全局系统名称
+    sysInfo.value.copyright = r.copyright || "";
+    // 同步更新首页左上角品牌名 + 底部状态栏版权/版本。
+    // setSystemName 是函数；sysNameGlobal/setCopyright/setVersion 为 ref，须赋值 .value。
     if (setSystemName) setSystemName(r.system_name);
     if (sysNameGlobal) sysNameGlobal.value = r.system_name;
-    notify("系统名称已更新", "ok");
+    if (setCopyright) setCopyright.value = r.copyright || "";
+    if (setVersion) setVersion.value = r.version || "";
+    notify("系统设置已更新", "ok");
     activeCard.value = null;
   } catch (e) {
-    notify(e.message, "err");
+    // 依据后端返回状态码给出分类明确、带定位的错误提示
+    if (e.status === 403) {
+      notify("保存失败：当前账号无「系统设置」权限（system.manage）", "err");
+    } else if (e.status === 400) {
+      // 后端已区分「系统名称」「版权」字段，直接透传具体信息
+      notify("保存失败：" + (e.message || "请求参数不合法"), "err");
+    } else if (e.status === 409) {
+      notify("保存失败：" + (e.message || "数据冲突，请刷新后重试"), "err");
+    } else if (e.status && e.status >= 500) {
+      notify("保存失败：服务端异常，请检查后端日志或稍后重试", "err");
+    } else {
+      notify("保存失败：" + (e.message || "网络错误，请重试"), "err");
+    }
+    console.error("[saveSystemName] 保存系统名称/版权失败:", e);
   } finally {
     nameBusy.value = false;
   }
 }
+
+// 打开「系统名称」卡片时，回填草稿（避免焦点触发才显示当前值）
+watch(activeCard, (k) => {
+  if (k === "sysname") {
+    nameDraft.value = sysInfo.value.system_name || "";
+    copyDraft.value = sysInfo.value.copyright || "";
+  }
+});
 
 const cards = computed(() => {
   // 系统维护卡片：顺序即展示顺序（管理员额外在末尾追加高危的「系统初始化」）
@@ -446,6 +488,10 @@ onMounted(load);
         <span>系统名称</span>
         <b v-if="!isAdmin" class="mono">{{ sysInfo.system_name || "—" }}</b>
       </div>
+      <div class="info-row" v-if="!isAdmin">
+        <span>版权信息</span>
+        <b class="mono">{{ sysInfo.copyright || "—" }}</b>
+      </div>
     </div>
     <div v-if="isAdmin" class="form-row">
       <label>系统名称</label>
@@ -454,10 +500,18 @@ onMounted(load);
         class="inp"
         maxlength="60"
         placeholder="请输入系统名称"
-        @focus="nameDraft === '' ? (nameDraft = sysInfo.system_name) : null"
       />
     </div>
-    <p v-if="!isAdmin" class="muted">仅管理员可修改系统名称。</p>
+    <div v-if="isAdmin" class="form-row">
+      <label>版权信息</label>
+      <input
+        v-model="copyDraft"
+        class="inp"
+        maxlength="200"
+        placeholder="如：© 2026 泰瑞德公司 版权所有"
+      />
+    </div>
+    <p v-if="!isAdmin" class="muted">仅管理员可修改系统名称与版权信息。</p>
     <div class="info-rows" style="margin-top: 12px">
       <div class="info-row"><span>版本号</span><b class="mono">v{{ sysInfo.version || "—" }}</b></div>
       <div class="info-row"><span>Git 提交次数</span><b class="mono">{{ sysInfo.commits ?? "—" }}</b></div>

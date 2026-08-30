@@ -105,6 +105,30 @@ a { color: var(--primary); text-decoration: none; }
 .topbar .brand { font-weight: 700; font-size: 16px; }
 .topbar .user { display: flex; align-items: center; gap: 12px; font-size: 13px; }
 .body { flex: 1; display: flex; min-height: 0; }
+
+/* TEDRI logo 主色通栏（顶部系统名称栏 + 底部状态栏）
+   主色取自 公司LOGO.aca4433dd3.jpg 像素采样：#304dcd（TEDRI 蓝，21541 像素） */
+.sky {
+  background: #304dcd !important;            /* TEDRI 主蓝 */
+  border-color: #243aa0 !important;         /* 主蓝深一档（active/hover 边） */
+  color: #ffffff;
+}
+.sky .brand { color: #ffffff; }
+.sky .user { color: #ffffff; }
+.sky .user .muted { color: #dbe4ff; }
+.sky .btn { background: #ffffff; border-color: #243aa0; color: #243aa0; }
+.sky .btn:hover { background: #dbe4ff; border-color: #1b2d80; color: #1b2d80; }
+
+.statusbar {
+  flex: 0 0 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 0 16px; font-size: 12px; border-top: 1px solid var(--line);
+}
+/* 状态栏 TEDRI 蓝（稍浅一档 #3d5cd0 以与顶部通栏 #304dcd 形成层次） */
+.statusbar.statusbar-sky {
+  background: #3d5cd0; color: #ffffff; border-top-color: #243aa0;
+}
+.statusbar .sb-sep { opacity: .75; color: #dbe4ff; }
+.statusbar .muted { color: #dbe4ff; }
 .sidebar {
   width: 220px; flex: 0 0 220px; background: #fff; border-right: 1px solid var(--line);
   overflow: auto; padding: 12px 10px;

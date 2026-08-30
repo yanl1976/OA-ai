@@ -111,7 +111,7 @@ function clearAll() {
   files.value = [];
 }
 
-async function upload() {
+async function doUpload() {
   if (!files.value.length) { notify("请选择文件", "err"); return; }
   // 分类留空即由系统自动识别，无需强制选择
   uploading.value = true;
@@ -148,85 +148,43 @@ async function upload() {
     const ids = okList.map((x) => x.doc_id).filter(Boolean);
     if (ids.length) pollRecognition(ids);
   } catch (e) {
-    // 409：分类与内容冲突，后端未落盘，弹窗请用户确认后重传
-    if (e.status === 409 && e.data && e.data.conflicts) {
-      conflicts.value = e.data.conflicts;
-      confirmOpen.value = true;
-      notify(e.message || "分类与文件内容不符，请确认", "warn");
-    } else {
-      notify(e.message, "err");
-    }
+    notify(e.message, "err");
   } finally {
     uploading.value = false;
     progress.value = { done: 0, total: 0 };
   }
 }
 
-// ---- 分类冲突确认：由用户决定如何上传（后端不代劳，问题在源头解决）----
-const conflicts = ref([]);
+// ---- 提交确认框：明确展示「文件名 / 文件类型 / 将归入分类」，用户确认后再上传 ----
+// 后台不再做分类与内容的冲突校验，分类以用户手动选择为准（精准落盘）。
 const confirmOpen = ref(false);
+const confirmList = ref([]);   // 待确认文件清单：{name, ext, category}
 
-// 采纳建议分类：把冲突文件改到建议分类后重新上传（其余文件保持原分类）
-async function uploadWithSuggested() {
-  confirmOpen.value = false;
-  const conflictNames = new Set(conflicts.value.map((c) => c.filename));
-  const conflictFiles = files.value.filter((f) => conflictNames.has(f.name));
-  if (!conflictFiles.length) return;
-  uploading.value = true;
-  try {
-    // 按建议分类逐个提交（不同文件建议分类可能不同）
-    const groups = {};
-    conflicts.value.forEach((c) => {
-      (groups[c.suggested_category] = groups[c.suggested_category] || []).push(c.filename);
-    });
-    const allIds = [];
-    for (const [cat, names] of Object.entries(groups)) {
-      const nameSet = new Set(names);
-      const gf = conflictFiles.filter((f) => nameSet.has(f.name));
-      if (!gf.length) continue;
-      const r = await api.upload(gf, cat, true);
-      allIds.push(...(r.results || []).map((x) => x.doc_id).filter(Boolean));
-    }
-    notify("已按建议分类上传 " + allIds.length + " 个文件", "ok");
-    files.value = [];
-    await loadCats();
-    emit("uploaded");
-    if (allIds.length) pollRecognition(allIds);
-  } catch (err2) {
-    notify(err2.message, "err");
-  } finally {
-    uploading.value = false;
-    conflicts.value = [];
-  }
+function extOf(name) {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1).toUpperCase() : "未知";
 }
 
-// 仍按原分类上传：用户知情后自主决定，带 confirm_category=1 重传
-async function uploadKeepOriginal() {
-  confirmOpen.value = false;
-  const conflictNames = new Set(conflicts.value.map((c) => c.filename));
-  const conflictFiles = files.value.filter((f) => conflictNames.has(f.name));
-  if (!conflictFiles.length) return;
-  uploading.value = true;
-  try {
-    const r = await api.upload(conflictFiles, category.value, true);
-    notify("已按原分类上传 " + ((r.results || []).length) + " 个文件（提取规则可能与内容不符）", "warn");
-    files.value = [];
-    await loadCats();
-    emit("uploaded");
-    const ids = (r.results || []).map((x) => x.doc_id).filter(Boolean);
-    if (ids.length) pollRecognition(ids);
-  } catch (err3) {
-    notify(err3.message, "err");
-  } finally {
-    uploading.value = false;
-    conflicts.value = [];
-  }
+function openConfirm() {
+  if (!files.value.length) { notify("请选择文件", "err"); return; }
+  const catLabel = category.value || "自动识别（系统按文件名/正文归类）";
+  confirmList.value = files.value.map((f) => ({
+    name: f.name,
+    ext: extOf(f.name),
+    category: catLabel,
+  }));
+  confirmOpen.value = true;
 }
 
-function cancelUpload() {
+function confirmUpload() {
   confirmOpen.value = false;
-  conflicts.value = [];
-  notify("已取消，请重新选择分类后上传", "warn");
+  confirmList.value = [];
+  doUpload();
+}
+
+function cancelConfirm() {
+  confirmOpen.value = false;
+  confirmList.value = [];
 }
 
 // ---- 上传后后台识别进度（轻量轮询，不阻塞上传完成提示）----
@@ -347,7 +305,7 @@ onMounted(loadCats);
         <a class="link" @click="clearAll" v-if="!uploading">清空</a>
       </p>
     </div>
-    <button class="btn primary" :disabled="uploading || !files.length" @click="upload">
+    <button class="btn primary" :disabled="uploading || !files.length" @click="openConfirm">
       {{ uploading ? "上传中…" : ("上传（" + files.length + "）") }}
     </button>
     <p class="file-hint" v-if="uploading && progress.total">
@@ -358,27 +316,28 @@ onMounted(loadCats);
     </p>
   </div>
 
-  <!-- 分类冲突确认弹窗：上传时校验发现分类与内容不符，交由用户决定（后端不自动纠正） -->
-  <div class="modal-mask" v-if="confirmOpen" @click.self="cancelUpload">
+  <!-- 提交确认框：明确展示每个文件的「文件名 / 文件类型 / 将归入分类」，确认后再上传 -->
+  <div class="modal-mask" v-if="confirmOpen" @click.self="cancelConfirm">
     <div class="modal-box">
-      <h3 class="modal-title">⚠️ 分类与文件内容不符</h3>
-      <p class="modal-desc">下列文件所选分类与内容类型不一致，若直接上传会导致提取结果错乱。请选择处理方式：</p>
-      <ul class="conflict-list">
-        <li v-for="(c, i) in conflicts" :key="i">
-          <div class="conflict-name">{{ c.filename }}</div>
-          <div class="conflict-detail">{{ c.warning }}</div>
-        </li>
-      </ul>
+      <h3 class="modal-title">请确认上传信息</h3>
+      <p class="modal-desc">请核对以下文件的「类型」与「将归入分类」。确认后点击「确认上传」，系统将按所选分类精准归档（不再做二次校验）。如需修改，请取消后调整分类再提交。</p>
+      <table class="confirm-table">
+        <thead>
+          <tr><th>文件名</th><th>文件类型</th><th>将归入分类</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="(c, i) in confirmList" :key="i">
+            <td class="cf-name">{{ c.name }}</td>
+            <td class="cf-ext">{{ c.ext }}</td>
+            <td class="cf-cat">{{ c.category }}</td>
+          </tr>
+        </tbody>
+      </table>
       <div class="modal-actions">
-        <button class="btn primary" :disabled="uploading" @click="uploadWithSuggested">
-          改用建议分类上传
-        </button>
-        <button class="btn" :disabled="uploading" @click="uploadKeepOriginal">
-          仍按原分类上传
-        </button>
-        <button class="btn danger" :disabled="uploading" @click="cancelUpload">取消</button>
+        <button class="btn primary" :disabled="uploading" @click="confirmUpload">确认上传</button>
+        <button class="btn danger" :disabled="uploading" @click="cancelConfirm">取消</button>
       </div>
-      <p class="modal-foot">提示：改用建议分类可保证提取结构正确；若确认分类无误，可选择「仍按原分类上传」。</p>
+      <p class="modal-foot">提示：选择「自动识别」时，系统将按文件名/正文归类；手动指定分类则原样采用，不会自动归一。</p>
     </div>
   </div>
 
@@ -483,7 +442,7 @@ onMounted(loadCats);
 .cat-warn-text { color: #b45309; font-size: 12px; flex-basis: 100%; padding-left: 2px; }
 .cat-warn-foot { margin: 8px 0 0; font-size: 12px; color: var(--muted, #888); }
 
-/* 分类冲突确认弹窗 */
+/* 提交确认弹窗 */
 .modal-mask {
   position: fixed; inset: 0; z-index: 1000;
   background: rgba(15, 23, 42, .45);
@@ -496,17 +455,22 @@ onMounted(loadCats);
   max-width: 620px; width: 100%; max-height: 86vh; overflow: auto;
   padding: 22px 24px;
 }
-.modal-title { margin: 0 0 8px; font-size: 17px; font-weight: 700; color: #b45309; }
+.modal-title { margin: 0 0 8px; font-size: 17px; font-weight: 700; color: #243aa0; }
 .modal-desc { margin: 0 0 12px; font-size: 13px; color: var(--muted, #666); line-height: 1.6; }
-.conflict-list {
-  list-style: none; margin: 0 0 16px; padding: 10px 12px;
-  background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
-  max-height: 260px; overflow: auto;
+.confirm-table {
+  width: 100%; border-collapse: collapse; margin: 0 0 16px;
+  font-size: 13px; border: 1px solid var(--border, #eee); border-radius: 8px; overflow: hidden;
 }
-.conflict-list li { padding: 7px 0; border-bottom: 1px dashed #fde68a; }
-.conflict-list li:last-child { border-bottom: none; }
-.conflict-name { font-size: 13px; font-weight: 600; word-break: break-all; }
-.conflict-detail { font-size: 12px; color: #b45309; margin-top: 3px; line-height: 1.5; }
+.confirm-table th, .confirm-table td {
+  padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border, #f0f0f0);
+}
+.confirm-table th { background: #f5f7fb; font-weight: 600; color: #333; }
+.confirm-table tr:last-child td { border-bottom: none; }
+.confirm-table .cf-name { word-break: break-all; }
+.confirm-table .cf-ext {
+  color: var(--primary, #2b7de9); font-weight: 600; white-space: nowrap; width: 84px;
+}
+.confirm-table .cf-cat { color: #243aa0; font-weight: 600; }
 .modal-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .modal-foot { margin: 12px 0 0; font-size: 12px; color: var(--muted, #888); line-height: 1.6; }
 </style>

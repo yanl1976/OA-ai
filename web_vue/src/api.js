@@ -94,6 +94,8 @@ export const api = {
     api.put("/api/kb/document/" + id, { category }),
   deleteUpload: (id) => api.del("/api/kb/uploads/" + id),
   deleteUploadsBatch: (docIds) => api.del("/api/kb/uploads/batch", { doc_ids: docIds }),
+  batchReclassify: (docIds, category) =>
+    api.post("/api/kb/uploads/batch/reclassify", { doc_ids: docIds, category }),
   // 上传后查询后台识别进度（轮询），ids 为逗号分隔的 doc_id 列表
   uploadStatus: (ids) => api.get("/api/kb/upload-status?ids=" + encodeURIComponent(ids.join(","))),
   // 回收站
@@ -147,7 +149,7 @@ export const api = {
   vectorStats: () => api.get("/api/admin/vector_stats"),
   health: () => api.get("/api/health"),
   systemInfo: () => api.get("/api/system/info"),
-  setSystemName: (name) => api.put("/api/system/info", { system_name: name }),
+  setSystemName: (name, copyright) => api.put("/api/system/info", { system_name: name, copyright: copyright || "" }),
 
   // 会议纪要二次生成（衍生版本）
   derivedList: (sourceDocId) =>

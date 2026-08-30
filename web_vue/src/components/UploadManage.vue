@@ -187,6 +187,49 @@ async function batchRemove() {
   finally { batchBusy.value = false; }
 }
 
+// ---- 批量调整归类：选定文档统一改到一个分类，并自动触发后台识别提取 ----
+const reclassOpen = ref(false);
+const reclassTarget = ref("");
+const batchReclassBusy = ref(false);
+
+function openBatchReclass() {
+  const n = selected.value.size;
+  if (!n) { notify("请先勾选要调整归类的文件", "err"); return; }
+  if (!cats.value.length) { loadCats(); }
+  reclassTarget.value = "";
+  reclassOpen.value = true;
+}
+
+async function confirmBatchReclass() {
+  const ids = Array.from(selected.value);
+  if (!ids.length) { notify("请先勾选要调整归类的文件", "err"); return; }
+  if (!reclassTarget.value) { notify("请选择目标分类", "err"); return; }
+  batchReclassBusy.value = true;
+  reclassOpen.value = false;
+  try {
+    const r = await api.batchReclassify(ids, reclassTarget.value);
+    const done = r.done || ids;
+    notify(`已批量调整归类 ${done.length} 个，并自动触发识别提取` + (r.failed && r.failed.length ? `，${r.failed.length} 个失败` : ""), "ok");
+    clearSelect();
+    await load();
+    // 分类改动后配套识别提取自动执行：逐篇轮询直到全部重新识别完成，列表即时刷新
+    for (const id of done) {
+      if (items.value.find((x) => x.doc_id === id)) {
+        await pollUntilIndexed(id, 30000).catch(() => {});
+      }
+    }
+  } catch (e) {
+    notify(e.message, "err");
+  } finally {
+    batchReclassBusy.value = false;
+  }
+}
+
+function cancelBatchReclass() {
+  reclassOpen.value = false;
+  reclassTarget.value = "";
+}
+
 onMounted(() => { loadCats(); load(); startPolling(); });
 onUnmounted(() => stopPolling());
 </script>
@@ -202,6 +245,9 @@ onUnmounted(() => stopPolling());
     <button class="btn" @click="load">刷新</button>
     <button class="btn danger" :disabled="!selected.size || batchBusy" @click="batchRemove">
       批量删除{{ selected.size ? `（${selected.size}）` : "" }}
+    </button>
+    <button class="btn primary" :disabled="!selected.size || batchReclassBusy" @click="openBatchReclass">
+      批量调整归类{{ selected.size ? `（${selected.size}）` : "" }}
     </button>
     <span class="spacer"></span>
     <span class="muted">共 {{ total }} 个上传文件</span>
@@ -283,6 +329,24 @@ onUnmounted(() => stopPolling());
       <div class="modal-acts">
         <button class="btn sm" @click="tagEditId = null">取消</button>
         <button class="btn sm primary" @click="saveTags">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量调整归类弹窗：选中文档统一改到目标分类，提交后自动触发识别提取 -->
+  <div class="modal-mask" v-if="reclassOpen" @click.self="cancelBatchReclass">
+    <div class="modal">
+      <h3>批量调整归类</h3>
+      <p class="muted">已勾选 {{ selected.size }} 个文件，将统一归入以下分类。提交后会自动按新分类重新识别提取并重建索引。</p>
+      <select class="input full" v-model="reclassTarget">
+        <option value="" disabled>请选择目标分类…</option>
+        <option v-for="c in cats" :key="c.id" :value="c.name">{{ c.name }}</option>
+      </select>
+      <div class="modal-acts">
+        <button class="btn sm" :disabled="batchReclassBusy" @click="cancelBatchReclass">取消</button>
+        <button class="btn sm primary" :disabled="batchReclassBusy || !reclassTarget" @click="confirmBatchReclass">
+          {{ batchReclassBusy ? "提交中…" : "确认调整" }}
+        </button>
       </div>
     </div>
   </div>
