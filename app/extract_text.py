@@ -818,12 +818,17 @@ def _decode_pdf_ocr(raw: bytes, category: str = None) -> str:
             with Image.open(_io.BytesIO(img)) as im:
                 try:
                     ocr = pytesseract.image_to_string(im, lang=_lang)
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    # 单页 OCR 失败不致命，记日志后继续下一页（避免静默丢失诊断信息）
+                    print("[OCR] 单页识别失败（%s）：%s" % (_lang, e))
                     ocr = ""
             if ocr and ocr.strip():
                 pages_txt.append(ocr.strip())
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 整体降级失败（如 tesseract 未安装/不可达）必须留痕，否则扫描件会被
+        # 静默提取为空、且在生产上完全无感知。返回空串由 extract() 给「未提取
+        # 到文本内容」告警，但根因已打印在后端日志。
+        print("[OCR] PDF 整体 OCR 降级失败：%s（请确认 Tesseract 已安装且 TESSERACT_CMD 可达）" % e)
     finally:
         doc.close()
 
