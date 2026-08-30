@@ -156,10 +156,21 @@ def _save_synced(d):
 def _collect_attachment_files(form_data):
     """遍历 form_data(widgetMap) 中所有控件，提取文件列表。
 
-    返回 [{file_id, file_name, widget_code}, ...]
-    云之家不同业务单据控件 code 不同，且本库 widgetMap 控件不含 widgetType 字段，
-    故改为「控件 value 为 list 且元素含文件 id 字段(sealedFileId/wpsFileId/fileId)」
-    即判定为附件控件，遍历全部而非写死某个 code。
+    返回 [{file_id, file_name, widget_code, kind, fallback_id, fallback_kind}, ...]
+
+    云之家存在「两种」附件载体，必须都支持，否则会漏掉整批单据：
+    1) 普通附件控件（如 Ps_0 / Od_0）：value 是 list，元素含
+       sealedFileId(盖章 pdf) / wpsFileId(原文件) / redFileId。
+    2) 金山在线文档控件（如 Kg_0，type=kingGrid）：value 是 dict，含
+       pdfFileId(盖章 pdf) / fileId(原 docx/doc) / fileName / ofdFileId。
+       2024 年度那批纪要走的正是 Kg_0 —— 旧实现只认 list 型控件，
+       导致这 54 条被误判为「无附件」而永久跳过（实测确认）。
+
+    下载策略（在原有「优先盖章 PDF」基础上，增加兼容原文件格式）：
+      优先取盖章版 PDF；仅当该单据没有生成盖章 PDF 时，才回退下载原文件
+      （docx/doc/ofd 等）。kind 记录本次实际下载的是哪一类：
+        "pdf"    → 盖章版 PDF，落盘扩展名 .pdf
+        "origin" → 原文件，落盘扩展名沿用文件自身的 .docx/.doc/...（不再强改 .pdf）
     """
     files = []
     if not isinstance(form_data, dict):
@@ -167,20 +178,56 @@ def _collect_attachment_files(form_data):
     for code, wv in form_data.items():
         if not isinstance(wv, dict):
             continue
-        vals = wv.get("value")
-        if not isinstance(vals, list):
+        val = wv.get("value")
+
+        # 类型 2：金山在线文档控件（value 为 dict）
+        if isinstance(val, dict):
+            fname = (val.get("fileName") or val.get("name") or "")
+            # 原文件（docx/doc）id，用作「盖章 PDF 不可用」时的回退
+            origin_id = val.get("fileId") or val.get("kingGridWidgetFileId") or ""
+            # 优先盖章 pdf（pdfFileId）→ 其次 OFD → 最后原文件（fileId，docx/doc）
+            if val.get("pdfFileId"):
+                fid, kind = val["pdfFileId"], "pdf"
+            elif val.get("ofdFileId"):
+                fid, kind = val["ofdFileId"], "ofd"
+            elif val.get("fileId"):
+                fid, kind = val["fileId"], "origin"
+            elif val.get("kingGridWidgetFileId"):
+                fid, kind = val["kingGridWidgetFileId"], "origin"
+            else:
+                continue
+            files.append({
+                "file_id": fid, "file_name": fname, "widget_code": code, "kind": kind,
+                # 仅当主选是 PDF/OFD 时，才登记原文件做回退（避免无谓重复下载）
+                "fallback_id": (origin_id if kind in ("pdf", "ofd") else ""),
+                "fallback_kind": ("origin" if kind in ("pdf", "ofd") else ""),
+            })
             continue
-        for item in vals:
+
+        # 类型 1：普通附件控件（value 为 list）
+        if not isinstance(val, list):
+            continue
+        for item in val:
             if not isinstance(item, dict):
                 continue
-            # 与 sync_yzj_minutes.py 一致：优先取盖章 pdf（sealedFileId），
-            # 否则回退 wpsFileId（原文件）/ redFileId（红头文件实例 id）。
-            fid = item.get("sealedFileId") or item.get("wpsFileId") or item.get("redFileId")
-            if not fid:
-                continue
+            # 优先盖章 pdf（sealedFileId）；回退原文件 wpsFileId（docx/doc）；
+            # 最后红头文件实例 id（红头本身为 pdf）。
             fname = (item.get("wpsFileName") or item.get("sealedFileName")
                      or item.get("fileName") or item.get("name") or "")
-            files.append({"file_id": fid, "file_name": fname, "widget_code": code})
+            origin_id = item.get("wpsFileId") or ""
+            if item.get("sealedFileId"):
+                fid, kind = item["sealedFileId"], "pdf"
+            elif item.get("wpsFileId"):
+                fid, kind = item["wpsFileId"], "origin"
+            elif item.get("redFileId"):
+                fid, kind = item["redFileId"], "pdf"
+            else:
+                continue
+            files.append({
+                "file_id": fid, "file_name": fname, "widget_code": code, "kind": kind,
+                "fallback_id": (origin_id if kind == "pdf" else ""),
+                "fallback_kind": ("origin" if kind == "pdf" else ""),
+            })
     return files
 
 
@@ -381,10 +428,22 @@ def run_task(task, dry_run=False, limit=None, force=False):
         if inst_id in synced and not force:
             rec = synced[inst_id]
             note = rec.get("note")
-            # 无附件 / 试跑 记录：本就无文件，保持跳过
-            if note == "no-attachment" or rec.get("dry"):
+            # 试跑记录：未落盘，正常跳过（下次正式拉取仍会处理）
+            if rec.get("dry"):
                 stats["skipped"] += 1
                 continue
+            # 自愈：旧版本只识别 list 型附件控件（Ps_0），把金山在线文档控件（Kg_0）
+            # 的单据误判为「无附件」并永久跳过（实测 2024 年度有 54 条因此漏拉）。
+            # 故对「无 ver 标记的旧 no-attachment 记录」重新校验一次：
+            # 若确无附件则补写 ver=2 标记（此后不再重复校验），若有附件则清记录重拉。
+            if note == "no-attachment":
+                if rec.get("ver") is None:
+                    del synced[inst_id]
+                    stats["recheck"] = stats.get("recheck", 0) + 1
+                    logger.info("重新校验旧 no-attachment 记录: %s", inst_id)
+                else:
+                    stats["skipped"] += 1
+                    continue
             # 文件可能因手动删除而不存在 → 校验文档是否仍存活，已删则移记录并重拉
             doc_ids = rec.get("doc_ids") or []
             if doc_ids:
@@ -403,8 +462,11 @@ def run_task(task, dry_run=False, limit=None, force=False):
             form_data = form_info.get("widgetMap") or {}
             files = _collect_attachment_files(form_data)
             if not files:
-                # 无附件也记录已处理（避免每次重复拉详情）
-                synced[inst_id] = {"ts": int(time.time()), "files": 0, "note": "no-attachment"}
+                # 无附件也记录已处理（避免每次重复拉详情）。
+                # ver=2 表示「已用支持 Kg_0 的新逻辑校验过确无附件」，
+                # 下次直接跳过，不再重复校验（否则自愈会每轮都重扫这些单据）。
+                synced[inst_id] = {"ts": int(time.time()), "files": 0,
+                                   "note": "no-attachment", "ver": 2}
                 stats["skipped"] += 1
                 continue
             if dry_run:
@@ -418,35 +480,64 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 fname = _safe_filename(fi.get("file_name") or ("file_%s" % fi["file_id"]))
                 # download_file 写盘后返回路径；读 bytes 再删临时文件（与 sync_yzj_minutes 一致）
                 import tempfile
-                tmp = os.path.join(tempfile.gettempdir(), "yzj_%s_%s" % (inst_id[-6:], fi["file_id"]))
-                try:
-                    download_file(fi["file_id"], tmp)
-                    with open(tmp, "rb") as fh:
-                        raw = fh.read()
-                except Exception as e:  # noqa: BLE001
-                    stats["failed"] += 1
-                    logger.warning("下载附件失败 %s: %s", fi.get("file_id"), e)
-                    continue
-                finally:
+                kind = fi.get("kind") or "pdf"
+                raw = b""
+                fb_id = fi.get("fallback_id") or ""
+                # 策略：优先下载盖章版 PDF；只有拿不到可用的 PDF 才回退原文件（docx/doc）。
+                # 这里的「拿不到可用」包含两种情形：
+                #   1) 单据本就没有盖章 PDF（无 pdfFileId/sealedFileId，直接选的 origin）
+                #   2) 有 pdfFileId 但下载失败 / 返回的不是 PDF（接口偶发、权限等）
+                for attempt, (use_id, use_kind) in enumerate(
+                        [(fi["file_id"], kind)] + ([(fb_id, "origin")] if fb_id else [])):
+                    tmp = os.path.join(tempfile.gettempdir(),
+                                       "yzj_%s_%s_%d" % (inst_id[-6:], use_id, attempt))
                     try:
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
-                    except Exception:  # noqa: BLE001
-                        pass
+                        download_file(use_id, tmp)
+                        with open(tmp, "rb") as fh:
+                            _raw = fh.read()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("下载附件失败 %s (kind=%s): %s", use_id, use_kind, e)
+                        _raw = b""
+                    finally:
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if not _raw:
+                        continue
+                    # 校验：声明为 PDF 就必须真的是 PDF 字节；否则视为不可用，回退原文件
+                    if use_kind == "pdf" and _raw[:4] != b"%PDF":
+                        logger.warning("盖章 PDF 内容异常(非 PDF 头) fileId=%s，回退原文件", use_id)
+                        continue
+                    raw, kind = _raw, use_kind
+                    break
                 if not raw:
                     stats["failed"] += 1
+                    logger.warning("附件下载失败（PDF 与原文件均不可用）: %s", fi.get("file_name"))
                     continue
-                # 与 sync_yzj_minutes.py 保持一致（已验证通过的口径）：
-                # 1) 下载的是「盖章版 PDF」，故落盘文件名统一 .pdf —— 去掉原文件名的
-                #    .docx/.doc/.pdf 等扩展名后统一加 .pdf，避免「内容=PDF 但文件名=docx」
-                #    导致 extract_text 按 docx 解析器去解 PDF 字节流而提取失败。
-                # 2) 不再拼接 inst_id 片段（doc_id 已全局唯一，避免文件名末尾多出随机码）。
-                base, _decl_ext = os.path.splitext(fname)
-                for _e in (".docx", ".doc", ".pdf", ".DOCX", ".DOC", ".PDF"):
+                # 落盘文件名：扩展名必须与实际下载到的内容一致。
+                # - kind="pdf"（盖章版 PDF）→ 统一 .pdf（与已验证的 sync_yzj_minutes 口径一致）
+                # - kind="origin"（该单据无盖章 PDF，回退下载原文件）→ 沿用文件自身的
+                #   .docx/.doc 扩展名，绝不改名为 .pdf。因为 extract_text 严格按扩展名
+                #   路由（.pdf→PDF 解析器 / .docx→OOXML 解析器），名实不符会导致
+                #   原文件被 PDF 解析器去解，实测会少提取约 3% 文本。
+                # 同时不再拼接 inst_id 片段（doc_id 已全局唯一，避免文件名末尾多出随机码）。
+                base, decl_ext = os.path.splitext(fname)
+                # 防御：原文件名可能把扩展名写进了主干（如 "xx.docx.pdf"），先剥一层
+                for _e in (".docx", ".doc", ".pdf", ".ofd", ".xlsx", ".xls"):
                     if base.lower().endswith(_e.lower()):
                         base = base[: -len(_e)]
                         break
-                uniq = (base.strip() or ("file_%s" % fi["file_id"])) + ".pdf"
+                base = base.strip() or ("file_%s" % fi["file_id"])
+                # 注意：此处的 kind 必须是「实际下载成功」的那个（可能在上面的
+                # PDF 校验失败后已回退为 origin），故不能再从 fi 重新取值覆盖。
+                if kind == "pdf":
+                    uniq = base + ".pdf"
+                elif kind == "ofd":
+                    uniq = base + ".ofd"
+                else:  # origin：沿用原文件扩展名，拿不到则按 .docx 兜底
+                    uniq = base + (decl_ext.lower() if decl_ext else ".docx")
                 # 自动归类（按文件名/标题关键词匹配分类树，校验存在，否则兜底 target_category）
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
