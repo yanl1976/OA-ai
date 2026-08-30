@@ -39,7 +39,7 @@ try:
 except ImportError:  # 直接以脚本运行时的回退
     from llm import structured_extract, is_configured
 
-ALLOWED_EXT = {".txt", ".md", ".csv", ".docx", ".xlsx", ".pptx", ".pdf"}
+ALLOWED_EXT = {".txt", ".md", ".csv", ".docx", ".doc", ".xlsx", ".pptx", ".pdf"}
 
 # LLM 配置：默认关闭，可在 .env 中设置 USE_LLM=true 并配置 MINIMAX_API_KEY 启用
 # 启用后，PDF/DOCX 会先用基础解析得到原始文本，再交由大模型做结构化排版
@@ -175,6 +175,59 @@ def _extract_docx(raw: bytes) -> str:
     if body is not None:
         walk(body)
     return "\n".join(out)
+
+
+def _extract_doc(raw: bytes) -> str:
+    """提取旧版 .doc（OLE 复合文档，文件头 D0CF11E0）的文本。
+
+    优先用系统命令（antiword / catdoc，准确率高）；不可用时回退到内置的
+    WordDocument 流解析：跳过 FIB 头部，按 8-bit 或 UTF-16 试探解码文本段。
+    内置解析不保证完整，仅作为「不装依赖也能读出正文」的兜底。
+    """
+    import subprocess, tempfile
+    # 1) 优先外部工具
+    for cmd in ("antiword", "catdoc"):
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tf:
+                tf.write(raw)
+                path = tf.name
+            try:
+                r = subprocess.run([cmd, path], capture_output=True, timeout=60)
+                if r.returncode == 0:
+                    txt = (r.stdout or b"").decode("utf-8", "replace")
+                    if txt.strip():
+                        return txt
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:  # noqa: BLE001
+                    pass
+        except FileNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001
+            continue
+
+    # 2) 内置兜底：OLE WordDocument 流文本抽取
+    try:
+        import struct
+        # 简化 OLE 解析：定位 WordDocument 流的扇区链过于复杂，
+        # 这里采用实用做法——直接在整个文件中扫描可读文本片段。
+        # .doc 正文通常以 UTF-16LE 存储，先试 UTF-16，再试 GBK/UTF-8。
+        best = ""
+        for enc in ("utf-16-le", "gbk", "utf-8"):
+            try:
+                s = raw.decode(enc, "ignore")
+            except Exception:  # noqa: BLE001
+                continue
+            # 提取连续可打印文本（按控制字符切分，保留中文与常用标点）
+            import re as _re
+            chunks = _re.findall(r"[\u4e00-\u9fffA-Za-z0-9 ，。、；：（）()\-—%．.]{6,}", s)
+            joined = "\n".join(c.strip() for c in chunks if c.strip())
+            if len(joined) > len(best):
+                best = joined
+        return best
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("旧版 .doc 解析失败（建议安装 antiword 或转换为 docx）: %s" % e)
 
 
 def _extract_xlsx(raw: bytes) -> str:
@@ -1374,14 +1427,26 @@ def extract(raw: bytes, filename: str, category: str = None):
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
         raise ValueError(
-            "不支持的文件格式: %s（支持 txt/md/csv/docx/xlsx/pptx/pdf）" % ext)
+            "不支持的文件格式: %s（支持 txt/md/csv/docx/doc/xlsx/pptx/pdf）" % ext)
     try:
         if ext in (".txt", ".md", ".csv"):
             text = _decode_text(raw)
             warn = None
         elif ext == ".docx":
-            text = _extract_docx(raw)
+            # 名实不符兜底：历史数据里存在「扩展名 .docx 但内容实为 PDF」的文件
+            # （早期版本统一按 .docx 命名所致），此时按 PDF 解析，避免直接报
+            # 「File is not a zip file」而无法读取。
+            if raw[:4] == b"%PDF":
+                text = _decode_pdf(raw, category=category)
+                warn = "文件名后缀为 .docx，但内容实为 PDF，已按 PDF 解析"
+            else:
+                text = _extract_docx(raw)
+                warn = None
+        elif ext == ".doc":
+            text = _extract_doc(raw)
             warn = None
+            if not text.strip():
+                warn = ".doc 未提取到文本（建议安装 antiword/catdoc 或转为 docx）"
         elif ext == ".xlsx":
             text = _extract_xlsx(raw)
             warn = None
