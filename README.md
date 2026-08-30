@@ -1,5 +1,34 @@
 # OA-ai 本地知识库系统
 
+## 更新日志
+
+### 2026-08-30 · 云之家审批单据自动拉取（重大功能 + 全链路排障）
+
+新增从云之家按模板自动拉取会议纪要等审批附件入库，并修复 10 类问题：
+
+| 问题 | 根因与修复 |
+|---|---|
+| 只拉到 7 条 | 模板只取首个命中 + `find_flows` 不翻页 → 改为匹配所有模板并逐模板翻完 |
+| 2024 年度拉不到 | 附件在 `Kg_0`（dict）控件，旧代码只扫 list 型 → 新增 `Kg_0` 支持 |
+| 自愈不生效，记录恒为 `ver=None` | 自愈清记录后未跳过 alive 判断被误判跳过 → 置 `_rechecking` 直接重拉 |
+| 拉取到 110 条无进展 | `synced` 整轮才保存一次，中断全丢 → 每条增量保存 + 原子写 + finally 兜底 |
+| 切页任务终止 | 同步阻塞 → 后台线程 + 轮询 + `/abort` 中止，切页不影响后端 |
+| docx 无法读取 | 历史「`.docx` 名 + PDF 内容」名实不符 → 自动按 PDF 解析 + 修复脚本 |
+| 32 份同名文件 | 同类单据附件名相同 → **仅重名时**加「单据日期_」前缀 |
+| 全部文件被加时间戳 | 初期无差别加前缀 → 改为仅冲突时加 |
+| 配置改了生产机不生效 | `yzj_pull_tasks.json` 被 `.gitignore` 排除 → 纳入版本库 |
+| `.doc`（OLE）无法提取 | `extract_text` 不支持 → 新增 `_extract_doc()`（antiword/catdoc + 内置兜底） |
+
+下载策略最终定为：**优先盖章版 PDF；仅当无盖章 PDF 时回退原文件 docx/doc，扩展名按实际内容定**。
+
+新增接口参考文档 **[`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)**：记录云之家各接口的请求/响应结构、
+鉴权三 scope（含易遗漏的 `resGroupSecret`）、附件**两种控件字段对照表**（`Ps_0` list / `Kg_0` dict）、
+下载策略、时间字段、去重记录字段语义与排查命令。
+
+详见下方「云之家审批单据自动拉取」与「云之家拉取排障」两节。
+
+---
+
 基于 **BM25 词法检索 + BGE 语义向量**混合检索的本地知识库管理平台，配备 **MiniMax 大模型智能对话**（含查询改写、跨文档对比分析）、**会议纪要结构化提取与二次生成**、**Three.js 3D 知识图谱**可视化。支持 PDF / Word / Excel / PPT / 文本 / HTML 等多格式文档的解析、检索、分类管理与关联关系图谱展示。
 
 > **混合检索，优雅降级**：向量模型（BGE）缺失时自动回退纯 BM25，不影响服务可用性。
@@ -24,9 +53,34 @@
 - **对比分解**：检测对比意图（含「对比/区别/差异」等），拆解为多个子问题分别检索后合并，支持跨文档对比分析。
 - **思考过程剥离**：推理模型的 `<think>` 标签自动剥离，不污染回答。
 
+### 云之家审批单据自动拉取（2026-08-30 新增）
+从云之家（云之家开放平台）按模板自动拉取审批完成的会议纪要等单据附件入库。
+
+- **任务化配置**：`config/yzj_pull_tasks.json`（**已纳入 git**，可随 pull 同步到各环境），支持模板、状态、时间范围、目标分类、定时（每日/每周）、限流间隔、单次条数上限。
+- **多模板匹配**：模板名关键词匹配**所有**命中模板（早期只取第一个，导致漏拉）；`findFlows` 逐模板翻完全部页。
+- **附件识别**：支持两种载体
+  1. `Ps_0`/`Od_0` 等普通附件控件（`value` 为 list，含 `sealedFileId`/`wpsFileId`）
+  2. **`Kg_0` 金山在线文档控件**（`value` 为 dict，含 `pdfFileId`/`fileId`）—— 2024 年度那批纪要走的就是它
+- **下载策略**：优先盖章版 PDF；**仅当该单据无盖章 PDF 时**才回退下载原文件 docx/doc，扩展名按实际内容定（绝不把 docx 改名成 pdf）。下载后校验 `%PDF` 头，不符则自动回退原文件。
+- **文件名规则**：不重名保持原文件名；**仅当重名时**才加「单据日期_」前缀（同类单据附件名常完全相同，实测 32 份同名）；重名且同日再加 `(2)` 序号。
+- **异步可中止**：`/api/yzj/run` 后台线程执行并立即返回，前端轮询 `/api/yzj/status`，可 `/api/yzj/abort` 终止；**切换页面不影响拉取**（后端继续跑，返回页面自动续接进度）。
+- **去重与断点续传**：每条处理完即**增量保存**去重记录（原子写），中断不丢进度，下次续拉不重复；异常时 `finally` 兜底保存。
+- **自愈**：旧版本误判为「无附件」的记录会重新校验一次（用 `ver` 标记避免重复校验）。
+
+> **接口参考**：云之家 API 的请求/响应结构、附件两种控件（`Ps_0` list / `Kg_0` dict）字段对照、
+> 下载策略与排查命令，见 **[`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)**。
+
+运维脚本 `scripts/fix_yzj_ext.py`：修复历史「名实不符」文件（`.docx` 名 + PDF 内容等）。
+```bash
+/opt/OA-ai/venv/bin/python scripts/fix_yzj_ext.py \
+  --files-dir /opt/OA-ai/knowledge_base/uploads/files \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json            # 预览
+# 确认无误后加 --apply 执行
+```
+
 ### 其他
 - **3D 知识图谱**：Three.js 渲染文档/分类/标签关联网络，节点可点击下钻。
-- **多格式文档**：PDF、DOCX、XLSX、PPTX、TXT、HTML 上传、解析、入库。
+- **多格式文档**：PDF、DOCX、DOC、XLSX、PPTX、TXT、HTML 上传、解析、入库。
 - **派生分析**：会议纪要结构化解析（议题切分）、二次生成 PDF。
 - **权限与角色**：用户/角色/权限管理，细粒度权限点（查看、上传、删除、图谱、派生分析等）。
 
@@ -57,18 +111,23 @@ kb_deploy/
 │   ├── kb_store.py           # 文档存储 / 元数据
 │   ├── admin.py              # 用户 / 角色 / 权限 + 功能开关（含 watermark_enabled）
 │   ├── chat_store.py         # 对话会话持久化
-│   ├── extract_text.py       # 多格式文档解析（PDF/Office/HTML）
+│   ├── extract_text.py       # 多格式文档解析（PDF/Office/HTML，含 .doc OLE 兜底）
+│   ├── yzj_pull.py           # 云之家审批单据拉取引擎（多模板/多控件/去重/自愈）
+│   ├── yunzhijia_client.py   # 云之家开放平台 API 封装（token/模板/流程/下载）
 │   ├── pdf_make.py           # PDF 生成（reportlab）
 │   ├── derived_store.py      # 会议纪要结构化解析与派生
 │   ├── generate_data.py      # 原始数据导入
 │   └── crypto.py             # 加密（secret.key）
 ├── scripts/
 │   ├── serve.py              # ✅ 启动入口（Flask，默认 8080）
+│   ├── fix_yzj_ext.py        # 修复云之家历史「名实不符」文件（预览 / --apply）
 │   ├── start.sh              # ✅ 一行命令启动 + 进程守护（崩溃自动重启）
 │   └── install.sh            # 首次安装脚本（systemd 服务）
 ├── web_vue/                  # 前端（Vue 3 + Vite + Three.js）
 │   ├── dist/                 # 生产构建（serve.py 直接托管，无需 dev server）
 │   └── src/components/       # SearchView / KbBrowse / ChatView / MeetingDerived ...
+├── docs/
+│   └── yunzhijia_api.md      # 云之家接口参考（字段结构/附件控件/下载策略/排障）
 ├── knowledge_base/
 │   ├── bm25_index/           # BM25 索引（运行时生成）
 │   ├── vec_index/            # 向量索引（运行时生成）
@@ -260,6 +319,22 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 | POST | `/api/derived/parse` | 纪要结构化解析 |
 | GET | `/api/derived/list` | 派生列表 |
 | GET | `/api/derived/<id>/pdf` | 生成 PDF |
+
+### 云之家拉取（需 `system.manage` 权限）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/yzj/templates` | 云之家审批模板列表 |
+| GET | `/api/yzj/tasks` | 拉取任务列表 |
+| POST/PUT | `/api/yzj/tasks` | 新建 / 更新任务 |
+| DELETE | `/api/yzj/tasks/<id>` | 删除任务 |
+| **POST** | `/api/yzj/run/<id>` | **启动拉取（后台线程，立即返回）** |
+| POST | `/api/yzj/abort/<id>` | 请求终止（协作式，下一条前退出） |
+| GET | `/api/yzj/status/<id>` | 查询进度（`running` / `processed` / `stats` / `new_docs`） |
+| GET | `/api/yzj/progress` | 全部任务的进度快照 |
+| GET | `/api/yzj/pulled-docs` | 已拉取文档清单（`page=`、`page_size=`，固定 `source=yunzhijia`） |
+
+> 前端「立即拉取」为异步：触发后轮询 `/api/yzj/status`，**切换页面不影响后端执行**；
+> 返回页面时 `onMounted` 自动续接进度。详见 [`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)。
 
 前端通过同源 `/api/*` 调用，无需配置跨域。完整路由见 `scripts/serve.py`（约 80 个）。
 
@@ -704,3 +779,152 @@ A：旧库缺少 `watermark_enabled` 这一行时，`setFeature` 的 UPDATE 会�
 
 **Q：系统名称改了但首页左上角没变？**
 A：首页品牌名在页面加载时读取 `/api/system/info`；管理员在系统设置保存后全局立即同步。若未登录或非管理员，左上角显示的是最近一次读取到的名称（默认 "OA-AI 知识库"）。确认系统设置卡片已保存成功。
+
+---
+
+## 云之家拉取排障（实战记录）
+
+> 接口字段结构与排障前置知识见 **[`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)**。
+
+### Q1：只拉取到 7 条，明明云之家有很多纪要
+
+两个原因叠加，均已修复：
+
+1. **模板只匹配第一个**：旧代码 `next(t for t in templates if kw in title)` 只取首个命中模板。
+   实测「会议纪要」关键词可匹配 3 个模板（7 + 154 + 0 条），只取第一个就只有 7 条。
+   现已改为匹配**所有**命中模板。
+2. **`find_flows` 不翻页**：只取首页，单据超过 `page_size` 后永久丢失。现已逐模板翻完全部页。
+
+### Q2：某批单据一直显示「无附件」而跳过
+
+附件控件有**两种**，必须都支持：
+
+| 控件 | value 类型 | 文件 id 字段 | 典型年份 |
+|---|---|---|---|
+| `Ps_0` / `Od_0` 普通附件 | **list** | `sealedFileId` / `wpsFileId` | 2025 / 2026 |
+| **`Kg_0` 金山在线文档** | **dict** | `pdfFileId` / `fileId` | **2024** |
+
+旧代码只扫 `value` 为 list 的控件，导致 2024 年度那批（`Kg_0`）被整体误判为"无附件"。
+现已支持 `Kg_0`；对历史误判记录有**自愈**：无 `ver` 标记的 `no-attachment` 记录会重新校验一次。
+
+### Q3：自愈已部署，但那批记录仍是 `ver=None`、数量不减
+
+检查自愈分支后是否**漏了跳过 alive 判断**：
+
+```python
+if note == "no-attachment":
+    if rec.get("ver") is None:
+        del synced[inst_id]      # 清记录准备重拉
+        ...
+# ⚠️ 若此处继续往下走 alive 判断：
+doc_ids = rec.get("doc_ids") or []          # 空 → fallback
+alive = inst_id[-6:] in alive_suffix        # 用旧文件名后缀兜底
+if alive:
+    continue                                 # 误判"已落盘"→ 自愈失效
+```
+
+`no-attachment` 记录没有 `doc_ids`，会 fallback 用「inst_id 末 6 位是否出现在旧文件名后缀里」判断，
+一旦撞上就跳过，表现为"跑满整轮却只多落盘 1 条"。
+现已在自愈分支置 `_rechecking=True`，**跳过 alive 判断直接重拉**。
+
+### Q4：拉取到一半停住，反复重拉已完成的单据
+
+根因：去重记录 `synced` **只在整轮结束后保存一次**，中断即全部丢失
+（文档已入库但去重没写，下次重跑会重复拉取）。
+
+修复：
+- 每处理完一条即**增量保存**（原子写：临时文件 + `os.replace`）
+- 调度器与接口层均加 `finally` 兜底 `flush_task_synced()`
+- 新增整轮运行时长上限 `max_runtime_sec`（默认 3600s）有序退出
+
+### Q5：切到别的页面，拉取就中断
+
+`/api/yzj/run` 改为**后台线程**执行并立即返回；前端轮询 `/api/yzj/status`，
+`onUnmounted` 只停前端定时器（后端继续跑），`onMounted` 自动续接进度。终止走 `/api/yzj/abort`。
+
+### Q6：落盘的 docx 文件无法读取 / 提取失败
+
+`extract_text` **严格按扩展名路由**（`.docx` → OOXML 解析器，`.pdf` → PDF 解析器），名实不符必然失败。
+历史遗留文件中存在「`.docx` 名 + PDF 内容」（早期版本统一按 `.docx` 命名所致）。
+
+已加兜底：`.docx` 名但内容为 `%PDF` 时自动按 PDF 解析。历史数据用脚本修复：
+
+```bash
+/opt/OA-ai/venv/bin/python scripts/fix_yzj_ext.py \
+  --files-dir /opt/OA-ai/knowledge_base/uploads/files \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json --apply
+```
+
+### Q7：同名文件无法区分（实测 32 份同名）
+
+同类单据的附件名常完全相同（如「天传所集团生产经营工作例会会议纪要」）。
+规则：**不重名保持原名；仅当重名时**才加「单据日期_」前缀（取 `Da_0`，回退 `_S_DATE`/`createTime`）；同日仍重名再加 `(2)`。
+
+> 注意：不是给所有文件加时间戳——只有真正冲突的才加。
+
+### Q8：`fix_yzj_ext.py` 报 `uploads 条数: 0`
+
+`kb_store` 路径拼接为 `KB_ROOT + "knowledge_base/uploads"`，而生产机 `.env` 的
+`KB_ROOT` **已含** knowledge_base，导致拼出重复路径、读到空数组：
+
+```
+拼出: /opt/OA-ai/knowledge_base/knowledge_base/uploads/user_documents.json ← 不存在
+实际: /opt/OA-ai/knowledge_base/uploads/user_documents.json
+```
+
+脚本已支持从 `--files-dir` 父目录推断元数据，但**建议显式指定 `--meta` 最稳妥**（见 Q6 命令）。
+保存时会写回**实际读到的那个**文件并自动备份 `.bak`。
+
+### Q9：改了任务配置但生产机不生效
+
+`config/yzj_pull_tasks.json` 曾被 `.gitignore` 排除，`git pull` 同步不过去
+（表现为"开发机拉全部、生产机只拉 N 条"）。现已**纳入版本库**。
+
+> `config/.yzj_pull_synced.json`（去重记录）保持忽略——它是运行时本地状态，各环境应独立。
+
+### Q10：旧版 `.doc`（OLE 格式）无法提取
+
+`extract_text` 原不支持 `.doc`。现已加入允许列表并实现 `_extract_doc()`：
+优先调用系统 `antiword` / `catdoc`，未安装则用内置 OLE 兜底。建议生产机安装以提升准确率：
+
+```bash
+sudo apt-get install -y antiword
+```
+
+### Q11：去重记录状态速查（排查第一手依据）
+
+`config/.yzj_pull_synced.json` 的每条记录按 `<formInstId>` 索引：
+
+```json
+{
+  "ts": 1756530000,
+  "files": 1,
+  "doc_ids": ["up_xxx"],
+  "note": "no-attachment",
+  "ver": 2
+}
+```
+
+| 记录状态 | 含义 | 下次行为 |
+|---|---|---|
+| 有 `doc_ids` | 已落盘 | 校验文档是否仍存活，存活则跳过 |
+| `note=no-attachment` **且无 `ver`** | **旧版误判记录** | **触发自愈，重新校验一次** |
+| `note=no-attachment` 且 `ver=2` | 已用新逻辑校验，确无附件 | 永久跳过 |
+| `dry: true` | 试跑记录（未落盘） | 正式拉取时仍会处理 |
+
+一键查看分布：
+
+```bash
+python3 -c "
+import json, collections
+d = json.load(open('/opt/OA-ai/config/.yzj_pull_synced.json', encoding='utf-8'))
+c = collections.Counter()
+for k, v in d.items():
+    if v.get('note') == 'no-attachment': c['no-attachment(ver=%s)' % v.get('ver')] += 1
+    elif v.get('doc_ids'): c['已落盘'] += 1
+print('总数', len(d), dict(c))
+"
+```
+
+> **判读要点**：如果 `no-attachment(ver=None)` 长期不减少，说明自愈没生效
+> （先查 Q3）；拉取停止时先看文件 `mtime` 判断是"结束了"还是"卡住"。

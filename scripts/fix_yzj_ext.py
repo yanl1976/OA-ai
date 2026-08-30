@@ -116,7 +116,35 @@ def main():
     print("部署根目录:", args.root)
     print("元数据文件:", meta_used, "(存在: %s)" % os.path.isfile(meta_used))
     print("uploads 条数:", len(ups))
-    print("文件目录:", root)
+
+    # 基准校准：stored_path 有两种形态，必须与 --files-dir 的层级匹配，否则
+    # 拼出的路径全部不存在，导致「需修复 0 / 无需改动 0」（实测踩坑）。
+    #   形态 A: "会议纪要/2024年度/up_xxx.pdf"        → 基准 = <files-dir>
+    #   形态 B: "files/会议纪要/2024年度/up_xxx.pdf"  → 基准 = <files-dir> 的父目录
+    # 这里用「实际能命中的文件数」自动挑选正确基准。
+    def _count_hit(base):
+        n = 0
+        for _u in ups:
+            if not isinstance(_u, dict):
+                continue
+            _rel = _u.get("stored_path")
+            if _rel and os.path.exists(os.path.join(base, _rel)):
+                n += 1
+        return n
+
+    bases = [root]
+    parent = os.path.dirname(root.rstrip("/\\"))
+    if parent and os.path.isdir(parent):
+        bases.append(parent)
+    best_base, best_hit = root, _count_hit(root)
+    for b in bases[1:]:
+        h = _count_hit(b)
+        if h > best_hit:
+            best_base, best_hit = b, h
+    if best_base != root:
+        print("提示：stored_path 含 'files/' 前缀，已自动改用上级目录作为基准")
+    root = best_base
+    print("文件目录:", root, "(可命中文件 %d / %d)" % (best_hit, len(ups)))
     print("模式:", "实际修复 --apply" if args.apply else "预览（不改动）")
     print("=" * 72)
 
