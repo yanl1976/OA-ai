@@ -1050,7 +1050,37 @@ print('元数据',len(ups),'| 物理文件缺失',len(miss),'| 软删',len([u fo
 无法从元数据反查云之家单据。若确需重下，只能用拉取任务的 `synced` 记录
 （`config/.yzj_pull_synced.json` 中的 `formInstId`）定位，或清去重后整轮重拉。
 
-### Q12：去重记录状态速查（排查第一手依据）
+### Q12：记录的时间与实际时间对不上（差 8 小时）
+
+**现象**：清单里显示 `created_at=2026-08-30 14:56:39`，而系统 `date` 是 `23:01`。
+
+**根因**：应用写时间时用 **UTC**，而系统时区是 `Asia/Shanghai`（UTC+8）：
+
+```python
+# 旧实现（app/kb_store.py、app/derived_store.py、app/admin.py、app/yzj_pull.py）
+datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")   # ← 写进去的是 UTC
+```
+
+机器时钟本身没问题（`timedatectl` 显示 Asia/Shanghai、NTP 已同步），
+是应用取时用了 UTC 而非本地时区，导致写入时间比实际慢 8 小时。
+
+**修复**：四处 `_now()` 统一改为本地时间 `datetime.now()`。
+新增文档后 `created_at` 即与界面/系统时间一致。
+
+自查（生产机）：
+
+```bash
+python3 -c "
+import datetime, time
+print('local:', datetime.datetime.now(), '| tz:', time.tzname)
+"
+timedatectl | grep -E 'Local time|Time zone'
+```
+
+> 历史已写入的 UTC 时间戳不会自动转换。若需修正，可在元数据里对
+> `created_at` 统一加 8 小时（注意别重复执行）。
+
+### Q13：去重记录状态速查（排查第一手依据）
 
 `config/.yzj_pull_synced.json` 的每条记录按 `<formInstId>` 索引：
 

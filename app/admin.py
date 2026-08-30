@@ -112,7 +112,8 @@ def verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    """当前时间（本地时区）。早期用 UTC，导致记录时间比界面显示慢 8 小时。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _conn() -> sqlite3.Connection:

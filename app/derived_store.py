@@ -92,8 +92,9 @@ def _merge_unfinished_lines(lines):
 
 
 def _now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    """当前时间（本地时区）。早期用 UTC，导致记录时间比界面显示慢 8 小时。"""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def split_blocks(text: str) -> list:

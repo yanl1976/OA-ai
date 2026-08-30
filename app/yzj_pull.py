@@ -813,8 +813,8 @@ def run_task(task, dry_run=False, limit=None, force=False):
                         "year": _extract_year(uniq, ""),
                         "chars": None,
                         "indexed": 0,
-                        # 与 kb_store._now() 同格式（UTC "YYYY-MM-DD HH:MM:SS"）
-                        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        # 与 kb_store._now() 同格式（本地时区 "YYYY-MM-DD HH:MM:SS"）
+                        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     })
                 if task.get("index_into_kb", True):
                     try:

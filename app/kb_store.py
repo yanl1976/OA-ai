@@ -1175,8 +1175,15 @@ def dedupe_uploads():
 
 
 def _now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    """当前时间字符串（本地时区）。
+
+    注意：早期实现用 datetime.now(timezone.utc)，写进去的是 UTC 时间，
+    而展示界面按本地时区解读，导致「记录时间比实际慢/快 8 小时」
+    （生产机时区 Asia/Shanghai，UTC+8）。这里统一改为本地时间，
+    保证「写入时间」与「界面/系统时间」一致。
+    """
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ============ 操作审计日志 ============
