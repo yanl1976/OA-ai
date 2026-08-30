@@ -28,6 +28,35 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "app"))
 
 
+def resolve_upload_dir(kb_store):
+    """探测真实的文件存放目录。
+
+    kb_store 的路径拼接为 KB_ROOT + "knowledge_base/uploads/files"，
+    但生产机 .env 的 KB_ROOT 常已指向 .../knowledge_base，导致拼出重复的
+    knowledge_base 而实际不存在（实测生产机即如此）。故这里做候选探测，
+    优先取真实存在的目录；也可用 --files-dir 显式指定。
+    """
+    kb_root = os.environ.get("KB_ROOT", "")
+    cands = [
+        getattr(kb_store, "UPLOAD_FILES_DIR", ""),
+        os.path.join(kb_root, "knowledge_base", "uploads", "files"),
+        os.path.join(kb_root, "uploads", "files"),
+        os.path.join(_ROOT, "knowledge_base", "uploads", "files"),
+    ]
+    for c in cands:
+        if c and os.path.isdir(c):
+            return c
+    # 兜底：在部署根下递归找名为 uploads/files 的目录
+    for base in [_ROOT, os.path.dirname(_ROOT), os.environ.get("KB_ROOT", "")]:
+        if not base or not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, _ in os.walk(base):
+            if os.path.basename(dirpath) == "files" and os.path.basename(os.path.dirname(dirpath)) == "uploads":
+                return dirpath
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git", "__pycache__")]
+    return ""
+
+
 def sniff_ext(raw: bytes) -> str:
     """按文件魔数判断真实类型。"""
     if raw[:4] == b"%PDF":
@@ -43,15 +72,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="实际执行修复（默认仅预览）")
     ap.add_argument("--root", default=_ROOT, help="部署根目录")
+    ap.add_argument("--files-dir", default="", help="显式指定上传文件目录（自动探测失败时用）")
     args = ap.parse_args()
 
     import kb_store
 
     ups = kb_store._load_uploads() or []
-    files_dir = kb_store.UPLOAD_FILES_DIR
+    root = args.files_dir or resolve_upload_dir(kb_store)
+    if not root:
+        print("错误：找不到 uploads 目录，请检查 KB_ROOT 配置；"
+              "可用 --files-dir 显式指定，例如"
+              " --files-dir /opt/OA-ai/knowledge_base/uploads/files")
+        return 1
     print("部署根目录:", args.root)
     print("uploads 条数:", len(ups))
-    print("文件目录:", files_dir)
+    print("文件目录:", root)
     print("模式:", "实际修复 --apply" if args.apply else "预览（不改动）")
     print("=" * 72)
 
@@ -63,10 +98,9 @@ def main():
         fn = u.get("filename") or ""
         if not rel:
             continue
-        abspath = os.path.join(kb_store.UPLOAD_DIR, rel)
+        abspath = os.path.join(root, rel)
         if not os.path.exists(abspath):
             continue
-        # 只看云之家拉取的（也可放开到全部）
         try:
             with open(abspath, "rb") as f:
                 head = f.read(8)
@@ -87,7 +121,7 @@ def main():
         new_fn = (fn[: -len(decl)] + real) if fn.lower().endswith(decl) else (fn + real)
 
         if args.apply:
-            new_abs = os.path.join(kb_store.UPLOAD_DIR, new_rel)
+            new_abs = os.path.join(root, new_rel)
             try:
                 os.makedirs(os.path.dirname(new_abs), exist_ok=True)
                 shutil.move(abspath, new_abs)
