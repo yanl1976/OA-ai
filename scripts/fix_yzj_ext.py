@@ -74,6 +74,8 @@ def main():
     ap.add_argument("--root", default=_ROOT, help="部署根目录")
     ap.add_argument("--files-dir", default="", help="显式指定上传文件目录（自动探测失败时用）")
     ap.add_argument("--meta", default="", help="显式指定 user_documents.json 路径")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="清理内容完全相同的冗余副本（保留 text 非空、命名更规范的那份）")
     args = ap.parse_args()
 
     import kb_store
@@ -226,10 +228,91 @@ def main():
         except Exception as e:  # noqa: BLE001
             print("保存失败: %s" % repr(e)[:200])
 
+    # ---------------- 冗余清理（--dedupe） ----------------
+    removed = 0
+    if args.dedupe:
+        print("\n" + "=" * 72)
+        print("=== 冗余清理（内容相同 md5 的重复项）===")
+        import hashlib as _hl
+
+        # 按内容 md5 分组（只看能读到文件的）
+        groups = {}
+        for u in ups:
+            if not isinstance(u, dict):
+                continue
+            rel = u.get("stored_path")
+            if not rel:
+                continue
+            ap = os.path.join(root, rel)
+            if not os.path.exists(ap):
+                continue
+            try:
+                h = _hl.md5(open(ap, "rb").read()).hexdigest()
+            except Exception:  # noqa: BLE001
+                continue
+            groups.setdefault(h, []).append((u, ap))
+
+        dups = {h: v for h, v in groups.items() if len(v) > 1}
+        print("内容相同的重复组: %d 组" % len(dups))
+
+        to_remove = []
+        for h, items in dups.items():
+            # 排序打分：优先保留「text 非空」「文件名不带日期前缀」「创建更早」的那份
+            def score(it):
+                u, _ap = it
+                has_text = 1 if (u.get("text") or "").strip() else 0
+                fn = u.get("filename") or ""
+                # 带日期前缀（如 20260731_）的说明是重名时产生的次选，优先级低
+                import re as _re
+                has_prefix = 1 if _re.match(r"^\d{8}_", fn) else 0
+                created = u.get("created_at") or ""
+                return (-has_text, has_prefix, created)
+
+            items_sorted = sorted(items, key=score)
+            keep, drop = items_sorted[0], items_sorted[1:]
+            print("\n  保留: %s" % keep[0].get("filename"))
+            print("        text=%d字 created=%s" % (
+                len(keep[0].get("text") or ""), keep[0].get("created_at")))
+            for u, ap in drop:
+                print("  删除: %s" % u.get("filename"))
+                print("        text=%d字 created=%s" % (
+                    len(u.get("text") or ""), u.get("created_at")))
+                to_remove.append((u, ap))
+
+        print("\n合计待删除: %d 份（保留 %d 份）" % (len(to_remove), len(dups)))
+
+        if args.apply and to_remove:
+            drop_ids = set(id(u) for u, _ in to_remove)
+            ok = 0
+            for u, ap in to_remove:
+                try:
+                    os.remove(ap)
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    print("  删除失败 %s: %s" % (ap, repr(e)[:100]))
+            ups = [u for u in ups if id(u) not in drop_ids]
+            # 保存元数据
+            try:
+                if meta_used and os.path.isfile(meta_used):
+                    import json as _json
+                    with open(meta_used, "w", encoding="utf-8") as f:
+                        _json.dump(ups, f, ensure_ascii=False)
+                    print("  已删除 %d 个文件并更新元数据" % ok)
+                else:
+                    kb_store._save_uploads(ups)
+                    print("  已删除 %d 个文件并更新元数据（默认路径）" % ok)
+            except Exception as e:  # noqa: BLE001
+                print("  保存元数据失败: %s" % repr(e)[:200])
+            removed = ok
+        elif to_remove:
+            print("\n确认无误后加 --apply 执行删除。")
+
     print("\n" + "=" * 72)
-    print("需修复: %d | 无需改动: %d | 失败: %d" % (fixed, skipped, failed))
-    if not args.apply and fixed:
-        print("\n确认无误后加 --apply 执行修复。")
+    print("需修复(改名): %d | 无需改动: %d | 失败: %d" % (fixed, skipped, failed))
+    if args.dedupe:
+        print("冗余删除: %d 份" % removed)
+    if not args.apply and (fixed or (args.dedupe and True)):
+        print("\n确认无误后加 --apply 执行。")
 
 
 if __name__ == "__main__":
