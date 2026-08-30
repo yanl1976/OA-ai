@@ -107,25 +107,67 @@ def main():
         return 0
 
     # 1) 删除文档
-    doc_ids = [u.get("doc_id") for u in todo if u.get("doc_id")]
-    removed = 0
-    if doc_ids and hasattr(kb_store, "delete_uploads_batch"):
-        try:
-            res = kb_store.delete_uploads_batch(doc_ids)
-            removed = res.get("deleted") or 0
-            print("已彻底删除文档: %d 条（含物理文件）" % removed)
-        except Exception as e:  # noqa: BLE001
-            print("批量删除失败: %s" % repr(e)[:200])
-            return 1
-    elif doc_ids:
-        # 兜底：逐个删（物理文件 + 元数据条目）
-        for did in doc_ids:
-            try:
-                kb_store.delete_upload(did)
-                removed += 1
-            except Exception:  # noqa: BLE001
-                pass
-        print("已删除文档: %d 条" % removed)
+    # 重要：不调用 kb_store.delete_uploads_batch —— 它内部读 kb_store.UPLOAD_FILE，
+    # 在生产机会拼出重复的 knowledge_base（KB_ROOT 已含该层级）而读到空数据，
+    # 导致 deleted=0「看似成功实则未删」（实测踩坑）。
+    # 故这里直接操作由 --meta 指定的元数据文件，路径明确、结果可验证。
+    doc_ids = set(u.get("doc_id") for u in todo if u.get("doc_id"))
+
+    # 物理文件基准目录候选：stored_path 可能是 "files/xxx.pdf"（相对 uploads 目录）
+    # 或 "xxx.pdf"（相对 files 目录），逐个尝试命中。
+    bases = [os.path.dirname(meta_used)]
+    _files_dir = os.path.join(os.path.dirname(meta_used), "files")
+    if os.path.isdir(_files_dir):
+        bases.append(_files_dir)
+    try:
+        for _c in (getattr(kb_store, "UPLOAD_FILES_DIR", ""),
+                   getattr(kb_store, "UPLOAD_DIR", "")):
+            if _c and os.path.isdir(_c) and _c not in bases:
+                bases.append(_c)
+    except Exception:  # noqa: BLE001
+        pass
+
+    removed_files = 0
+    for u in todo:
+        sp = u.get("stored_path")
+        if not sp:
+            continue
+        for b in bases:
+            p = os.path.join(b, sp)
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                    removed_files += 1
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+
+    # 从元数据中移除条目
+    before = len(ups)
+    ups = [u for u in ups if u.get("doc_id") not in doc_ids]
+    removed = before - len(ups)
+    try:
+        shutil.copy(meta_used, meta_used + ".bak")
+        with open(meta_used, "w", encoding="utf-8") as f:
+            json.dump(ups, f, ensure_ascii=False)
+        print("已删除文档条目: %d 条 | 物理文件: %d 个" % (removed, removed_files))
+        print("元数据已保存（备份: %s.bak）" % meta_used)
+    except Exception as e:  # noqa: BLE001
+        print("保存元数据失败: %s" % repr(e)[:200])
+        return 1
+
+    # 重建索引（让界面与检索立刻反映删除结果）
+    try:
+        if hasattr(kb_store, "rebuild_index_only"):
+            kb_store.rebuild_index_only()
+            print("索引已重建（rebuild_index_only）")
+        elif hasattr(kb_store, "rebuild_index"):
+            kb_store.rebuild_index()
+            print("索引已重建（rebuild_index）")
+        else:
+            print("提示：请在界面「系统设置 → 重建索引」手动执行")
+    except Exception as e:  # noqa: BLE001
+        print("重建索引失败（可在界面手动重建）: %s" % repr(e)[:150])
 
     # 2) 清空去重记录
     if not args.keep_synced and os.path.isfile(synced_path):
