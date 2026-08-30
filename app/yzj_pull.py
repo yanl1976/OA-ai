@@ -531,6 +531,8 @@ def run_task(task, dry_run=False, limit=None, force=False):
         if not inst_id:
             stats["skipped"] += 1
             continue
+        # 标记：本条是否处于「自愈重校验」中（是则跳过 alive 判断直接重拉）
+        _rechecking = False
         if inst_id in synced and not force:
             rec = synced[inst_id]
             note = rec.get("note")
@@ -544,24 +546,34 @@ def run_task(task, dry_run=False, limit=None, force=False):
             # 若确无附件则补写 ver=2 标记（此后不再重复校验），若有附件则清记录重拉。
             if note == "no-attachment":
                 if rec.get("ver") is None:
+                    # 自愈：清记录后必须直接进入下面的重拉流程。
+                    # 注意：此处不能继续往下走 alive 判断 —— no-attachment 记录没有
+                    # doc_ids，会 fallback 用「inst_id 末6位是否出现在旧文件名后缀里」
+                    # 判断存活，一旦后缀撞上（生产机存在带 _XXXXXX 后缀的旧文件）
+                    # 就会被误判为「已落盘」而 continue，导致自愈失效、
+                    # 这批单据永远拉不下来（实测 2024 年度 47 条因此卡住）。
                     del synced[inst_id]
                     stats["recheck"] = stats.get("recheck", 0) + 1
                     logger.info("重新校验旧 no-attachment 记录: %s", inst_id)
+                    _rechecking = True
                 else:
                     stats["skipped"] += 1
                     continue
-            # 文件可能因手动删除而不存在 → 校验文档是否仍存活，已删则移记录并重拉
-            doc_ids = rec.get("doc_ids") or []
-            if doc_ids:
-                alive = any(d in alive_doc_ids for d in doc_ids)
+            if _rechecking:
+                pass  # 自愈重校验：跳过 alive 判断，直接重拉
             else:
-                # 旧格式记录无 doc_ids：用文件名后缀兜底判断
-                alive = inst_id[-6:] in alive_suffix
-            if alive:
-                stats["skipped"] += 1
-                continue
-            # 文档已不存在（被手动删除）→ 清除去重记录，本次重新拉取
-            del synced[inst_id]
+                # 文件可能因手动删除而不存在 → 校验文档是否仍存活，已删则移记录并重拉
+                doc_ids = rec.get("doc_ids") or []
+                if doc_ids:
+                    alive = any(d in alive_doc_ids for d in doc_ids)
+                else:
+                    # 旧格式记录无 doc_ids：用文件名后缀兜底判断
+                    alive = inst_id[-6:] in alive_suffix
+                if alive:
+                    stats["skipped"] += 1
+                    continue
+                # 文档已不存在（被手动删除）→ 清除去重记录，本次重新拉取
+                del synced[inst_id]
         try:
             inst = view_form_inst(inst_id, form_code_id)
             form_info = (inst or {}).get("formInfo") or {}
