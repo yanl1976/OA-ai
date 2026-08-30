@@ -192,9 +192,14 @@ const filterSource = ref("all");
 
 async function loadSources() {
   try {
-    // 【范围约束】二次生成仅限「总经理会议纪要」来源文档（与后端 create_derived 校验一致）
-    const r = await api.documents({ category: "总经理会议纪要", page_size: 300 });
-    sources.value = r.items || [];
+    // 【范围约束·用 ID 管理】二次生成仅限「总经理类会议纪要」来源文档。
+    // 允许的分类集合由后端按分类 id 规则动态计算（改名/新增/删除子类自动同步），
+    // 前端不再写死任何分类名。先取「会议纪要」父级下全部，再按后端下发的名集合过滤。
+    const allowed = await api.derivedAllowedCategories();
+    const allowedNames = new Set(allowed.names || []);
+    const r = await api.documents({ category: "会议纪要", page_size: 300 });
+    const all = r.items || [];
+    sources.value = all.filter((s) => allowedNames.has(s.category));
   } catch (e) { notify(e.message || "加载来源失败", "err"); }
 }
 async function loadDerived(sourceDocId) {

@@ -9,14 +9,14 @@ const openDerivedInManage = inject("openDerivedInManage");
 const openDerivedForDoc = inject("openDerivedForDoc");
 const pendingDocId = inject("pendingDocId");
 const user = inject("user");
-// 纪要二次生成：① 需 derived.manage 权限；② 当前文档须属于「总经理会议纪要」分类
-// 【范围约束·2026-08-30】二次生成仅限「总经理会议纪要」来源文档（与后端 create_derived
-// 的来源分类校验保持一致）。此前曾放开为所有以「纪要」结尾的子类（如专项会议纪要），
-// 现按业务要求收窄为单一类目。
-const MINUTES_ALLOWED = ["总经理会议纪要"];
+// 纪要二次生成：① 需 derived.manage 权限；② 当前文档须属于「总经理类会议纪要」分类
+// 【范围约束·用 ID 管理】允许二次生成的分类集合由后端按分类 id 规则动态计算
+// （会议纪要父分类下、名称含「总经理」的子分类 id 集合），改名/新增/删除子类自动同步。
+// 前端拉取该集合判断，不写死任何分类名。
+const derivedAllowedNames = ref(new Set());
 function isMinutesCategory(cat) {
   if (!cat) return false;
-  return MINUTES_ALLOWED.includes(String(cat).trim());
+  return derivedAllowedNames.value.has(String(cat));
 }
 // 当前文档是否为「纪要类」（仅用于判断是否可展示二次生成入口）
 const isMinutesDoc = computed(() => isMinutesCategory(docDetail.value?.category));
@@ -196,6 +196,11 @@ onMounted(async () => {
   loadCats();
   await loadDocs();
   if (pendingDocId.value) await applyPendingDoc();
+  // 拉取允许二次生成的分类集合（后端按 id 规则动态计算），用于判断按钮可见性
+  try {
+    const r = await api.derivedAllowedCategories();
+    derivedAllowedNames.value = new Set(r.names || []);
+  } catch (e) { /* 非致命：失败则按钮默认不显示 */ }
 });
 </script>
 

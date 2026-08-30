@@ -1165,14 +1165,18 @@ def kb_doc_delete(doc_id):
 @app.route("/api/kb/uploads")
 @login_required("kb.upload.manage")
 def kb_uploads_list():
-    """上传文件管理：列表（支持关键词 q 与分页）。"""
+    """上传文件管理：列表（支持关键词 q、分页、source 标签过滤）。
+
+    source: upload=手动上传 / yunzhijia=云之家拉取 / 不传=全部。
+    """
     q = request.args.get("q", "").strip()
+    source = request.args.get("source", "").strip() or None
     try:
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 50))
     except ValueError:
         page, page_size = 1, 50
-    return jsonify(kb_store.list_uploads(q, page, page_size))
+    return jsonify(kb_store.list_uploads(q, page, page_size, source_filter=source))
 
 
 @app.route("/api/kb/upload-status")
@@ -1844,6 +1848,17 @@ def sys_info_set():
 
 
 # ===================== 会议纪要二次生成 API =====================
+@app.route("/api/derived/allowed-categories")
+@login_required("derived.manage")
+def derived_allowed_categories():
+    """返回允许二次生成的分类（id+name 集合）。
+
+    范围以分类 id 标识（会议纪要父分类下名称含「总经理」的子分类），改名自动同步，
+    前端据此判断「某文档是否可二次生成」，后端 create_derived 用同一 ID 集合校验。
+    """
+    return jsonify(derived_store.list_derived_allowed_categories())
+
+
 @app.route("/api/derived/list")
 @login_required("derived.manage")
 def derived_list():

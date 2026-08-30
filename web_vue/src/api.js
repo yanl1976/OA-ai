@@ -169,6 +169,8 @@ export const api = {
     "/api/derived/" + id + "/source-pdf" + (inline ? "?inline=1" : ""),
   // 衍生版本父子血缘（来源纪要 + 祖先链 + 下游子版本）
   derivedLineage: (id) => api.get("/api/derived/" + id + "/lineage"),
+  // 允许二次生成的分类集合（id+name，后端按 id 规则动态计算，改名自动同步）
+  derivedAllowedCategories: () => api.get("/api/derived/allowed-categories"),
 
   // ============ 对话式智能问答 ============
   chatScope: () => api.get("/api/kb/chat/scope"),

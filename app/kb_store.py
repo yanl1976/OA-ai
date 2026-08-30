@@ -716,7 +716,8 @@ def _resolve_doc_id_conflict(doc_id: str, raw_bytes: bytes, ups: list) -> str:
     return doc_id
 
 
-def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = None) -> str:
+def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = None,
+                     source: str = "upload") -> str:
     """仅落盘原始二进制 + 占位 entry（text 暂空），极快，供上传接口同步返回。
 
     真正的文本提取/结构化（extract + post_process）由后台任务异步补写，
@@ -772,6 +773,7 @@ def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = 
                  "stored_path": stored_rel,
                  "mimetype": mimetype,
                  "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None,
+                 "source": source,
                  "indexed": 0}   # indexed=0 标记尚未经后台提取/建索引
         existed = False
         for u in ups:
@@ -904,15 +906,20 @@ def clear_extract() -> int:
 
 
 def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
-                 include_deleted: bool = False) -> dict:
+                 include_deleted: bool = False, source_filter: str = None) -> dict:
     """返回上传文档管理列表（含归类/年代/存储路径/原文件状态），支持关键词与分页。
 
     include_deleted=False（默认）时仅列出活跃文档；回收站页单独调用 list_trash。
+    source_filter: 按来源过滤 uploads/raw 之外，额外支持 "upload"(手动上传) /
+    "yunzhijia"(云之家拉取) 两个标签分开展示。None=全部。
     """
     ups = _load_uploads()
     items = []
     for u in ups:
         if u.get("deleted") and not include_deleted:
+            continue
+        src = u.get("source", "upload")
+        if source_filter and src != source_filter:
             continue
         text = u.get("text", "") or ""
         p = _resolve_binary_path(u)
@@ -928,7 +935,7 @@ def list_uploads(q: str = None, page: int = 1, page_size: int = 50,
             "deleted": bool(u.get("deleted")),
             "deleted_at": u.get("deleted_at", ""),
             "tags": u.get("tags", []),
-            "source": "upload",
+            "source": src,
             "stored": bool(p),
             "storage_path": u.get("stored_path"),
             "mimetype": u.get("mimetype"),

@@ -18,6 +18,11 @@ import os
 import json
 import re
 import uuid
+import sqlite3
+
+# 复用 admin 的分类表访问（DB_PATH），kb_store 的分类函数（category_id_by_name）
+import admin
+import kb_store  # 避免循环导入：kb_store 不依赖 derived_store
 
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 KB_DIR = os.path.join(KB_ROOT, "knowledge_base")
@@ -713,6 +718,49 @@ def _extract_year(filename: str, content: str):
     return None
 
 
+def _derived_root_category_id():
+    """二次生成根域：会议纪要（按名动态解析 id，不写死具体数字）。"""
+    return kb_store.category_id_by_name("会议纪要")
+
+
+def _derived_allowed_category_ids():
+    """二次生成允许的分类 ID 集合（稳定，不依赖分类名）。
+
+    【用 ID 管理范围，抗改名】
+    规则：会议纪要父分类下、名称含「总经理」的所有子分类 id。
+    改名/新增/删除子类均自动同步——真正以分类 id 作为范围标识，
+    而非写死某个分类名（名称后期随时会变）。
+    """
+    root = _derived_root_category_id()
+    if root is None:
+        return set()
+    ids = set()
+    con = sqlite3.connect(admin.DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        for r in con.execute("SELECT id,name,parent_id FROM categories"):
+            if r["parent_id"] == root and (r["name"] or "").find("总经理") >= 0:
+                ids.add(r["id"])
+    finally:
+        con.close()
+    return ids
+
+
+def list_derived_allowed_categories() -> dict:
+    """供前端使用的「允许二次生成的分类」（名+id），由后端按 ID 规则动态计算。
+
+    前端展示范围用此集合，后端校验也用同一 ID 集合——改名自动同步，不写死。
+    """
+    ids = _derived_allowed_category_ids()
+    con = sqlite3.connect(admin.DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = {r["id"]: r["name"] for r in con.execute("SELECT id,name FROM categories")}
+    finally:
+        con.close()
+    return {"ids": list(ids), "names": [rows[i] for i in ids if i in rows]}
+
+
 def list_derived(source_doc_id: str = None) -> list:
     """列出衍生版本。可按来源纪要过滤；按创建时间倒序。"""
     items = _load()
@@ -756,8 +804,12 @@ def create_derived(data: dict) -> dict:
     # 既保证前端入口范围（KbBrowse.canDerived）与后端一致，也阻断绕过前端直调 API。
     _src = get_source_summary(source_doc_id) if source_doc_id else None
     _src_cat = (_src or {}).get("category", "")
-    if _src_cat != "总经理会议纪要":
-        raise ValueError("二次生成仅支持「总经理会议纪要」来源文档（当前来源分类：%s）" % _src_cat)
+    # 【范围约束·用 ID 管理】仅限「总经理类会议纪要」来源文档。
+    # 以分类 id 作为范围标识（会议纪要父分类下、名称含「总经理」的子分类 id 集合），
+    # 分类改名/新增/删除均自动同步，彻底摆脱对分类名的依赖。
+    _src_cat_id = kb_store.category_id_by_name(_src_cat)
+    if _src_cat_id not in _derived_allowed_category_ids():
+        raise ValueError("二次生成仅支持「总经理类会议纪要」来源文档（当前来源分类：%s）" % _src_cat)
     tpl = data.get("template")
     renumber = bool(data.get("renumber"))
     # 有模板则按模板重排正文，保证模板模式下存储正文始终符合版式

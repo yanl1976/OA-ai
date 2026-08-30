@@ -13,6 +13,15 @@ const q = ref("");
 const cats = ref([]);
 const loading = ref(false);
 
+// 来源分标签：手动上传 / 云之家拉取（两者分开管理，互不混杂）
+const activeTab = ref("upload"); // upload=手动上传, yunzhijia=云之家拉取
+function switchTab(tab) {
+  if (activeTab.value === tab) return;
+  activeTab.value = tab;
+  page.value = 1;
+  load();
+}
+
 // 后台提取轮询：当列表中存在「未识别」(indexed=0) 的活跃文档时，自动刷新列表，
 // 使「重新提取」后状态/字数能即时从「已识别/字数」→「未识别/0」→回填 可视化。
 const pollingTimer = ref(null);
@@ -85,7 +94,8 @@ async function loadCats() {
 async function load() {
   loading.value = true;
   try {
-    const r = await api.uploads({ q: q.value, page: page.value, page_size: pageSize });
+    const r = await api.uploads({ q: q.value, page: page.value, page_size: pageSize,
+      source: activeTab.value });
     items.value = r.items || [];
     total.value = r.total || 0;
   } catch (e) {
@@ -238,6 +248,15 @@ onUnmounted(() => stopPolling());
   <h2>上传文件管理</h2>
   <p class="muted">查看、调整归类或删除已上传的文档（仅作用于上传文档，不影响原始文档库）。</p>
 
+  <div class="tabs">
+    <button class="tab" :class="{ active: activeTab === 'upload' }" @click="switchTab('upload')">
+      手动上传
+    </button>
+    <button class="tab" :class="{ active: activeTab === 'yunzhijia' }" @click="switchTab('yunzhijia')">
+      云之家拉取
+    </button>
+  </div>
+
   <div class="toolbar">
     <input class="input" v-model="q" placeholder="搜索文件名 / 分类…" style="max-width:300px"
            @keyup.enter="search" />
@@ -263,7 +282,8 @@ onUnmounted(() => stopPolling());
           <td class="mid"><input type="checkbox" :checked="isSelected(d.doc_id)" @change="toggleSelect(d.doc_id)" /></td>
           <td class="mid">
             <a class="link" @click="openDoc(d)">{{ d.filename }}</a>
-            <span class="badge" style="margin-left:6px">上传</span>
+            <span class="badge yzj" v-if="d.source === 'yunzhijia'" style="margin-left:6px">云之家</span>
+            <span class="badge" v-else style="margin-left:6px">上传</span>
           </td>
           <td class="mid">
             <template v-if="reclassId === d.doc_id">
@@ -353,6 +373,11 @@ onUnmounted(() => stopPolling());
 </template>
 
 <style scoped>
+.tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.tab { padding: 7px 18px; border: 1px solid #dcdcdc; background: #fff; color: #555;
+  border-radius: 8px; cursor: pointer; font-size: 14px; line-height: 1; transition: all .15s; }
+.tab:hover { border-color: var(--primary); color: var(--primary); }
+.tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 .pager { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center;
   margin-top: 18px; }
 .pg { min-width: 34px; padding: 5px 10px; border: 1px solid #dcdcdc; background: #fff; color: #555;
@@ -365,6 +390,7 @@ onUnmounted(() => stopPolling());
 .link:hover { color: var(--primary-d); }
 .mini-tag { display: inline-block; background: #f0f4f8; color: #555; border-radius: 4px;
   padding: 1px 6px; font-size: 11px; margin: 0 4px 2px 0; }
+.badge.yzj { background: #fff7e6; color: #ad6800; border: 1px solid #ffd591; }
 .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex;
   align-items: center; justify-content: center; z-index: 100; }
 .modal { background: #fff; border-radius: 10px; padding: 20px 24px; width: 360px; box-shadow: 0 8px 30px rgba(0,0,0,.2); }
