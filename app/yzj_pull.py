@@ -22,6 +22,30 @@ import logging
 
 logger = logging.getLogger("yzj_pull")
 
+# ---------------- 任务运行态（供前端轮询 / 中止） ----------------
+# _PROGRESS[task_id] = {"running": bool, "aborted": bool, "total": int,
+#                       "processed": int, "stats": {...}, "started_at": ts, "done_at": ts}
+# _ABORT[task_id]    = True 时 run_task 在下一轮循环break退出。
+_PROGRESS = {}
+_ABORT = {}
+
+
+def get_progress(task_id):
+    return _PROGRESS.get(task_id)
+
+
+def request_abort(task_id):
+    _ABORT[task_id] = True
+    p = _PROGRESS.get(task_id)
+    if p:
+        p["aborted"] = True
+
+
+def reset_progress(task_id):
+    _PROGRESS.pop(task_id, None)
+    _ABORT.pop(task_id, None)
+
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
@@ -149,7 +173,9 @@ def _collect_attachment_files(form_data):
         for item in vals:
             if not isinstance(item, dict):
                 continue
-            fid = item.get("sealedFileId") or item.get("wpsFileId") or item.get("fileId")
+            # 与 sync_yzj_minutes.py 一致：优先取盖章 pdf（sealedFileId），
+            # 否则回退 wpsFileId（原文件）/ redFileId（红头文件实例 id）。
+            fid = item.get("sealedFileId") or item.get("wpsFileId") or item.get("redFileId")
             if not fid:
                 continue
             fname = (item.get("wpsFileName") or item.get("sealedFileName")
@@ -181,7 +207,15 @@ def run_task(task, dry_run=False, limit=None, force=False):
     import extract_text
     from sync_yzj_minutes import _auto_classify
 
+    task_id = task.get("id")
     stats = {"task": task.get("name"), "found": 0, "downloaded": 0, "tried": 0, "skipped": 0, "failed": 0, "errors": []}
+    # 初始化运行态（供前端轮询/中止）
+    _PROGRESS[task_id] = {
+        "running": True, "aborted": False, "total": 0,
+        "processed": 0, "stats": stats,
+        "started_at": int(time.time()), "done_at": None,
+    }
+    _ABORT.pop(task_id, None)
 
     # 1) 解析目标模板 form_code_id
     form_code_id = task.get("form_code_id")
@@ -232,6 +266,9 @@ def run_task(task, dry_run=False, limit=None, force=False):
         return stats
 
     stats["found"] = len(flows)
+    if task_id in _PROGRESS:
+        _PROGRESS[task_id]["total"] = len(flows)
+        _PROGRESS[task_id]["stats"] = stats
     synced = _load_synced()
     cat = task.get("target_category") or "会议纪要"
 
@@ -274,6 +311,11 @@ def run_task(task, dry_run=False, limit=None, force=False):
 
     processed = 0
     for idx, fl in enumerate(flows):
+        # 中止检查：前端请求终止时，本轮之后立即退出（已下载的保留，未处理的跳过）
+        if _ABORT.get(task_id):
+            logger.info("任务 %s 被用户中止，已处理 %d/%d", task_id, processed, len(flows))
+            stats["aborted"] = True
+            break
         if batch_size is not None and processed >= batch_size:
             break
         inst_id = fl.get("formInstId") or fl.get("formInstId", "")
@@ -338,9 +380,17 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 if not raw:
                     stats["failed"] += 1
                     continue
-                # 文件名带 inst_id 片段防重名冲突
-                base, ext = os.path.splitext(fname)
-                uniq = "%s_%s%s" % (base, inst_id[-6:], ext or "")
+                # 与 sync_yzj_minutes.py 保持一致（已验证通过的口径）：
+                # 1) 下载的是「盖章版 PDF」，故落盘文件名统一 .pdf —— 去掉原文件名的
+                #    .docx/.doc/.pdf 等扩展名后统一加 .pdf，避免「内容=PDF 但文件名=docx」
+                #    导致 extract_text 按 docx 解析器去解 PDF 字节流而提取失败。
+                # 2) 不再拼接 inst_id 片段（doc_id 已全局唯一，避免文件名末尾多出随机码）。
+                base, _decl_ext = os.path.splitext(fname)
+                for _e in (".docx", ".doc", ".pdf", ".DOCX", ".DOC", ".PDF"):
+                    if base.lower().endswith(_e.lower()):
+                        base = base[: -len(_e)]
+                        break
+                uniq = (base.strip() or ("file_%s" % fi["file_id"])) + ".pdf"
                 # 自动归类（按文件名/标题关键词匹配分类树，校验存在，否则兜底 target_category）
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
@@ -361,11 +411,21 @@ def run_task(task, dry_run=False, limit=None, force=False):
             logger.warning("处理流程 %s 失败: %s", inst_id, e)
             processed += 1
 
+        # 实时回写进度（供前端轮询）
+        if task_id in _PROGRESS:
+            _PROGRESS[task_id]["processed"] = processed
+            _PROGRESS[task_id]["stats"] = stats
+
         # 限流：每条流程处理完后间隔 interval_sec 秒，防止请求过密被封 IP
         if interval_sec > 0 and not (batch_size is not None and processed >= batch_size):
             time.sleep(interval_sec)
 
     _save_synced(synced)
+    # 标记运行态结束
+    if task_id in _PROGRESS:
+        _PROGRESS[task_id]["running"] = False
+        _PROGRESS[task_id]["done_at"] = int(time.time())
+        _PROGRESS[task_id]["stats"] = stats
     return stats
 
 

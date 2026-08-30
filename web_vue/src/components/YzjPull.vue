@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, inject } from "vue";
+import { ref, onMounted, onUnmounted, inject } from "vue";
 import { api } from "../api.js";
 
 const notify = inject("notify");
@@ -12,9 +12,11 @@ const pulledDocs = ref([]);
 const showEditor = ref(false);
 const editing = ref(null); // 当前编辑的任务副本
 const saving = ref(false);
-const runningId = ref(null);
+const runningId = ref(null);   // 当前正在后台跑的任务 id
 const lastStat = ref(null);
 const forceNow = ref(false);
+const pollTimer = ref(null);
+const pollErr = ref("");
 
 const SCHEDULE_OPTS = [
   { v: "manual", t: "手动触发" },
@@ -135,17 +137,69 @@ async function toggleEnabled(t) {
 }
 
 async function runTask(t, dry) {
+  // 触发后端异步执行（立即返回，任务在后台线程跑，切换页面/路由不影响）
   runningId.value = t.id;
   lastStat.value = null;
+  pollErr.value = "";
   try {
     const r = await api.yzjTaskRun(t.id, { dry_run: dry, limit: dry ? 3 : null, force: forceNow.value });
-    lastStat.value = { ...r.stats, _dry: !!dry };
-    notify((dry ? "试跑完成：" : "执行完成：") + JSON.stringify(r.stats), "ok");
+    if (r.already_running) {
+      notify("该任务已在后台运行，已切换到进度跟踪", "ok");
+    } else {
+      notify(dry ? "试跑已启动（后台执行）" : "拉取已启动（后台执行）", "ok");
+    }
+    startPoll(t.id);
   } catch (e) {
     notify(e.message, "err");
-  } finally {
     runningId.value = null;
   }
+}
+
+async function abortTask(t) {
+  try {
+    await api.yzjTaskAbort(t.id);
+    notify("已发送终止请求，任务将尽快停止", "ok");
+  } catch (e) {
+    notify(e.message, "err");
+  }
+}
+
+function stopPoll() {
+  if (pollTimer.value) {
+    clearInterval(pollTimer.value);
+    pollTimer.value = null;
+  }
+}
+
+async function startPoll(id) {
+  stopPoll();
+  const tick = async () => {
+    try {
+      const r = await api.yzjTaskStatus(id);
+      const p = r.progress || {};
+      const st = p.stats || {};
+      // 把最新进度同步给展示区（即使切换页面后重新进入也能续显）
+      lastStat.value = { ...st, _dry: st.get ? false : (lastStat.value && lastStat.value._dry) };
+      if (!p.running) {
+        // 完成（含被中止）：停轮询、刷新文档列表
+        stopPoll();
+        runningId.value = null;
+        if (st.aborted) notify("任务已中止", "ok");
+        await loadPulledDocsOnly();
+      }
+    } catch (e) {
+      pollErr.value = e.message;
+    }
+  };
+  await tick();
+  pollTimer.value = setInterval(tick, 1500);
+}
+
+async function loadPulledDocsOnly() {
+  try {
+    const pd = await api.yzjPulledDocs({ page_size: 100 });
+    pulledDocs.value = pd.items || [];
+  } catch (e) { /* 忽略 */ }
 }
 
 function scheduleText(t) {
@@ -158,7 +212,25 @@ function scheduleText(t) {
   return "-";
 }
 
-onMounted(load);
+onMounted(async () => {
+  await load();
+  // 恢复轮询：若组件挂载时后端仍有正在跑的任务，自动续接进度显示
+  for (const t of tasks.value) {
+    try {
+      const r = await api.yzjTaskStatus(t.id);
+      if (r.progress && r.progress.running) {
+        runningId.value = t.id;
+        lastStat.value = { ...(r.progress.stats || {}), _dry: false };
+        startPoll(t.id);
+        break;
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+});
+
+// 切换页面时仅停止前端轮询定时器；后端任务在后台线程继续跑，
+// 再次进入本组件时 onMounted 会自动恢复进度跟踪，故「切页不会终止拉取」。
+onUnmounted(stopPoll);
 </script>
 
 <template>
@@ -196,8 +268,9 @@ onMounted(load);
           <td class="ops">
             <button class="btn sm" :disabled="runningId===t.id" @click="runTask(t, false)">立即拉取</button>
             <button class="btn sm" :disabled="runningId===t.id" @click="runTask(t, true)">试跑</button>
+            <button class="btn sm warn" v-if="runningId===t.id" @click="abortTask(t)">终止</button>
             <button class="btn sm" @click="openEdit(t)">编辑</button>
-            <button class="btn sm danger" @click="removeTask(t)">删除</button>
+            <button class="btn sm danger" :disabled="runningId===t.id" @click="removeTask(t)">删除</button>
           </td>
         </tr>
         <tr v-if="!tasks.length"><td colspan="9" class="loading">暂无拉取任务</td></tr>
@@ -206,14 +279,22 @@ onMounted(load);
     </template>
 
     <div v-if="lastStat" class="stat-box">
-      <b>上次执行结果（{{ lastStat._dry ? "试跑" : "正式" }} · {{ lastStat.task }}）：</b>
-      <template v-if="lastStat._dry">
-        发现 {{ lastStat.found }} · 试跑命中 {{ lastStat.tried }}（未落盘）· 跳过 {{ lastStat.skipped }} · 失败 {{ lastStat.failed }}
+      <b>执行结果（{{ lastStat._dry ? "试跑" : "正式" }} · {{ lastStat.task }}）：</b>
+      <template v-if="runningId">
+        <span class="running">后台运行中…</span>
+        已处理 {{ lastStat.processed || 0 }} / {{ lastStat.total || lastStat.found || "?" }}
       </template>
       <template v-else>
-        发现 {{ lastStat.found }} · 落盘 {{ lastStat.downloaded }} · 跳过 {{ lastStat.skipped }} · 失败 {{ lastStat.failed }}
+        <template v-if="lastStat._dry">
+          发现 {{ lastStat.found }} · 试跑命中 {{ lastStat.tried }}（未落盘）· 跳过 {{ lastStat.skipped }} · 失败 {{ lastStat.failed }}
+        </template>
+        <template v-else>
+          发现 {{ lastStat.found }} · 落盘 {{ lastStat.downloaded }} · 跳过 {{ lastStat.skipped }} · 失败 {{ lastStat.failed }}
+        </template>
+        <span v-if="lastStat.aborted" class="aborted">（已中止）</span>
       </template>
       <span v-if="lastStat.errors && lastStat.errors.length">；错误：{{ lastStat.errors.slice(0,3).join("; ") }}</span>
+      <span v-if="pollErr" class="poll-err">；进度获取失败：{{ pollErr }}</span>
     </div>
 
     <div class="pulled">
@@ -373,6 +454,11 @@ onMounted(load);
 .tbl th { background: #f8fafc; }
 .ops { display: flex; gap: 4px; flex-wrap: wrap; }
 .stat-box { margin-top: 12px; padding: 10px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 13px; }
+.stat-box .running { color: #2563eb; font-weight: 600; margin-right: 6px; }
+.stat-box .aborted { color: #d97706; font-weight: 600; }
+.stat-box .poll-err { color: #dc2626; }
+.btn.warn { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+.btn.warn:hover { background: #fde68a; }
 .force-row { margin: 10px 0; font-size: 13px; color: #475569; }
 .pulled { margin-top: 20px; }
 .pulled h3 { font-size: 14px; margin: 0 0 8px; color: #334155; }

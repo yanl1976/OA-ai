@@ -1760,6 +1760,7 @@ def yzj_task_delete(task_id):
 @login_required("system.manage")
 def yzj_task_run(task_id):
     import yzj_pull
+    import threading
     body = request.get_json(silent=True) or {}
     task = yzj_pull.get_task(task_id)
     if not task:
@@ -1767,11 +1768,46 @@ def yzj_task_run(task_id):
     dry = bool(body.get("dry_run"))
     limit = body.get("limit")
     force = bool(body.get("force"))
-    try:
-        stats = yzj_pull.run_task(task, dry_run=dry, limit=limit, force=force)
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True, "stats": stats})
+    # 若同任务已在运行，先不重复启动（避免并发写同一去重文件）
+    cur = yzj_pull.get_progress(task_id)
+    if cur and cur.get("running"):
+        return jsonify({"ok": True, "already_running": True, "task_id": task_id})
+    # 异步后台执行：前端立即拿到响应，切换页面/轮询 /status 都不影响任务继续跑
+    def _worker():
+        try:
+            yzj_pull.run_task(task, dry_run=dry, limit=limit, force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.error("云之家拉取任务 %s 异常: %s", task_id, e)
+            p = yzj_pull.get_progress(task_id)
+            if p:
+                p["running"] = False
+                p.setdefault("stats", {})["errors"] = p["stats"].get("errors", []) + ["%s" % e]
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "task_id": task_id, "started": True})
+
+
+@app.route("/api/yzj/abort/<task_id>", methods=["POST"])
+@login_required("system.manage")
+def yzj_task_abort(task_id):
+    import yzj_pull
+    yzj_pull.request_abort(task_id)
+    return jsonify({"ok": True, "aborted": True, "task_id": task_id})
+
+
+@app.route("/api/yzj/status/<task_id>", methods=["GET"])
+@login_required("system.manage")
+def yzj_task_status(task_id):
+    import yzj_pull
+    p = yzj_pull.get_progress(task_id) or {}
+    return jsonify({"ok": True, "progress": p})
+
+
+@app.route("/api/yzj/progress", methods=["GET"])
+@login_required("system.manage")
+def yzj_task_progress_all():
+    import yzj_pull
+    return jsonify({"ok": True, "progress": yzj_pull._PROGRESS})
 
 
 @app.route("/api/yzj/pulled-docs")
