@@ -70,6 +70,21 @@
 > **接口参考**：云之家 API 的请求/响应结构、附件两种控件（`Ps_0` list / `Kg_0` dict）字段对照、
 > 下载策略与排查命令，见 **[`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)**。
 
+**从零重拉（数据混乱时最省事的办法）**：`scripts/reset_yzj_pull.py`
+删除云之家文档（物理文件 + 条目 + 重建索引）并清空去重记录，之后重新拉取即得干净数据。
+**不会碰手动上传的文档**。
+
+```bash
+# 预览（默认只删今天拉取的）
+/opt/OA-ai/venv/bin/python scripts/reset_yzj_pull.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json
+# 确认后执行
+/opt/OA-ai/venv/bin/python scripts/reset_yzj_pull.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json --apply
+# 删除全部云之家文档（不限今天）：加 --all
+# 只删文档但保留去重记录：加 --keep-synced
+```
+
 运维脚本 `scripts/fix_yzj_ext.py`：修复历史「名实不符」文件（`.docx` 名 + PDF 内容等）。
 ```bash
 /opt/OA-ai/venv/bin/python scripts/fix_yzj_ext.py \
