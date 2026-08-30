@@ -33,8 +33,9 @@ config/.env.*
 **/.env
 !.env.example
 !config/.env.example
-# 云之家拉取任务配置与去重记录（运行时生成，含本地拉取状态，不入库）
-config/yzj_pull_tasks.json
+# 云之家拉取：任务配置需入版本库（须能随 git 同步到各环境，
+# 否则开发机改的配置永远到不了生产机，会出现「开发机拉全部、生产机只拉 N 条」的偏差）；
+# 去重记录 .yzj_pull_synced.json 才是运行时本地状态，保持忽略、各环境独立。
 config/.yzj_pull_synced.json
 
 # 索引重建前的本地备份（_backup_index_<时间戳>/）。

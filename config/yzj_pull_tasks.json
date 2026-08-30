@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "batch_size": 0,
+      "download_attachments": true,
+      "enabled": true,
+      "end_date": "",
+      "form_code_id": "",
+      "id": "minutes",
+      "index_into_kb": true,
+      "interval_sec": 3,
+      "name": "会议纪要",
+      "recent_days": 7,
+      "schedule": "daily",
+      "schedule_hour": 2,
+      "schedule_minute": 0,
+      "schedule_weekday": 1,
+      "start_date": "",
+      "status": "FINISH",
+      "target_category": "会议纪要",
+      "template_name": "会议纪要",
+      "time_range": "all"
+    }
+  ]
+}
