@@ -870,10 +870,28 @@ if alive:
 # 确认无误后加 --apply
 ```
 
-`--dedupe` 按内容 md5 分组，保留策略（打分优先级）：
-1. `text` 非空的优先
-2. 文件名**不带** `YYYYMMDD_` 前缀的优先（符合「仅重名才加前缀」规范）
-3. 创建时间更早的优先
+`--dedupe` 按内容 **md5** 分组，每组保留 1 份、删除其余。
+
+**保留判据（只用这两条，不使用文件名前缀）**：
+1. `text` 非空的优先（旧残留通常 `text` 为空）
+2. 创建时间更早的优先（后拉的是重复）
+
+> ⚠️ **为什么不用「有无 `YYYYMMDD_` 前缀」当判据**：
+> 带前缀的文件**未必是冗余**——它们可能是「重名但内容不同」的真实文档
+> （如 `20240929_` / `20240923_` / `20240918_` 是不同日期的天传所例会，
+> md5 各不相同，本就不会进入 dedupe 流程）。用前缀当判据会误导，
+> 也会让人误以为「带前缀的就要删」。同组内 md5 已相同，按创建时间删较晚那份最稳妥。
+
+**判定对照表**：
+
+| 情形 | md5 | 处理 |
+|---|---|---|
+| 同份文件被重复拉取（跨天、或重名后加前缀） | 相同 | ✅ 保留较早那份，删其余 |
+| 不同日期的例会（文件名重名 → 加前缀区分） | **不同** | ❌ 不参与，全部保留 |
+| 旧残留（`text` 为空）+ 已存在新版本 | 相同 | ✅ 删旧残留 |
+
+输出中会打印每组的 md5 前 10 位与「共 N 份（内容完全相同）」字样，便于人工核对。
+
 
 仅改名（不含 `--dedupe`）用于处理「名实不符且无对应新版本」的文件：
 
@@ -919,7 +937,56 @@ if alive:
 sudo apt-get install -y antiword
 ```
 
-### Q11：去重记录状态速查（排查第一手依据）
+### Q11：「文件列表都在，但看不到文件」——先查软删，别急着重下载
+
+**实测结论（2026-08-30）**：生产机 344 条元数据中，**物理文件缺失 0 个**。
+「列表有条目但界面看不到」几乎都不是文件丢失，而是 **`deleted=1` 软删**——
+所有接口均以 `not u.get("deleted")` 过滤，软删文档界面完全不显示，但**物理文件与正文都在**。
+
+自查（生产机）：
+
+```bash
+python3 -c "
+import json, os
+base='/opt/OA-ai/knowledge_base/uploads'
+ups=json.load(open(base+'/user_documents.json',encoding='utf-8'))
+if isinstance(ups,dict): ups=ups.get('items') or []
+miss=[u for u in ups if u.get('stored_path') and not os.path.exists(os.path.join(base,u['stored_path']))]
+print('元数据',len(ups),'| 物理文件缺失',len(miss),'| 软删',len([u for u in ups if u.get('deleted')]))
+"
+```
+
+- `物理文件缺失 = 0` → 是软删，**用恢复脚本**，无需重新下载
+- `物理文件缺失 > 0` → 才是真丢失，需从备份或重新上传
+
+恢复脚本 `scripts/restore_deleted_docs.py`（默认预览，`--apply` 执行）：
+
+```bash
+# 按文件名关键词
+/opt/OA-ai/venv/bin/python scripts/restore_deleted_docs.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json \
+  --match "2025.3.11" --match "呆滞物料" --rebuild-index --apply
+
+# 按 doc_id（可重复）
+/opt/OA-ai/venv/bin/python scripts/restore_deleted_docs.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json \
+  --doc-id up_142770527602 --doc-id up_414452157707 --rebuild-index --apply
+
+# 恢复全部云之家文档，跳过正文异常巨大的（如 .doc 解析出上百万字）
+/opt/OA-ai/venv/bin/python scripts/restore_deleted_docs.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json \
+  --source yunzhijia --max-text 1000000 --rebuild-index --apply
+```
+
+> `--rebuild-index` 会在恢复后重建检索索引，否则界面可能仍检索不到（推荐加上）。
+> 执行前自动备份元数据到 `user_documents.json.bak`。
+
+**为什么不能「按列表自动从云之家重新下载」**：
+落盘元数据只记录 `source: "yunzhijia"`，**不保存 `formInstId` / `fileId`**，
+无法从元数据反查云之家单据。若确需重下，只能用拉取任务的 `synced` 记录
+（`config/.yzj_pull_synced.json` 中的 `formInstId`）定位，或清去重后整轮重拉。
+
+### Q12：去重记录状态速查（排查第一手依据）
 
 `config/.yzj_pull_synced.json` 的每条记录按 `<formInstId>` 索引：
 
