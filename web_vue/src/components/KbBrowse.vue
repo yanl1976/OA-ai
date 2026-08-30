@@ -9,18 +9,14 @@ const openDerivedInManage = inject("openDerivedInManage");
 const openDerivedForDoc = inject("openDerivedForDoc");
 const pendingDocId = inject("pendingDocId");
 const user = inject("user");
-// 纪要二次生成：① 需 derived.manage 权限；② 当前文档须属于「会议纪要」分类域
-// 【修复·按钮不显示】原判断为 category === "会议纪要" 严格相等，而纪要已细分出
-// 「总经理会议纪要」「专项会议纪要」等子分类（由上传校验按文件名自动归位），
-// 文档 category 存的是子分类名，严格相等永不成立 → 按钮一直不显示。
-// 改为「纪要类」判定：命中会议纪要本体或其任一子分类。
-const MINUTES_ROOTS = ["会议纪要"];
+// 纪要二次生成：① 需 derived.manage 权限；② 当前文档须属于「总经理会议纪要」分类
+// 【范围约束·2026-08-30】二次生成仅限「总经理会议纪要」来源文档（与后端 create_derived
+// 的来源分类校验保持一致）。此前曾放开为所有以「纪要」结尾的子类（如专项会议纪要），
+// 现按业务要求收窄为单一类目。
+const MINUTES_ALLOWED = ["总经理会议纪要"];
 function isMinutesCategory(cat) {
   if (!cat) return false;
-  const c = String(cat).trim();
-  if (MINUTES_ROOTS.includes(c)) return true;
-  // 子分类命名形如「总经理会议纪要」「专项会议纪要」，统一以「纪要」结尾归类
-  return c.endsWith("纪要");
+  return MINUTES_ALLOWED.includes(String(cat).trim());
 }
 // 当前文档是否为「纪要类」（仅用于判断是否可展示二次生成入口）
 const isMinutesDoc = computed(() => isMinutesCategory(docDetail.value?.category));

@@ -752,6 +752,12 @@ def create_derived(data: dict) -> dict:
     """
     items = _load()
     source_doc_id = data.get("source_doc_id", "")
+    # 【范围约束】二次生成仅限「总经理会议纪要」来源文档。来源类别非该类时拒绝，
+    # 既保证前端入口范围（KbBrowse.canDerived）与后端一致，也阻断绕过前端直调 API。
+    _src = get_source_summary(source_doc_id) if source_doc_id else None
+    _src_cat = (_src or {}).get("category", "")
+    if _src_cat != "总经理会议纪要":
+        raise ValueError("二次生成仅支持「总经理会议纪要」来源文档（当前来源分类：%s）" % _src_cat)
     tpl = data.get("template")
     renumber = bool(data.get("renumber"))
     # 有模板则按模板重排正文，保证模板模式下存储正文始终符合版式

@@ -192,7 +192,8 @@ const filterSource = ref("all");
 
 async function loadSources() {
   try {
-    const r = await api.documents({ category: "会议纪要", page_size: 300 });
+    // 【范围约束】二次生成仅限「总经理会议纪要」来源文档（与后端 create_derived 校验一致）
+    const r = await api.documents({ category: "总经理会议纪要", page_size: 300 });
     sources.value = r.items || [];
   } catch (e) { notify(e.message || "加载来源失败", "err"); }
 }

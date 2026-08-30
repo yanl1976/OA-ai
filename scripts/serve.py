@@ -1900,7 +1900,11 @@ def derived_create():
     data = dict(data)
     u = _current_user()
     data["created_by"] = u["username"] if u else ""
-    d = derived_store.create_derived(data)
+    try:
+        d = derived_store.create_derived(data)
+    except ValueError as e:
+        # 范围约束：二次生成仅限「总经理会议纪要」来源文档
+        return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "derived": d})
 
 
