@@ -73,18 +73,48 @@ def main():
     ap.add_argument("--apply", action="store_true", help="实际执行修复（默认仅预览）")
     ap.add_argument("--root", default=_ROOT, help="部署根目录")
     ap.add_argument("--files-dir", default="", help="显式指定上传文件目录（自动探测失败时用）")
+    ap.add_argument("--meta", default="", help="显式指定 user_documents.json 路径")
     args = ap.parse_args()
 
     import kb_store
 
-    ups = kb_store._load_uploads() or []
     root = args.files_dir or resolve_upload_dir(kb_store)
     if not root:
         print("错误：找不到 uploads 目录，请检查 KB_ROOT 配置；"
               "可用 --files-dir 显式指定，例如"
               " --files-dir /opt/OA-ai/knowledge_base/uploads/files")
         return 1
+
+    # 元数据读取：kb_store._load_uploads() 用的是 UPLOAD_FILE，而生产机的
+    # UPLOAD_DIR 会拼出重复的 knowledge_base（KB_ROOT 已含 knowledge_base 时），
+    # 导致读到空数组。故这里按「实际文件目录」反推元数据路径作为兜底。
+    ups = kb_store._load_uploads() or []
+    meta_used = getattr(kb_store, "UPLOAD_FILE", "")
+    if not ups:
+        guessed = os.path.join(os.path.dirname(root.rstrip("/\\")), "user_documents.json")
+        if os.path.isfile(guessed):
+            try:
+                import json as _json
+                _d = _json.load(open(guessed, encoding="utf-8"))
+                if isinstance(_d, dict):
+                    _d = _d.get("items") or _d.get("uploads") or []
+                if isinstance(_d, list):
+                    ups, meta_used = _d, guessed
+            except Exception as e:  # noqa: BLE001
+                print("兜底读取元数据失败 %s: %s" % (guessed, e))
+    if args.meta and os.path.isfile(args.meta):
+        try:
+            import json as _json
+            _d = _json.load(open(args.meta, encoding="utf-8"))
+            if isinstance(_d, dict):
+                _d = _d.get("items") or _d.get("uploads") or []
+            if isinstance(_d, list):
+                ups, meta_used = _d, args.meta
+        except Exception as e:  # noqa: BLE001
+            print("读取指定元数据失败: %s" % e)
+
     print("部署根目录:", args.root)
+    print("元数据文件:", meta_used, "(存在: %s)" % os.path.isfile(meta_used))
     print("uploads 条数:", len(ups))
     print("文件目录:", root)
     print("模式:", "实际修复 --apply" if args.apply else "预览（不改动）")
@@ -151,8 +181,22 @@ def main():
             fixed += 1
 
     if args.apply:
-        kb_store._save_uploads(ups)
-        print("\n已保存 uploads 元数据")
+        # 写回「实际读取到的那个」元数据文件，避免写回 kb_store 拼错的路径
+        # （生产机 UPLOAD_FILE 会拼出重复的 knowledge_base，导致修复结果丢失）。
+        try:
+            if meta_used and os.path.isfile(meta_used):
+                with open(meta_used + ".bak", "w", encoding="utf-8") as bf:
+                    import json as _json
+                    _json.dump(ups, bf, ensure_ascii=False)
+                import json as _json
+                with open(meta_used, "w", encoding="utf-8") as f:
+                    _json.dump(ups, f, ensure_ascii=False)
+                print("\n已保存元数据:", meta_used, "(备份:", meta_used + ".bak)")
+            else:
+                kb_store._save_uploads(ups)
+                print("\n已保存 uploads 元数据（kb_store 默认路径）")
+        except Exception as e:  # noqa: BLE001
+            print("保存失败: %s" % repr(e)[:200])
 
     print("\n" + "=" * 72)
     print("需修复: %d | 无需改动: %d | 失败: %d" % (fixed, skipped, failed))
