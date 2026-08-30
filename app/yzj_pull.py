@@ -458,7 +458,14 @@ def run_task(task, dry_run=False, limit=None, force=False):
         _ups = []
     alive_doc_ids = set()
     alive_suffix = set()
+    # 已存在的落盘文件名（小写）：用于「重名检测」——仅当新文件与既有文件重名时
+    # 才加单据日期前缀，不重名的文件保持原名，避免无差别给所有文件加时间戳。
+    existing_names = set()
     for u in _ups:
+        if not u.get("deleted"):
+            _fn = (u.get("filename") or "").strip().lower()
+            if _fn:
+                existing_names.add(_fn)
         if u.get("source") == "yunzhijia" and not u.get("deleted"):
             did = u.get("doc_id")
             if did:
@@ -466,6 +473,8 @@ def run_task(task, dry_run=False, limit=None, force=False):
             m = re.search(r"_([0-9A-Za-z]{6})\.", u.get("filename", ""))
             if m:
                 alive_suffix.add(m.group(1))
+    # 本轮内已用过的落盘名（同一轮里多份同名附件也要能区分）
+    used_names = set()
 
     # 实际处理上限：取「调试 limit」与「任务配置的 batch_size」较小值。
     # batch_size 留空/0/负数 → 视为不限（按计划全部拉取）；
@@ -635,11 +644,24 @@ def run_task(task, dry_run=False, limit=None, force=False):
                     uniq = base + ".ofd"
                 else:  # origin：沿用原文件扩展名，拿不到则按 .docx 兜底
                     uniq = base + (decl_ext.lower() if decl_ext else ".docx")
-                # 加「单据日期_」前缀：同类单据附件名常完全相同（实测同一模板下
-                # 15 份「天传所集团生产经营工作例会会议纪要」重名），加日期后可区分。
-                _prefix = _doc_date_prefix(form_data, fl)
-                if _prefix and not base.startswith(_prefix):
-                    uniq = _prefix + uniq
+                # 重名处理：仅当该落盘名「已被占用」时才加单据日期前缀。
+                # 同类单据附件名常完全相同（实测同一模板下 32 份
+                # 「天传所集团生产经营工作例会会议纪要」重名），但绝大多数文件
+                # 并不重名——故只在真正冲突时加前缀，不重名的保持原文件名，
+                # 避免无差别给所有文件都加时间戳。
+                if uniq.strip().lower() in existing_names or uniq.strip().lower() in used_names:
+                    _prefix = _doc_date_prefix(form_data, fl)
+                    if _prefix and not base.startswith(_prefix):
+                        uniq = _prefix + uniq
+                    # 极端情况：加日期后仍重名（同一天多份同名），再补序号
+                    if uniq.strip().lower() in existing_names or uniq.strip().lower() in used_names:
+                        _stem, _dot, _extx = uniq.rpartition(".")
+                        for _i in range(2, 100):
+                            _cand = "%s(%d).%s" % (_stem, _i, _extx) if _dot else "%s(%d)" % (uniq, _i)
+                            if _cand.strip().lower() not in existing_names and _cand.strip().lower() not in used_names:
+                                uniq = _cand
+                                break
+                used_names.add(uniq.strip().lower())
                 # 自动归类（按文件名/标题关键词匹配分类树，校验存在，否则兜底 target_category）
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
