@@ -324,6 +324,12 @@ def run_task(task, dry_run=False, limit=None, force=False):
     from yunzhijia_client import (
         get_templates, find_flows, view_form_inst, download_file,
     )
+    # 注意：必须同时 `import kb_store`（模块对象）与 from-import（具体函数）。
+    # 本文件历史上只写了 from-import，而下方存活校验用到了 `kb_store._load_uploads()`，
+    # 触发 NameError 却被 `except Exception: _ups = []` 静默吞掉，导致存活集合恒为空、
+    # 每次拉取都把所有已拉取单据判定为「文档不存在」而全量重拉——这正是长期
+    # 反复重复拉取、重复文件堆积的根因。故此处显式导入模块对象。
+    import kb_store  # noqa: F401  （模块对象，供下方 kb_store._load_uploads 等使用）
     from kb_store import save_upload_raw, update_upload_text_async, rebuild_index_only, _extract_year
     import extract_text
     from sync_yzj_minutes import _auto_classify
@@ -454,18 +460,34 @@ def run_task(task, dry_run=False, limit=None, force=False):
     # 收集云之家来源且未软删的文档 doc_id 集合，以及文件名里的 inst_id 末6位后缀集合。
     try:
         _ups = kb_store._load_uploads() or []
-    except Exception:  # noqa: BLE001
+    except Exception as _e:  # noqa: BLE001
+        # 不可再静默吞异常：早期这里 `except: _ups=[]` 把 NameError 也吞掉，
+        # 导致存活集合恒为空、每次全量重拉，且日志无踪迹、长期无法定位。
+        # 现在显式告警，便于第一时间发现「读不到元数据」类问题。
+        logger.error("读取上传元数据失败，存活校验将不可靠（可能导致重复拉取）: %s", _e)
+        stats["errors"].append("读取元数据失败: %s" % _e)
         _ups = []
+    if not _ups:
+        logger.warning("上传元数据为空：若此前已拉取过文档，请检查 KB_ROOT / 元数据文件路径，"
+                       "否则本次会把已拉取单据误判为丢失而重复拉取")
     alive_doc_ids = set()
     alive_suffix = set()
     # 已存在的落盘文件名（小写）：用于「重名检测」——仅当新文件与既有文件重名时
     # 才加单据日期前缀，不重名的文件保持原名，避免无差别给所有文件加时间戳。
     existing_names = set()
+    # 文件名(小写) → stored_path：用于「物理文件兜底校验」。
+    # 当元数据读取异常（路径拼接问题 / 文件损坏 / 条目丢失）导致 alive_doc_ids
+    # 为空时，仍可按文件名定位物理文件并校验其存在，避免误判已拉取内容为
+    # 「不存在」而整批重拉（历史上一再发生重复拉取的根因）。
+    name_to_path = {}
     for u in _ups:
         if not u.get("deleted"):
             _fn = (u.get("filename") or "").strip().lower()
             if _fn:
                 existing_names.add(_fn)
+                _sp = u.get("stored_path")
+                if _sp:
+                    name_to_path.setdefault(_fn, _sp)
         if u.get("source") == "yunzhijia" and not u.get("deleted"):
             did = u.get("doc_id")
             if did:
@@ -475,6 +497,88 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 alive_suffix.add(m.group(1))
     # 本轮内已用过的落盘名（同一轮里多份同名附件也要能区分）
     used_names = set()
+
+    # 物理文件基准目录候选：stored_path 可能是 "files/xxx.pdf"（相对 uploads 目录）
+    # 也可能是 "xxx.pdf"（相对 files 目录），逐个尝试，命中即用。
+    _upload_bases = []
+    for _cand in (getattr(kb_store, "UPLOAD_DIR", ""),
+                  getattr(kb_store, "UPLOAD_FILES_DIR", ""),
+                  os.path.dirname(getattr(kb_store, "UPLOAD_FILES_DIR", "") or "")):
+        if _cand and os.path.isdir(_cand) and _cand not in _upload_bases:
+            _upload_bases.append(_cand)
+
+    # doc_id → 元数据条目：用于补提取时判断正文是否为空
+    doc_entry = {}
+    for _u in _ups:
+        _did = _u.get("doc_id")
+        if _did:
+            doc_entry[_did] = _u
+
+    def _reextract_missing(doc_ids, stats):
+        """对「已落盘但正文为空」的文档补做提取（**不重新下载**）。
+
+        场景：下载成功、落盘成功，但提取/索引环节失败（解析异常、进程中断等），
+        此时去重记录已标记为已拉取，后续不会重下，导致文档长期正文为空、
+        检索不到。这里在判定「已拉取」时顺带检查正文，为空则直接读物理文件
+        重新提取，无需重新联网下载，代价极低。
+        """
+        if not doc_ids:
+            return 0
+        n = 0
+        for _d in doc_ids:
+            e = doc_entry.get(_d)
+            if not e or (e.get("text") or "").strip():
+                continue
+            sp = e.get("stored_path")
+            if not sp:
+                continue
+            raw = None
+            for _b in _upload_bases:
+                _p = os.path.join(_b, sp)
+                if os.path.isfile(_p):
+                    try:
+                        with open(_p, "rb") as _fh:
+                            raw = _fh.read()
+                    except Exception:  # noqa: BLE001
+                        raw = None
+                    break
+            if not raw:
+                continue
+            try:
+                import extract_text
+                from kb_store import update_upload_text_async, _extract_year
+                _fn = e.get("filename") or ""
+                _cat = e.get("category")
+                _text, _w = extract_text.extract(raw, _fn, category=_cat)
+                update_upload_text_async(_d, _text, _cat, _extract_year(_fn, _text))
+                stats["reextracted"] = stats.get("reextracted", 0) + 1
+                n += 1
+                logger.info("补提取成功: %s（%d 字）", _fn, len(_text))
+            except Exception as _ex:  # noqa: BLE001
+                logger.warning("补提取失败 %s: %s", e.get("filename"), _ex)
+        return n
+
+    def _physically_exists(names, sizes):
+        """物理文件兜底：按文件名找到 stored_path，校验文件存在且大小一致。"""
+        if not names or not _upload_bases:
+            return False
+        for i, nm in enumerate(names):
+            sp = name_to_path.get((nm or "").strip().lower())
+            if not sp:
+                continue
+            for _b in _upload_bases:
+                _p = os.path.join(_b, sp)
+                if os.path.isfile(_p):
+                    # 记了大小就一并校验，防止同名但内容不同被误判为已拉取
+                    try:
+                        if sizes and i < len(sizes) and sizes[i]:
+                            if os.path.getsize(_p) == sizes[i]:
+                                return True
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return True if not sizes else False
+        return False
 
     # 实际处理上限：取「调试 limit」与「任务配置的 batch_size」较小值。
     # batch_size 留空/0/负数 → 视为不限（按计划全部拉取）；
@@ -562,17 +666,30 @@ def run_task(task, dry_run=False, limit=None, force=False):
             if _rechecking:
                 pass  # 自愈重校验：跳过 alive 判断，直接重拉
             else:
-                # 文件可能因手动删除而不存在 → 校验文档是否仍存活，已删则移记录并重拉
+                # 文件可能因手动删除而不存在 → 校验是否仍存活，已删则移记录并重拉。
+                # 三级校验，逐级放宽，最大程度避免「已拉取却被误判为不存在」：
+                #   1) 元数据：doc_id 仍在未删文档中（最快、最准）
+                #   2) 物理文件：按记录里的 names/sizes 定位文件并校验存在与大小
+                #      （元数据读取异常时的兜底，历史重复拉取的主因）
+                #   3) 旧格式兜底：文件名里的 inst_id 末6位后缀（仅无 doc_ids/names 时）
                 doc_ids = rec.get("doc_ids") or []
                 if doc_ids:
                     alive = any(d in alive_doc_ids for d in doc_ids)
                 else:
-                    # 旧格式记录无 doc_ids：用文件名后缀兜底判断
+                    alive = False
+                if not alive:
+                    alive = _physically_exists(rec.get("names") or [],
+                                               rec.get("sizes") or [])
+                if not alive and not doc_ids and not rec.get("names"):
+                    # 最老格式记录（既无 doc_ids 也无 names）：用文件名后缀兜底
                     alive = inst_id[-6:] in alive_suffix
                 if alive:
+                    # 已拉取：顺带检查正文，为空则补提取（不重新下载）
+                    if task.get("index_into_kb", True) and doc_ids:
+                        _reextract_missing(doc_ids, stats)
                     stats["skipped"] += 1
                     continue
-                # 文档已不存在（被手动删除）→ 清除去重记录，本次重新拉取
+                # 文档确已不存在（手动删除或文件丢失）→ 清除去重记录，本次重新拉取
                 del synced[inst_id]
         try:
             inst = view_form_inst(inst_id, form_code_id)
@@ -594,6 +711,13 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 continue
             saved_count = 0
             doc_ids = []
+            # 同步记录文件名与字节大小：让去重记录「自包含」。
+            # 早期只记 doc_ids，存活判断完全依赖能否读到元数据；一旦元数据
+            # 读取异常（路径拼接问题 / 文件损坏）就会把已拉取内容误判为不存在
+            # 而整批重拉。记下 names/sizes 后，即使元数据读不到，也能用
+            # 物理文件兜底校验，避免重复拉取。
+            doc_names = []
+            doc_sizes = []
             for fi in files:
                 fname = _safe_filename(fi.get("file_name") or ("file_%s" % fi["file_id"]))
                 # download_file 写盘后返回路径；读 bytes 再删临时文件（与 sync_yzj_minutes 一致）
@@ -678,6 +802,8 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
                 doc_ids.append(doc_id)
+                doc_names.append(uniq)
+                doc_sizes.append(len(raw))
                 # 逐条追加到运行态，前端轮询即可「拉一个显示一个」
                 if task_id in _PROGRESS:
                     _PROGRESS[task_id]["new_docs"].append({
@@ -697,7 +823,9 @@ def run_task(task, dry_run=False, limit=None, force=False):
                     except Exception as e:  # noqa: BLE001
                         logger.warning("提取索引失败 %s: %s", doc_id, e)
                 saved_count += 1
-            synced[inst_id] = {"ts": int(time.time()), "files": saved_count, "doc_ids": doc_ids}
+            synced[inst_id] = {"ts": int(time.time()), "files": saved_count,
+                               "doc_ids": doc_ids,
+                               "names": doc_names, "sizes": doc_sizes}
             stats["downloaded"] += 1 if saved_count else 0
             processed += 1
         except Exception as e:  # noqa: BLE001

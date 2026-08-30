@@ -842,7 +842,56 @@ if alive:
 一旦撞上就跳过，表现为"跑满整轮却只多落盘 1 条"。
 现已在自愈分支置 `_rechecking=True`，**跳过 alive 判断直接重拉**。
 
-### Q4：拉取到一半停住，反复重拉已完成的单据
+### Q4：反复重复拉取、重复文件堆积（**根因级问题，务必先看这条**）
+
+**症状**：每次拉取都重新下载全部单据；`--dedupe` 能扫出几十组 md5 相同的重复文件；
+统计里 `skipped` 长期为 0、`downloaded` 约等于 `found`。
+
+**根因（2026-08-30 定位）**：`app/yzj_pull.py` 只写了 `from kb_store import ...`，
+**从未 `import kb_store`（模块对象）**，而存活校验处调用了 `kb_store._load_uploads()`：
+
+```python
+try:
+    _ups = kb_store._load_uploads() or []   # ← NameError: name 'kb_store' is not defined
+except Exception:
+    _ups = []                                # ← 被静默吞掉！日志毫无痕迹
+```
+
+后果链：
+
+```
+_ups = []  →  alive_doc_ids 恒为空
+          →  alive = any(d in alive_doc_ids ...) 恒为 False
+          →  del synced[inst_id]
+          →  每次都把已拉取单据判定为「文档不存在」→ 全量重拉
+```
+
+**修复**：
+1. 补 `import kb_store`（模块对象），与 from-import 并存
+2. 去掉静默 `except`，改为 `logger.error` + 写入 `stats["errors"]`；
+   `_ups` 为空时额外 warning 提示检查 `KB_ROOT`——避免同类问题再次被掩盖
+
+**配套加固（防止元数据异常时再退化成全量重拉）**：
+- 去重记录**自包含**：落盘时写入 `names`（文件名）与 `sizes`（字节大小）
+- 存活判断改为**三级校验**：
+  1. `doc_id` 在未删文档中（最快最准）
+  2. 按 `names/sizes` 定位**物理文件**并校验存在与大小一致（元数据异常时的兜底）
+  3. 无 `doc_ids`/`names` 的最老记录，用文件名里的 inst_id 末 6 位后缀
+  4. 三者皆否才判定丢失并重拉
+- **补提取**：已落盘但正文为空的文档，在判定「已拉取」时自动重跑提取
+  （**不重新下载**，直接读物理文件），统计项 `reextracted`
+
+旧记录没有 `names/sizes`，用脚本一次性回填：
+
+```bash
+/opt/OA-ai/venv/bin/python scripts/backfill_synced_meta.py \
+  --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json --apply
+```
+
+> 排查同类问题的经验：**警惕 `except Exception: pass/赋空值`**。
+> 本次根因被这类语句掩盖了数周——异常被吞、日志无痕、现象又恰好像是"数据问题"。
+
+### Q4b：拉取到一半停住，反复重拉已完成的单据
 
 根因：去重记录 `synced` **只在整轮结束后保存一次**，中断即全部丢失
 （文档已入库但去重没写，下次重跑会重复拉取）。
