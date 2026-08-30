@@ -180,8 +180,15 @@ async function startPoll(id) {
       const st = p.stats || {};
       // 把最新进度同步给展示区（即使切换页面后重新进入也能续显）
       lastStat.value = { ...st, _dry: st.get ? false : (lastStat.value && lastStat.value._dry) };
+      // 「拉一个刷一个」：把本次运行新落盘的文档即时并入列表顶部（按 doc_id 去重）
+      const nd = p.new_docs || [];
+      if (nd.length) {
+        const seen = new Set(pulledDocs.value.map((d) => d.doc_id));
+        const add = nd.filter((d) => !seen.has(d.doc_id));
+        if (add.length) pulledDocs.value = [...add, ...pulledDocs.value];
+      }
       if (!p.running) {
-        // 完成（含被中止）：停轮询、刷新文档列表
+        // 完成（含被中止）：停轮询、全量刷新一次文档列表（补齐 chars/indexed 等异步字段）
         stopPoll();
         runningId.value = null;
         if (st.aborted) notify("任务已中止", "ok");

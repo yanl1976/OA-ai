@@ -214,24 +214,51 @@ def run_task(task, dry_run=False, limit=None, force=False):
         "running": True, "aborted": False, "total": 0,
         "processed": 0, "stats": stats,
         "started_at": int(time.time()), "done_at": None,
+        # 本次运行新落盘的文档（逐条追加，供前端「拉一个刷一个」实时显示）
+        "new_docs": [],
     }
     _ABORT.pop(task_id, None)
 
-    # 1) 解析目标模板 form_code_id
-    form_code_id = task.get("form_code_id")
-    template_name = task.get("template_name")
-    if not form_code_id and template_name:
+    # 1) 解析目标模板 form_code_id（支持「一个任务匹配多个模板」）
+    # 重要：云之家同名/近名模板常有多个（如「总经理会议纪要线上审批」「会议纪要线上审批发布」
+    # 「资金管理委员会会议纪要」），旧实现 next(...) 只取第一个匹配，会漏掉其余模板的全部单据
+    # （实测只拉到 7 条，而全量纪要 255 条）。findFlows 的 formCodeIds 本身是数组，
+    # 故改为收集「所有」含关键词的模板，一次传入批量拉取。
+    form_code_ids = []
+    _raw_ids = task.get("form_code_id")
+    if isinstance(_raw_ids, (list, tuple)):
+        form_code_ids = [str(x) for x in _raw_ids if x]
+    elif _raw_ids:
+        form_code_ids = [str(_raw_ids)]
+    # 任务可显式配置多个模板名（template_names 列表，逗号分隔字符串亦可）
+    _names = task.get("template_names")
+    if isinstance(_names, str):
+        _names = [n.strip() for n in _names.split(",") if n.strip()]
+    if not _names:
+        _n = task.get("template_name")
+        _names = [_n] if _n else []
+    template_name = _names[0] if _names else ""
+    if not form_code_ids and _names:
         try:
             templates = get_templates()
-            match = next((t for t in templates if template_name in (t.get("title") or "")), None)
-            if match:
-                form_code_id = match.get("formCodeId")
-            else:
-                stats["errors"].append("未匹配到模板: %s" % template_name)
+            for _n in _names:
+                for t in templates:
+                    cid = t.get("formCodeId")
+                    if cid and _n in (t.get("title") or "") and cid not in form_code_ids:
+                        form_code_ids.append(cid)
+            if not form_code_ids:
+                stats["errors"].append("未匹配到模板: %s" % ",".join(_names))
                 return stats
+            logger.info("模板关键词 %s 匹配到 %d 个模板: %s",
+                        _names, len(form_code_ids), form_code_ids)
         except Exception as e:  # noqa: BLE001
             stats["errors"].append("拉取模板列表失败: %s" % e)
             return stats
+    if not form_code_ids:
+        stats["errors"].append("未配置模板（template_name / form_code_id）")
+        return stats
+    # 兼容后续单值引用
+    form_code_id = form_code_ids[0]
 
     # 2) 时间范围
     ct_start = ct_end = None
@@ -256,33 +283,37 @@ def run_task(task, dry_run=False, limit=None, force=False):
     ct_pair = [ct_start, ct_end] if (ct_start or ct_end) else None
     flows = []
     try:
-        page = 1
-        page_size = 50
-        while True:
-            resp = find_flows(
-                form_code_ids=[form_code_id] if form_code_id else None,
-                status=task.get("status") or None,
-                create_time=ct_pair,
-                page_number=page,
-                page_size=page_size,
-            )
-            batch = (resp or {}).get("list") or [] if isinstance(resp, dict) else (resp or [])
-            flows.extend(batch)
-            # 提前退出：本页不足一页（已到末页）
-            if len(batch) < page_size:
-                break
-            # 以服务端返回的 total 为准（有则用它，避免多翻一次空页）
-            total = (resp or {}).get("total") if isinstance(resp, dict) else None
-            try:
-                total = int(total) if total is not None else None
-            except (TypeError, ValueError):  # noqa: BLE001
-                total = None
-            if total is not None and len(flows) >= total:
-                break
-            page += 1
-            if page > 500:  # 安全阀，防接口异常时无限翻页
-                logger.warning("翻页超过 500 页，停止继续翻页（已取 %d 条）", len(flows))
-                break
+        # 多模板时逐模板翻页（findFlows 对 formCodeIds 数组的组合过滤不可靠，
+        # 逐模板拉取可确保每个模板的单据都被完整取到）
+        for cid in form_code_ids:
+            page = 1
+            page_size = 50
+            while True:
+                resp = find_flows(
+                    form_code_ids=[cid],
+                    status=task.get("status") or None,
+                    create_time=ct_pair,
+                    page_number=page,
+                    page_size=page_size,
+                )
+                batch = (resp or {}).get("list") or [] if isinstance(resp, dict) else (resp or [])
+                flows.extend(batch)
+                # 提前退出：本页不足一页（已到末页）
+                if len(batch) < page_size:
+                    break
+                # 以服务端返回的 total 为准（有则用它，避免多翻一次空页）
+                total = (resp or {}).get("total") if isinstance(resp, dict) else None
+                try:
+                    total = int(total) if total is not None else None
+                except (TypeError, ValueError):  # noqa: BLE001
+                    total = None
+                if total is not None and len(batch) * page >= total:
+                    break
+                page += 1
+                if page > 500:  # 安全阀，防接口异常时无限翻页
+                    logger.warning("模板 %s 翻页超过 500 页，停止（已取 %d 条）", cid, len(flows))
+                    break
+            logger.info("模板 %s 取到 %d 条，累计 %d 条", cid, len(batch), len(flows))
     except Exception as e:  # noqa: BLE001
         stats["errors"].append("拉取流程列表失败: %s" % e)
         return stats
@@ -420,6 +451,18 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
                 doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
                 doc_ids.append(doc_id)
+                # 逐条追加到运行态，前端轮询即可「拉一个显示一个」
+                if task_id in _PROGRESS:
+                    _PROGRESS[task_id]["new_docs"].append({
+                        "doc_id": doc_id,
+                        "filename": uniq,
+                        "category": category,
+                        "year": _extract_year(uniq, ""),
+                        "chars": None,
+                        "indexed": 0,
+                        # 与 kb_store._now() 同格式（UTC "YYYY-MM-DD HH:MM:SS"）
+                        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    })
                 if task.get("index_into_kb", True):
                     try:
                         text, _warn = extract_text.extract(raw, uniq, category=category)
