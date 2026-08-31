@@ -133,8 +133,9 @@ async function reindex() {
   reindexing.value = true;
   try {
     const r = await api.reindex();
-    vecStats.value = (r && r.stats) || vecStats.value;
-    notify("索引重建完成", "ok");
+    // 后端为后台线程异步执行，请求返回时索引【尚未】完成，
+    // 不能提示「已完成」；实际结果需稍后刷新本页查看。
+    notify(r.note || "已提交后台重建索引，请稍后刷新查看文档数", "ok");
     await load();
   } catch (e) {
     notify(e.message, "err");

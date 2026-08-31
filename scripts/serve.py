@@ -1984,15 +1984,24 @@ def yzj_pulled_docs():
 
 
 
+@app.route("/api/admin/reindex", methods=["POST"])
 @login_required("system.manage")
 def adm_reindex():
-    try:
-        import rag_build_index
-        rag_build_index.build_index()
-        vec_store.rebuild(kb_store.iter_all_documents())
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True, "stats": vec_store.stats()})
+    """重建 BM25 + 向量索引（后台线程异步执行，立即返回，不阻塞页面）。
+
+    【历史故障】本函数一度丢失 @app.route 装饰器，成为从未注册的死代码，
+    导致「检索索引管理 → 重建索引」按钮恒定 404；而文件头部的接口清单里
+    仍列着该路由，故长期未被发现。新增/修改路由后务必核对装饰器是否存在。
+    """
+    def _run():
+        try:
+            kb_store.rebuild_index_only()
+        except Exception as e:  # noqa: BLE001
+            # 后台线程内的异常无法回传给前端，必须落日志，否则失败会毫无痕迹
+            print("[后台] 重建索引失败: %s" % e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "note": "已提交后台重建索引，完成后自动生效（可在几分钟后刷新本页查看文档数）"})
 
 
 @app.route("/api/admin/vector_stats")
