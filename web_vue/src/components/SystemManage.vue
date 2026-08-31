@@ -468,8 +468,9 @@ onMounted(load);
     <div class="feat-list">
       <div v-for="f in features" :key="f.key" class="feat-row">
         <div class="feat-meta">
-          <div class="feat-name"><code>{{ f.key }}</code></div>
-          <div class="muted" style="font-size: 12px">{{ f.label }}</div>
+          <div class="feat-name">{{ f.name || f.key }}</div>
+          <div class="muted" style="font-size: 12px">{{ f.description || "" }}</div>
+          <div class="feat-key"><code>{{ f.key }}</code></div>
         </div>
         <button
           class="btn sm"

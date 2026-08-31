@@ -116,6 +116,33 @@ function search() { page.value = 1; load(); }
 function goPage(p) { page.value = Math.min(Math.max(1, p), totalPages()); load(); }
 const totalPages = () => Math.max(1, Math.ceil(total.value / pageSize));
 
+// 列表排序：当前支持「归类」列排序（升/降切换），便于找出归错类的文档后再批量调整
+const sortKey = ref("");   // 当前排序列："" | "category"
+const sortOrder = ref("asc");
+function toggleSort(key) {
+  if (sortKey.value === key) {
+    sortOrder.value = sortOrder.value === "asc" ? "desc" : "asc";
+  } else {
+    sortKey.value = key;
+    sortOrder.value = "asc";
+  }
+}
+const sortIndicator = (key) => {
+  if (sortKey.value !== key) return "";
+  return sortOrder.value === "asc" ? " ▲" : " ▼";
+};
+const displayItems = computed(() => {
+  if (sortKey.value !== "category") return items.value;
+  const arr = items.value.slice();
+  arr.sort((a, b) => {
+    const x = (a.category || "").toString();
+    const y = (b.category || "").toString();
+    const cmp = x < y ? -1 : x > y ? 1 : 0;
+    return sortOrder.value === "asc" ? cmp : -cmp;
+  });
+  return arr;
+});
+
 // 页码序列：1、2、3、4…末页 一字排开，超长时折叠为 [1, …, cur-1,cur,cur+1, …, last]
 const pageList = computed(() => {
   const tp = totalPages();
@@ -226,15 +253,11 @@ async function confirmBatchReclass() {
   try {
     const r = await api.batchReclassify(ids, reclassTarget.value);
     const done = r.done || ids;
-    notify(`已批量调整归类 ${done.length} 个，并自动触发识别提取` + (r.failed && r.failed.length ? `，${r.failed.length} 个失败` : ""), "ok");
+    notify(`已批量调整归类 ${done.length} 个，并自动触发后台识别提取` + (r.failed && r.failed.length ? `，${r.failed.length} 个失败` : ""), "ok");
     clearSelect();
+    // 后端已一次性改归类 + 重建索引，提交即返回；后台逐篇重提取由轮询机制自动刷新状态，
+    // 无需前端串行等待（原逐篇 pollUntilIndexed 在批量大时极慢）。
     await load();
-    // 分类改动后配套识别提取自动执行：逐篇轮询直到全部重新识别完成，列表即时刷新
-    for (const id of done) {
-      if (items.value.find((x) => x.doc_id === id)) {
-        await pollUntilIndexed(id, 30000).catch(() => {});
-      }
-    }
   } catch (e) {
     notify(e.message, "err");
   } finally {
@@ -282,10 +305,10 @@ onUnmounted(() => stopPolling());
   <div class="card card-pad">
     <table class="table">
       <thead>
-        <tr><th style="width:40px"><input type="checkbox" v-model="allChecked" title="全选本页" /></th><th>文件名</th><th>归类</th><th>标签</th><th>年代</th><th>字数</th><th>原文件</th><th>识别状态</th><th>上传时间</th><th>操作</th></tr>
+        <tr><th style="width:40px"><input type="checkbox" v-model="allChecked" title="全选本页" /></th><th>文件名</th><th class="sortable" @click="toggleSort('category')">归类<span class="sort-ind">{{ sortIndicator('category') }}</span></th><th>标签</th><th>年代</th><th>字数</th><th>原文件</th><th>识别状态</th><th>上传时间</th><th>操作</th></tr>
       </thead>
       <tbody>
-        <tr v-for="d in items" :key="d.doc_id">
+        <tr v-for="d in displayItems" :key="d.doc_id">
           <td class="mid"><input type="checkbox" :checked="isSelected(d.doc_id)" @change="toggleSelect(d.doc_id)" /></td>
           <td class="mid">
             <a class="link" @click="openDoc(d)">{{ d.filename }}</a>
@@ -330,7 +353,7 @@ onUnmounted(() => stopPolling());
             </template>
           </td>
         </tr>
-        <tr v-if="!items.length"><td colspan="9" class="loading">暂无上传文件</td></tr>
+        <tr v-if="!displayItems.length"><td colspan="10" class="loading">暂无上传文件</td></tr>
       </tbody>
     </table>
 

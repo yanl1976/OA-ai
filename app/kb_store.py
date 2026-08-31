@@ -1102,6 +1102,88 @@ def reclassify_upload(doc_id: str, category: str) -> bool:
     return True
 
 
+def reclassify_uploads_batch(doc_ids: list, category: str) -> dict:
+    """批量调整归类（性能优化版）。
+
+    相比逐篇调用 reclassify_upload（每篇都会全量重写 uploads.json + 整库重建向量索引，
+    N 篇 = N 次全库重建，是「批量改分类很慢」的根因），本函数：
+      - 仅加载/保存 uploads.json 一次；
+      - 仅在循环结束后统一重建一次检索索引（rag_build_index + vec_store.rebuild）。
+    物理文件移动仍逐篇执行（必须），但不再触发 N 次索引重建。
+    返回 {"done": [...], "failed": [...]}。重提取入队由调用方负责（见 serve 批量路由）。
+    """
+    if not category:
+        return {"done": [], "failed": list(doc_ids or [])}
+    ids = set(doc_ids or [])
+    done, failed = [], []
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        targets = [u for u in ups if u.get("doc_id") in ids and not u.get("deleted")]
+        found_ids = {u.get("doc_id") for u in targets}
+        for doc_id in doc_ids:
+            if doc_id not in found_ids:
+                failed.append(doc_id)
+        for u in targets:
+            doc_id = u.get("doc_id")
+            old_path = _resolve_binary_path(u)
+            u["category"] = category
+            # 物理移动（保持与 reclassify_upload 一致的逻辑，但批量合并到一次保存）
+            if old_path:
+                ext = u.get("ext") or os.path.splitext(u.get("filename", ""))[1].lower()
+                year = u.get("year") or _extract_year(u.get("filename", ""), u.get("text", ""))
+                new_rel = _stored_rel_for(category, year, doc_id, ext)
+                new_path = os.path.join(UPLOAD_DIR, new_rel)
+                if os.path.abspath(old_path) != os.path.abspath(new_path):
+                    try:
+                        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                        if os.path.exists(new_path):
+                            try:
+                                same = (os.path.getsize(old_path) == os.path.getsize(new_path)
+                                        and open(old_path, "rb").read()
+                                        == open(new_path, "rb").read())
+                            except Exception:
+                                same = False
+                            if same:
+                                os.remove(old_path)
+                                u["stored_path"] = new_rel
+                            else:
+                                stem, e2 = os.path.splitext(new_rel)
+                                k = 1
+                                while os.path.exists(os.path.join(UPLOAD_DIR, "%s_%d%s" % (stem, k, e2))):
+                                    k += 1
+                                new_rel = "%s_%d%s" % (stem, k, e2)
+                                new_path = os.path.join(UPLOAD_DIR, new_rel)
+                                import shutil
+                                shutil.move(old_path, new_path)
+                                u["stored_path"] = new_rel
+                        else:
+                            import shutil
+                            shutil.move(old_path, new_path)
+                            u["stored_path"] = new_rel
+                        try:
+                            od = os.path.dirname(old_path)
+                            if od.startswith(UPLOAD_FILES_DIR) and not os.listdir(od):
+                                os.rmdir(od)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            done.append(doc_id)
+        _atomic_write_json(UPLOAD_FILE, ups)
+    # 循环外统一重建一次索引（关键：避免 N 次全库重建）
+    try:
+        import rag_build_index
+        rag_build_index.build_index()
+        import vec_store
+        vec_store.rebuild(iter_all_documents())
+    except Exception:
+        pass
+    return {"done": done, "failed": failed}
+
+
 def migrate_upload_storage() -> int:
     """一次性迁移：把旧版扁平布局 files/<doc_id><ext> 重定位到
     files/<类别>/<年代>/<doc_id><ext> 归类布局（幂等，可重复运行）。

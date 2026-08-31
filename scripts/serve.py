@@ -1296,17 +1296,16 @@ def kb_upload_reclassify_batch():
     if not category:
         return jsonify({"error": "分类不能为空"}), 400
     try:
+        # 批量改归类（后端一次性保存 + 仅重建一次索引，性能关键，勿改回逐篇 reclassify_upload）
+        result = kb_store.reclassify_uploads_batch(doc_ids, category)
+        done = result.get("done", [])
+        failed = result.get("failed", [])
         ups = kb_store._load_uploads()
-        done, failed = [], []
-        for doc_id in doc_ids:
+        # 逐篇入队后台重提取（入队开销极低，不影响接口响应速度）
+        for doc_id in done:
             target = next((u for u in ups if u.get("doc_id") == doc_id and not u.get("deleted")), None)
             if not target:
-                failed.append(doc_id)
                 continue
-            if not kb_store.reclassify_upload(doc_id, category):
-                failed.append(doc_id)
-                continue
-            # 复位识别状态并触发后台重提取（分类改动 → 配套识别提取自动执行）
             kb_store.mark_extracting([doc_id])
             _EXTRACT_Q.put({
                 "filename": target.get("filename", doc_id),
@@ -1314,7 +1313,6 @@ def kb_upload_reclassify_batch():
                 "doc_id": doc_id,
                 "cat_hint": category,
             })
-            done.append(doc_id)
         return jsonify({
             "ok": True,
             "done": done,
