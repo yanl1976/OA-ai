@@ -24,7 +24,7 @@ import notify_mail
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(KB_ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "kb_admin.db")
-# 用户池：工号/姓名/部门/预设角色全部落在 config/user_pool.json，
+# 用户池：工号/姓名/预设角色全部落在 config/user_pool.json，
 # 本模块只关联该文件（读写与文件格式见 app/user_pool.py），名单不再硬编码进源码。
 USER_POOL_FILE = os.path.join(KB_ROOT, "config", "user_pool.json")
 # 与本模块对齐根目录（user_pool 在 import 时已按 KB_ROOT 推过一次，这里再同步一次，
@@ -690,7 +690,7 @@ def list_user_pool(only_enabled: bool = False) -> list:
     for e in entries:
         u = users_by_no.get(e["emp_no"])
         out.append({
-            "emp_no": e["emp_no"], "name": e["name"], "dept": e["dept"],
+            "emp_no": e["emp_no"], "name": e["name"],
             "role": e["role"], "role_id": role_ids.get(e["role"]),
             "status": e["status"], "note": e["note"],
             "used": 1 if u else 0,
@@ -719,11 +719,11 @@ def user_pool_info() -> dict:
     return info
 
 
-def create_pool_entry(emp_no, name, dept="", role="", note="", status=1):
+def create_pool_entry(emp_no, name, role="", note="", status=1):
     """新增池条目（直接写入 config/user_pool.json）。"""
     if role and role not in _role_names():
         raise ValueError("角色「%s」不存在" % role)
-    return user_pool.create_entry(emp_no, name, dept=dept, role=role,
+    return user_pool.create_entry(emp_no, name, role=role,
                                   status=status, note=note)
 
 
@@ -752,7 +752,7 @@ def delete_pool_entry(emp_no):
 def import_user_pool(items: list, mode: str = "merge") -> dict:
     """批量导入用户池（真实花名册走这里），结果写回 config/user_pool.json。
 
-    items: [{emp_no, name, dept?, role?}]，role 为【角色名】。
+    items: [{emp_no, name, role?}]，role 为【角色名】。
     mode:  merge   —— 同工号更新、新工号新增
            replace —— 先清空【未被注册占用】的条目再导入
     返回 {created, updated, skipped, cleared, errors:[{row, msg}]}
@@ -812,9 +812,9 @@ def create_registration(emp_no, name, password) -> int:
         salt, h = hash_password(password)
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO user_registrations(emp_no, name, dept, password_salt, password_hash, "
-            "pool_role, role_id, status, apply_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
-            (emp_no, name, entry["dept"], salt, h, entry["role"], role_id, _now()))
+            "INSERT INTO user_registrations(emp_no, name, password_salt, password_hash, "
+            "pool_role, role_id, status, apply_at) VALUES (?,?,?,?,?,?,'pending',?)",
+            (emp_no, name, salt, h, entry["role"], role_id, _now()))
         rid = cur.lastrowid
         conn.commit()
     finally:

@@ -1,12 +1,11 @@
 {
   "version": 1,
   "source": "虚拟用户池（示例数据，待替换为真实花名册）",
-  "updated_at": "2026-08-31 16:20:00",
+  "updated_at": "2026-08-31 17:10:00",
   "entries": [
     {
       "emp_no": "E1001",
       "name": "张伟",
-      "dept": "综合管理部",
       "role": "viewer",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -14,7 +13,6 @@
     {
       "emp_no": "E1002",
       "name": "李娜",
-      "dept": "人力资源部",
       "role": "editor",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -22,7 +20,6 @@
     {
       "emp_no": "E1003",
       "name": "王强",
-      "dept": "生产制造部",
       "role": "viewer",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -30,7 +27,6 @@
     {
       "emp_no": "E1004",
       "name": "刘洋",
-      "dept": "技术研发部",
       "role": "editor",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -38,7 +34,6 @@
     {
       "emp_no": "E1005",
       "name": "陈静",
-      "dept": "财务部",
       "role": "viewer",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -46,7 +41,6 @@
     {
       "emp_no": "E1006",
       "name": "赵敏",
-      "dept": "办公室",
       "role": "秘书",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -54,7 +48,6 @@
     {
       "emp_no": "E1007",
       "name": "孙建国",
-      "dept": "总经办",
       "role": "领导",
       "status": 1,
       "note": "虚拟数据·示例"
@@ -62,7 +55,6 @@
     {
       "emp_no": "E1008",
       "name": "周涛",
-      "dept": "质量管理部",
       "role": "viewer",
       "status": 1,
       "note": "虚拟数据·示例"

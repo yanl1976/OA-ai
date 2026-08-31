@@ -2,7 +2,7 @@
 
 设计要点
 --------
-1. **名册与代码分离**：工号 / 姓名 / 部门 / 预设角色全部落在这个 JSON 文件里，
+1. **名册与代码分离**：工号 / 姓名 / 预设角色全部落在这个 JSON 文件里，
    `app/admin.py` 只负责「读它、用它」，名单不再硬编码进源码。
    后期 HR 提供真实花名册：直接替换本文件，或经「用户管理 → 用户池 → 批量导入」
    写回本文件（后者会原子覆盖并保留一份 `.bak`）。
@@ -21,7 +21,7 @@
   "source": "来源说明（如「2026-09 人力花名册」）",
   "updated_at": "2026-08-31 12:00:00",
   "entries": [
-    {"emp_no": "E1001", "name": "张伟", "dept": "综合管理部",
+    {"emp_no": "E1001", "name": "张伟",
      "role": "viewer", "status": 1, "note": ""}
   ]
 }
@@ -47,14 +47,14 @@ DEFAULT_DOC = {
     "source": "虚拟用户池（示例数据，待替换为真实花名册）",
     "updated_at": "",
     "entries": [
-        {"emp_no": "E1001", "name": "张伟",   "dept": "综合管理部", "role": "viewer", "status": 1, "note": ""},
-        {"emp_no": "E1002", "name": "李娜",   "dept": "人力资源部", "role": "editor", "status": 1, "note": ""},
-        {"emp_no": "E1003", "name": "王强",   "dept": "生产制造部", "role": "viewer", "status": 1, "note": ""},
-        {"emp_no": "E1004", "name": "刘洋",   "dept": "技术研发部", "role": "editor", "status": 1, "note": ""},
-        {"emp_no": "E1005", "name": "陈静",   "dept": "财务部",     "role": "viewer", "status": 1, "note": ""},
-        {"emp_no": "E1006", "name": "赵敏",   "dept": "办公室",     "role": "秘书",   "status": 1, "note": ""},
-        {"emp_no": "E1007", "name": "孙建国", "dept": "总经办",     "role": "领导",   "status": 1, "note": ""},
-        {"emp_no": "E1008", "name": "周涛",   "dept": "质量管理部", "role": "viewer", "status": 1, "note": ""},
+        {"emp_no": "E1001", "name": "张伟",   "role": "viewer", "status": 1, "note": ""},
+        {"emp_no": "E1002", "name": "李娜",   "role": "editor", "status": 1, "note": ""},
+        {"emp_no": "E1003", "name": "王强",   "role": "viewer", "status": 1, "note": ""},
+        {"emp_no": "E1004", "name": "刘洋",   "role": "editor", "status": 1, "note": ""},
+        {"emp_no": "E1005", "name": "陈静",   "role": "viewer", "status": 1, "note": ""},
+        {"emp_no": "E1006", "name": "赵敏",   "role": "秘书",   "status": 1, "note": ""},
+        {"emp_no": "E1007", "name": "孙建国", "role": "领导",   "status": 1, "note": ""},
+        {"emp_no": "E1008", "name": "周涛",   "role": "viewer", "status": 1, "note": ""},
     ],
 }
 
@@ -92,7 +92,6 @@ def _norm_entry(raw) -> dict:
     return {
         "emp_no": emp_no,
         "name": _norm(raw.get("name")),
-        "dept": _norm(raw.get("dept")),
         "role": _norm(raw.get("role") or raw.get("role_name")),
         "status": 1 if int(raw.get("status", 1) or 0) else 0,
         "note": _norm(raw.get("note")),
@@ -192,7 +191,7 @@ def get_entry(emp_no: str):
 
 
 # ============ 写入 ============
-def create_entry(emp_no, name, dept="", role="", status=1, note="") -> dict:
+def create_entry(emp_no, name, role="", status=1, note="") -> dict:
     emp_no, name = _norm(emp_no), _norm(name)
     if not emp_no or not name:
         raise ValueError("工号与姓名不能为空")
@@ -202,7 +201,7 @@ def create_entry(emp_no, name, dept="", role="", status=1, note="") -> dict:
         if e and e["emp_no"] == emp_no:
             raise ValueError("工号「%s」已存在于用户池" % emp_no)
     doc["entries"].append({
-        "emp_no": emp_no, "name": name, "dept": _norm(dept),
+        "emp_no": emp_no, "name": name,
         "role": _norm(role), "status": 1 if status else 0, "note": _norm(note),
     })
     save_doc(doc)
@@ -240,8 +239,6 @@ def update_entry(emp_no, data: dict) -> dict:
         target["emp_no"] = new_no
     if "name" in data:
         target["name"] = _norm(data["name"])
-    if "dept" in data:
-        target["dept"] = _norm(data["dept"])
     if "role" in data:
         target["role"] = _norm(data["role"])
     if "status" in data:
@@ -307,15 +304,13 @@ def import_entries(items, mode="merge", valid_roles=None, source: str = None) ->
             result["errors"].append({"row": i + 1, "msg": "角色「%s」不存在" % role})
             continue
         entry = {
-            "emp_no": emp_no, "name": name, "dept": _norm(it.get("dept")),
+            "emp_no": emp_no, "name": name,
             "role": role, "note": _norm(it.get("note")),
         }
         if emp_no in existing:
             old = existing[emp_no]
             # 未提供的字段保留原值；status 沿用原状（导入不擅自改启用状态）
             entry["status"] = old["status"]
-            if not entry["dept"]:
-                entry["dept"] = old["dept"]
             if not entry["role"]:
                 entry["role"] = old["role"]
             if not entry["note"]:

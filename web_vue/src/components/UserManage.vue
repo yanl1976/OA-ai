@@ -79,7 +79,7 @@ const pool = ref([]);
 const poolInfo = ref({ file: "", source: "", updated_at: "", count: 0 });
 const showPoolModal = ref(false);
 const poolEditing = ref(null);
-const poolForm = ref({ emp_no: "", name: "", dept: "", role: "", status: 1, note: "" });
+const poolForm = ref({ emp_no: "", name: "", role: "", status: 1, note: "" });
 const poolSaving = ref(false);
 const showImport = ref(false);
 const importText = ref("");
@@ -100,13 +100,13 @@ async function loadPool() {
 
 function openPoolCreate() {
   poolEditing.value = null;
-  poolForm.value = { emp_no: "", name: "", dept: "", role: "", status: 1, note: "" };
+  poolForm.value = { emp_no: "", name: "", role: "", status: 1, note: "" };
   showPoolModal.value = true;
 }
 function openPoolEdit(p) {
   poolEditing.value = p;
   poolForm.value = {
-    emp_no: p.emp_no, name: p.name, dept: p.dept || "",
+    emp_no: p.emp_no, name: p.name,
     role: p.role || "", status: p.status, note: p.note || "",
   };
   showPoolModal.value = true;
@@ -120,7 +120,6 @@ async function savePool() {
   const payload = {
     emp_no: poolForm.value.emp_no.trim(),
     name: poolForm.value.name.trim(),
-    dept: poolForm.value.dept,
     role: poolForm.value.role || "",
     status: poolForm.value.status,
     note: poolForm.value.note,
@@ -150,7 +149,7 @@ async function removePool(p) {
   }
 }
 
-// 批量导入：每行「工号,姓名,部门,角色」（逗号或制表符分隔，部门与角色可省略）
+// 批量导入：每行「工号,姓名,角色」（逗号或制表符分隔，角色可省略）
 function parsePoolText(text) {
   const items = [];
   (text || "").split(/\r?\n/).forEach((raw) => {
@@ -158,14 +157,14 @@ function parsePoolText(text) {
     if (!line || line.startsWith("#")) return;
     const parts = line.split(/[,，\t]/).map((s) => s.trim());
     if (parts.length < 2 || !parts[0] || !parts[1]) return;
-    items.push({ emp_no: parts[0], name: parts[1], dept: parts[2] || "", role: parts[3] || "" });
+    items.push({ emp_no: parts[0], name: parts[1], role: parts[2] || "" });
   });
   return items;
 }
 const importItems = computed(() => parsePoolText(importText.value));
 async function doImport() {
   if (!importItems.value.length) {
-    notify("未解析到有效数据，请检查格式：工号,姓名,部门,角色", "err");
+    notify("未解析到有效数据，请检查格式：工号,姓名,角色", "err");
     return;
   }
   if (importMode.value === "replace" && !confirm("替换模式会先清空【未被注册占用】的现有条目，确认继续？")) return;
@@ -265,7 +264,7 @@ onMounted(() => {
       <table class="table">
         <thead>
           <tr>
-            <th>工号</th><th>姓名</th><th>部门</th><th>授予角色</th><th>状态</th>
+            <th>工号</th><th>姓名</th><th>授予角色</th><th>状态</th>
             <th>申请时间</th><th>审批信息</th><th>操作</th>
           </tr>
         </thead>
@@ -273,7 +272,6 @@ onMounted(() => {
           <tr v-for="r in regs" :key="r.id">
             <td class="mid">{{ r.emp_no }}</td>
             <td class="mid">{{ r.name }}</td>
-            <td class="mid muted">{{ r.dept || "—" }}</td>
             <td class="mid">
               <select v-if="r.status === 'pending'" class="input sm" v-model="r.edit_role_id">
                 <option value="">— 未指定 —</option>
@@ -324,7 +322,7 @@ onMounted(() => {
       <table class="table">
         <thead>
           <tr>
-            <th>工号</th><th>姓名</th><th>部门</th><th>预设角色</th>
+            <th>工号</th><th>姓名</th><th>预设角色</th>
             <th>状态</th><th>注册情况</th><th>备注</th><th>操作</th>
           </tr>
         </thead>
@@ -332,7 +330,6 @@ onMounted(() => {
           <tr v-for="p in pool" :key="p.emp_no">
             <td class="mid">{{ p.emp_no }}</td>
             <td class="mid">{{ p.name }}</td>
-            <td class="mid muted">{{ p.dept || "—" }}</td>
             <td class="mid">
               {{ p.role || "—" }}
               <span v-if="p.role && !p.role_id" class="badge off" title="系统中无同名角色，审批时需手动指定">角色缺失</span>
@@ -427,10 +424,6 @@ onMounted(() => {
       <input class="input" v-model="poolForm.name" placeholder="须与员工真实姓名一致" />
     </div>
     <div class="field">
-      <label>部门</label>
-      <input class="input" v-model="poolForm.dept" />
-    </div>
-    <div class="field">
       <label>预设角色（决定注册后权限）</label>
       <select class="input" v-model="poolForm.role">
         <option value="">— 暂不指定（审批时再定） —</option>
@@ -473,7 +466,7 @@ onMounted(() => {
   <!-- 用户池批量导入 -->
   <Modal :show="showImport" title="批量导入用户池" @close="showImport = false; importResult = null">
     <p class="muted">
-      每行一条：<code>工号,姓名,部门,角色</code>（逗号或制表符分隔，部门与角色可省略；
+      每行一条：<code>工号,姓名,角色</code>（逗号或制表符分隔，角色可省略；
       角色可填角色名或角色 id）。以 # 开头的行为注释。
     </p>
     <div class="field">

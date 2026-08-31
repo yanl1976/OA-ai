@@ -1791,7 +1791,7 @@ def adm_user_pool_create():
     data = request.get_json(silent=True) or {}
     try:
         admin.create_pool_entry(
-            data.get("emp_no"), data.get("name"), dept=data.get("dept", ""),
+            data.get("emp_no"), data.get("name"),
             role=data.get("role", ""), note=data.get("note", ""),
             status=data.get("status", 1))
     except ValueError as e:
@@ -1802,7 +1802,7 @@ def adm_user_pool_create():
 @app.route("/api/admin/user-pool/import", methods=["POST"])
 @login_required("user.manage")
 def adm_user_pool_import():
-    """批量导入用户池（真实花名册）。body: {items:[{emp_no,name,dept,role}], mode:'merge'|'replace'}。"""
+    """批量导入用户池（真实花名册）。body: {items:[{emp_no,name,role}], mode:'merge'|'replace'}。"""
     data = request.get_json(silent=True) or {}
     try:
         result = admin.import_user_pool(data.get("items") or [], mode=data.get("mode") or "merge")
