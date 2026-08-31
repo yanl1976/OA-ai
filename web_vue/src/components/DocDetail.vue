@@ -106,7 +106,7 @@ watch(() => props.docId, load);
         <textarea v-model="editText" class="etx"></textarea>
         <button class="btn" @click="saveEdit">保存</button>
       </div>
-      <div v-else class="preview">
+      <div v-else class="preview" @contextmenu.prevent @copy.prevent @cut.prevent @selectstart.prevent>
         <pre>{{ doc.text }}</pre>
       </div>
     </div>
@@ -129,6 +129,7 @@ watch(() => props.docId, load);
   padding: 10px; font-family: monospace; font-size: 13px; line-height: 1.5; }
 .btn { border: 1px solid #2b6cb0; background: #2b6cb0; color: #fff; border-radius: 6px;
   padding: 6px 18px; cursor: pointer; margin-top: 8px; }
+.preview { -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none; }
 .preview pre { background: #fafbfc; border: 1px solid #eef0f2; border-radius: 8px;
   padding: 14px; white-space: pre-wrap; word-break: break-word; max-height: 620px; overflow: auto;
   font-size: 13px; line-height: 1.6; }

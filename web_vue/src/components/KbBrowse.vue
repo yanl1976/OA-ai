@@ -302,7 +302,7 @@ onMounted(async () => {
             disabled
           >纪要二次生成（无权限）</button>
         </div>
-        <div class="doc-view">{{ docDetail.text || docDetail.full_text || "（无正文）" }}</div>
+        <div class="doc-view" @contextmenu.prevent @copy.prevent @cut.prevent @selectstart.prevent>{{ docDetail.text || docDetail.full_text || "（无正文）" }}</div>
 
         <!-- 衍生版本（顺查：原版 -> 衍生） -->
         <div class="derived-panel" v-if="derivedForDoc.length">
@@ -340,6 +340,11 @@ onMounted(async () => {
   background: #fcfdff;
   border: 1px solid var(--line);
   border-radius: 8px;
+  /* 知识浏览预览：禁止选择/复制 */
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
   padding: 14px 16px;
 }
 .year-bar {
