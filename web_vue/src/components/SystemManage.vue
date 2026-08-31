@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, inject, computed, watch } from "vue";
+import { ref, reactive, onMounted, inject, computed, watch } from "vue";
 import { api } from "../api.js";
 import Modal from "./Modal.vue";
 import CategoryManage from "./CategoryManage.vue";
@@ -85,6 +85,105 @@ async function toggleWatermark() {
 
 const activeCard = ref(null); // 当前打开的弹窗 key
 const reindexing = ref(false);
+
+// ============ 邮件系统配置 ============
+const emailForm = reactive({
+  enabled: "0", type: "smtp", host: "", port: "", user: "", password: "", to: "",
+  notify_pull: "0", notify_register: "0",
+});
+const emailSaving = ref(false);
+const emailTesting = ref(false);
+const emailMsg = ref("");
+const emailOk = ref(false);
+
+function applyTypeHint(type) {
+  // 选 QQ/126/163 时自动带出常见 SMTP 主机与端口（端口仍可被用户改）
+  const hints = { qq: { host: "smtp.qq.com", port: "465" }, 126: { host: "smtp.126.com", port: "465" }, 163: { host: "smtp.163.com", port: "465" } };
+  const h = hints[type];
+  if (h) {
+    if (!emailForm.host) emailForm.host = h.host;
+    if (!emailForm.port) emailForm.port = h.port;
+  }
+}
+
+async function loadEmail() {
+  try {
+    const r = await api.emailConfig();
+    if (r && r.ok) {
+      const c = r.config || {};
+      emailForm.enabled = c.EMAIL_ENABLED || "0";
+      emailForm.type = c.EMAIL_TYPE || "smtp";
+      emailForm.host = c.EMAIL_HOST || "";
+      emailForm.port = c.EMAIL_PORT || "";
+      emailForm.user = c.EMAIL_USER || "";
+      emailForm.password = c.EMAIL_PASSWORD || ""; // 占位「已设置」时不改
+      emailForm.to = c.EMAIL_TO || "";
+      emailForm.notify_pull = c.EMAIL_NOTIFY_PULL || "0";
+      emailForm.notify_register = c.EMAIL_NOTIFY_REGISTER || "0";
+    }
+  } catch (e) {
+    // 静默：打开弹窗失败不阻断
+  }
+}
+
+async function saveEmail() {
+  emailMsg.value = "";
+  emailSaving.value = true;
+  try {
+    // 若类型为 QQ/126/163 且用户未改主机，自动补全
+    applyTypeHint(emailForm.type);
+    const payload = {
+      EMAIL_ENABLED: emailForm.enabled, EMAIL_TYPE: emailForm.type,
+      EMAIL_HOST: emailForm.host, EMAIL_PORT: emailForm.port,
+      EMAIL_USER: emailForm.user, EMAIL_PASSWORD: emailForm.password,
+      EMAIL_TO: emailForm.to,
+      EMAIL_NOTIFY_PULL: emailForm.notify_pull, EMAIL_NOTIFY_REGISTER: emailForm.notify_register,
+    };
+    const r = await api.saveEmailConfig(payload);
+    if (r && r.ok) {
+      emailOk.value = true;
+      emailMsg.value = "配置已保存至 .env";
+    } else {
+      emailOk.value = false;
+      emailMsg.value = (r && r.detail) || "保存失败";
+    }
+  } catch (e) {
+    emailOk.value = false;
+    emailMsg.value = "保存失败：" + (e && e.message ? e.message : e);
+  } finally {
+    emailSaving.value = false;
+  }
+}
+
+async function testEmail() {
+  emailMsg.value = "";
+  emailTesting.value = true;
+  try {
+    // 测试前先尝试保存当前填写（含未保存的授权码），再发测试
+    applyTypeHint(emailForm.type);
+    const payload = {
+      EMAIL_ENABLED: emailForm.enabled, EMAIL_TYPE: emailForm.type,
+      EMAIL_HOST: emailForm.host, EMAIL_PORT: emailForm.port,
+      EMAIL_USER: emailForm.user, EMAIL_PASSWORD: emailForm.password,
+      EMAIL_TO: emailForm.to,
+      EMAIL_NOTIFY_PULL: emailForm.notify_pull, EMAIL_NOTIFY_REGISTER: emailForm.notify_register,
+    };
+    const r = await api.testEmailConfig(payload);
+    if (r && r.ok) {
+      emailOk.value = true;
+      emailMsg.value = "测试邮件已发送：" + (r.detail || "");
+    } else {
+      emailOk.value = false;
+      emailMsg.value = "发送失败：" + (r && r.detail ? r.detail : "未知错误");
+    }
+  } catch (e) {
+    emailOk.value = false;
+    emailMsg.value = "发送失败：" + (e && e.message ? e.message : e);
+  } finally {
+    emailTesting.value = false;
+  }
+}
+
 const me = ref(null); // 当前登录用户
 
 async function load() {
@@ -291,6 +390,7 @@ const cards = computed(() => {
     { key: "watermark", icon: "🌐", title: "页面水印", desc: "为所有内容页叠加账号姓名水印" },
   ];
   if (isAdmin.value) {
+    base.push({ key: "email", icon: "✉", title: "邮件系统配置", desc: "SMTP 通知：拉取更新 / 注册审核" });
     base.push({ key: "init", icon: "🔧", title: "系统初始化", desc: "清除文档 / 提取内容 / 重建索引", danger: true });
   }
   return base;
@@ -305,7 +405,10 @@ const allCards = computed(() => {
 
 function onCardClick(c) {
   if (c.group === "sub") openSub(c.key);
-  else activeCard.value = c.key;
+  else {
+    activeCard.value = c.key;
+    if (c.key === "email") loadEmail(); // 打开邮件配置弹窗时拉取当前配置
+  }
 }
 
 function statusText(key) {
@@ -397,6 +500,58 @@ onMounted(load);
       <button class="btn" @click="activeCard = null">关闭</button>
       <button class="btn primary" :disabled="reindexing" @click="reindex">
         {{ reindexing ? "重建中…" : "重建索引" }}
+      </button>
+    </template>
+  </Modal>
+
+  <!-- 邮件系统配置 -->
+  <Modal :show="activeCard === 'email'" title="邮件系统配置" @close="activeCard = null">
+    <p class="muted">配置 SMTP 邮件服务，用于云之家拉取内容更新通知、用户注册审核通知。配置写入部署根 <code>.env</code>。</p>
+    <div class="email-switches">
+      <label class="sw"><span>邮件总开关</span><input type="checkbox" v-model="emailForm.enabled" true-value="1" false-value="0" /></label>
+      <label class="sw"><span>拉取内容更新通知</span><input type="checkbox" v-model="emailForm.notify_pull" true-value="1" false-value="0" /></label>
+      <label class="sw"><span>注册审核通知</span><input type="checkbox" v-model="emailForm.notify_register" true-value="1" false-value="0" /></label>
+    </div>
+    <div class="email-form">
+      <div class="form-row2">
+        <label class="fl">邮件类型</label>
+        <select v-model="emailForm.type" @change="applyTypeHint" class="fi">
+          <option value="smtp">SMTP（标准）</option>
+          <option value="qq">QQ 邮箱</option>
+          <option value="126">126 邮箱</option>
+          <option value="163">163 邮箱</option>
+        </select>
+      </div>
+      <div class="form-row2">
+        <label class="fl">SMTP 服务器</label>
+        <input v-model="emailForm.host" class="fi" placeholder="如 smtp.qq.com" />
+      </div>
+      <div class="form-row2">
+        <label class="fl">端口</label>
+        <input v-model="emailForm.port" class="fi" placeholder="465" />
+      </div>
+      <div class="form-row2">
+        <label class="fl">发件账号</label>
+        <input v-model="emailForm.user" class="fi" placeholder="如 123@qq.com" />
+      </div>
+      <div class="form-row2">
+        <label class="fl">授权码</label>
+        <input v-model="emailForm.password" class="fi" type="password"
+          :placeholder="emailForm.password==='已设置'?'已保存，留空不改':'SMTP 授权码（非登录密码）'" />
+      </div>
+      <div class="form-row2">
+        <label class="fl">收件人</label>
+        <input v-model="emailForm.to" class="fi" placeholder="逗号分隔多地址，如 a@qq.com,b@163.com" />
+      </div>
+    </div>
+    <div v-if="emailMsg" class="email-msg" :class="emailOk ? 'ok' : 'err'">{{ emailMsg }}</div>
+    <template #actions>
+      <button class="btn" @click="activeCard = null">关闭</button>
+      <button class="btn" :disabled="emailTesting" @click="testEmail">
+        {{ emailTesting ? "发送中…" : "发送测试邮件" }}
+      </button>
+      <button class="btn primary" :disabled="emailSaving" @click="saveEmail">
+        {{ emailSaving ? "保存中…" : "保存配置" }}
       </button>
     </template>
   </Modal>

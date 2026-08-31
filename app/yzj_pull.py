@@ -22,6 +22,12 @@ import logging
 
 logger = logging.getLogger("yzj_pull")
 
+# 邮件通知（拉取内容更新），导入失败不阻断拉取主流程
+try:
+    import notify_mail
+except Exception:  # noqa: BLE001
+    notify_mail = None
+
 # ---------------- 任务运行态（供前端轮询 / 中止） ----------------
 # _PROGRESS[task_id] = {"running": bool, "aborted": bool, "total": int,
 #                       "processed": int, "stats": {...}, "started_at": ts, "done_at": ts}
@@ -858,6 +864,13 @@ def run_task(task, dry_run=False, limit=None, force=False):
         _PROGRESS[task_id]["running"] = False
         _PROGRESS[task_id]["done_at"] = int(time.time())
         _PROGRESS[task_id]["stats"] = stats
+    # 拉取完成 → 邮件内容更新通知（尽力发送，失败不影响返回值）
+    if notify_mail is not None:
+        try:
+            task_name = (task or {}).get("name", task_id or "云之家任务")
+            notify_mail.notify_pull_update(task_name, stats)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("拉取完成邮件通知失败: %s", e)
     return stats
 
 

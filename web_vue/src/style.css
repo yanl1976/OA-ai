@@ -292,3 +292,16 @@ a { color: var(--primary); text-decoration: none; }
 .info-row b.ok { color: var(--ok); }
 .info-row b.warn { color: #b45309; }
 .info-row b.mono, b.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; text-align: right; max-width: 60%; }
+
+/* ===== 邮件系统配置 ===== */
+.email-switches { display: flex; flex-wrap: wrap; gap: 18px 28px; margin: 6px 0 14px; }
+.email-switches .sw { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.email-switches .sw input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent, #2563eb); }
+.email-form { display: flex; flex-direction: column; gap: 10px; }
+.form-row2 { display: flex; align-items: center; gap: 12px; }
+.form-row2 .fl { flex: 0 0 96px; color: var(--muted); font-size: 13px; text-align: right; }
+.form-row2 .fi { flex: 1 1 auto; min-width: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 13.5px; background: var(--bg, #fff); color: var(--fg, #1f2937); }
+.form-row2 select.fi { cursor: pointer; }
+.email-msg { margin-top: 10px; font-size: 13px; padding: 7px 11px; border-radius: 8px; }
+.email-msg.ok { color: #166534; background: #dcfce7; border: 1px solid #86efac; }
+.email-msg.err { color: #991b1b; background: #fee2e2; border: 1px solid #fca5a5; }

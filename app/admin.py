@@ -18,6 +18,7 @@ import json
 from datetime import datetime, timezone
 
 import user_pool
+import notify_mail
 
 # ============ 路径 ============
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -881,6 +882,12 @@ def approve_registration(reg_id: int, reviewer_id=None, role_id=None, note="") -
         # 注：用户池不落库，账号建好后「已注册」状态由工号自动派生，无需回写文件。
     finally:
         conn.close()
+    # 注册审核通过通知（邮件，尽力发送，失败不影响审批结果）
+    try:
+        notify_mail.notify_register("approved", reg["emp_no"], reg["name"],
+                                     reviewer=str(reviewer_id or ""), note=note)
+    except Exception:  # noqa: BLE001
+        pass
     return uid
 
 
@@ -899,6 +906,12 @@ def reject_registration(reg_id: int, reviewer_id=None, note=""):
         conn.commit()
     finally:
         conn.close()
+    # 注册审核驳回通知（邮件，尽力发送）
+    try:
+        notify_mail.notify_register("rejected", reg["emp_no"], reg["name"],
+                                     reviewer=str(reviewer_id or ""), note=note)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ============ 分类 ============

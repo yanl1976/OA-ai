@@ -55,6 +55,11 @@ export const api = {
   deletePoolEntry: (empNo) => api.del("/api/admin/user-pool/" + encodeURIComponent(empNo)),
   importUserPool: (items, mode) => api.post("/api/admin/user-pool/import", { items, mode }),
 
+  // 邮件系统配置
+  emailConfig: () => api.get("/api/admin/email-config"),
+  saveEmailConfig: (cfg) => api.post("/api/admin/email-config", cfg),
+  testEmailConfig: (cfg) => api.post("/api/admin/email-config/test", cfg || {}),
+
   categories: () => api.get("/api/kb/categories"),
   categoriesAll: () => api.get("/api/kb/categories_all"),
   documents: (params) => {

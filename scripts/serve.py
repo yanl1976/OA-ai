@@ -103,6 +103,7 @@ os.environ["KB_ROOT"] = KB_ROOT
 sys.path.insert(0, os.path.join(KB_ROOT, "app"))
 
 import admin
+import notify_mail
 import kb_store
 import search as kb_search_mod
 import vec_store
@@ -1962,6 +1963,36 @@ def yzj_task_status(task_id):
 def yzj_task_progress_all():
     import yzj_pull
     return jsonify({"ok": True, "progress": yzj_pull._PROGRESS})
+
+
+# ===================== 邮件系统配置 =====================
+@app.route("/api/admin/email-config", methods=["GET"])
+@login_required("system.manage")
+def email_config_get():
+    return jsonify({"ok": True, "config": notify_mail.load_config(),
+                    "typeHints": notify_mail.TYPE_HINTS})
+
+
+@app.route("/api/admin/email-config", methods=["POST"])
+@login_required("system.manage")
+def email_config_post():
+    data = request.get_json(force=True, silent=True) or {}
+    # 仅接受白名单键，防止写入任意环境变量
+    cfg = {k: data.get(k) for k in notify_mail.KEYS if k in data}
+    saved = notify_mail.save_config(cfg)
+    return jsonify({"ok": True, "config": saved})
+
+
+@app.route("/api/admin/email-config/test", methods=["POST"])
+@login_required("system.manage")
+def email_config_test():
+    data = request.get_json(force=True, silent=True) or {}
+    # 测试前可临时合并本次提交(若用户先改未保存)，再发测试
+    if any(k in data for k in notify_mail.KEYS):
+        cfg = {k: data.get(k) for k in notify_mail.KEYS if k in data}
+        notify_mail.save_config(cfg)
+    ok, detail = notify_mail.send_test(force=True)
+    return jsonify({"ok": ok, "detail": detail})
 
 
 @app.route("/api/yzj/pulled-docs")
