@@ -17,10 +17,43 @@ import secrets
 import json
 from datetime import datetime, timezone
 
+import user_pool
+
 # ============ 路径 ============
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(KB_ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "kb_admin.db")
+# 用户池：工号/姓名/部门/预设角色全部落在 config/user_pool.json，
+# 本模块只关联该文件（读写与文件格式见 app/user_pool.py），名单不再硬编码进源码。
+USER_POOL_FILE = os.path.join(KB_ROOT, "config", "user_pool.json")
+# 与本模块对齐根目录（user_pool 在 import 时已按 KB_ROOT 推过一次，这里再同步一次，
+# 杜绝「admin 用一个根、user_pool 读写另一个根」的配置分裂）
+user_pool.set_root(KB_ROOT)
+
+
+def _env_get(key: str, default: str = "") -> str:
+    """读取配置项：os.environ 优先，未命中再回落到 .env 文件文本。
+
+    【为什么不用 load_dotenv】serve.py 启动时会以 override=True 加载 .env 并
+    **校验/纠正** KB_ROOT（遇到非法值会回退到推导值）。本模块若在 import 时再
+    加载一次 .env，会把已被纠正的 KB_ROOT 又覆盖成 .env 里的错误值，导致索引与
+    文档全部找不着。因此这里只做「按需读取」，且**绝不写回 os.environ**。
+    """
+    v = (os.environ.get(key) or "").strip()
+    if v:
+        return v
+    try:
+        with open(os.path.join(KB_ROOT, ".env"), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, val = line.partition("=")
+                if k.strip().lstrip("export ").strip() == key:
+                    return val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
 
 # ============ 权限目录 (固定) ============
 # 每个权限项: (key, name, description, group)
@@ -82,15 +115,31 @@ DEFAULT_ROLES = {
         "kb.doc.upload", "derived.manage", "graph.view"], "builtin": 0},
 }
 
-# 默认管理员
-DEFAULT_ADMIN_USER = "admin"
-DEFAULT_ADMIN_PASS = "Admin@123"
+# ============ 默认管理员 ============
+# 【安全铁律】本文件受 Git 版本控制，**禁止出现任何明文口令**。
+# 初始管理员口令只有两个来源（按优先级）：
+#   1) 部署方在 .env 显式配置 KB_ADMIN_PASS（推荐，口令不进版本库）
+#   2) 首次建库时随机生成，仅写入 data/initial_admin_password.txt（data/ 已被
+#      .gitignore 排除）并打印到启动日志，由运维首次登录后自行修改并删除该文件。
+# 历史教训：曾把默认口令硬编码在本文件，随仓库公开即等于口令泄露；
+# 且改这里【不会】影响已存在库里的 admin 账号（建库后才用到），
+# 存量环境请用 scripts/reset_admin_password.py 重置。
+DEFAULT_ADMIN_USER = _env_get("KB_ADMIN_USER", "admin") or "admin"
+INITIAL_PASS_FILE = os.path.join(DATA_DIR, "initial_admin_password.txt")
+
+# ============ 用户池（自助注册白名单） ============
+# 自助注册时，用户填写的「工号 + 姓名」必须命中用户池且姓名完全一致，
+# 并继承池中为该工号预设的角色（即「用户池给定的权限」）。
+#
+# 池数据本身【不在本文件】：统一存于 config/user_pool.json（见 app/user_pool.py）。
+# 该文件可直接用真实花名册替换，或在「用户管理 → 用户池」中批量导入写回。
+# 注册占用状态不落库，按 users 表的工号实时派生（删账号即自动释放）。
 
 # 功能开关默认项 (对“现有功能”的管理)
 DEFAULT_FEATURES = [
     ("graph_enabled",   "3D 知识图谱",   "开启后用户可访问 3D 神经网络知识图谱", 1),
     ("search_enabled",  "检索接口",      "开启 BM25 检索与检索 API",              1),
-    ("register_enabled","自助注册",      "允许访客自行注册为只读账号",             0),
+    ("register_enabled","自助注册",      "允许用户按「工号+姓名」自助注册，命中的用户池赋予对应角色，且须管理员审批通过后方可登录", 1),
     ("upload_enabled",  "文档上传",      "允许用户上传文档扩充知识库",             1),
     ("api_public",      "开放检索 API",  "无需登录即可调用 /api/query",          0),
     ("watermark_enabled","页面水印",      "为所有内容显示页叠加使用者账号+姓名水印", 1),
@@ -109,6 +158,36 @@ def verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
     salt = bytes.fromhex(salt_hex)
     _, dk = hash_password(password, salt)
     return secrets.compare_digest(dk, hash_hex)
+
+
+# 随机口令字符表：已剔除易混淆字符 0/O、1/l/I，避免运维抄错
+_PWD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*-_=+"
+
+
+def generate_password(length: int = 16) -> str:
+    """生成随机强口令（初始管理员口令未配置时使用）。"""
+    return "".join(secrets.choice(_PWD_ALPHABET) for _ in range(length))
+
+
+def _initial_admin_password() -> tuple:
+    """返回 (口令, 来源)；来源为 'env'（.env 指定）或 'generated'（随机生成）。
+
+    随机生成时同步落盘到 data/initial_admin_password.txt，便于运维查看；
+    该文件位于已被 .gitignore 排除的 data/ 下，不会进版本库。
+    """
+    env_pass = _env_get("KB_ADMIN_PASS")
+    if env_pass:
+        return env_pass, "env"
+    pwd = generate_password()
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(INITIAL_PASS_FILE, "w", encoding="utf-8") as f:
+            f.write("账号: %s\n口令: %s\n\n"
+                    "（首次初始化时随机生成。请登录后立即修改密码，并删除本文件）\n"
+                    % (DEFAULT_ADMIN_USER, pwd))
+    except OSError as e:  # noqa: BLE001
+        print("[警告] 初始管理员口令写入失败（请留意上方日志中的口令）: %s" % e)
+    return pwd, "generated"
 
 
 def _now() -> str:
@@ -183,7 +262,44 @@ def init_db(seed: bool = True):
         `key` TEXT PRIMARY KEY,
         value TEXT
     );
+    -- 注册申请：提交后为 pending，管理员审批(approved)时才真正建 users 账号。
+    CREATE TABLE IF NOT EXISTS user_registrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        emp_no TEXT NOT NULL,
+        name TEXT NOT NULL,
+        dept TEXT DEFAULT '',
+        password_salt TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        pool_role TEXT DEFAULT '',
+        role_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        apply_at TEXT,
+        review_at TEXT,
+        reviewer_id INTEGER,
+        review_note TEXT DEFAULT '',
+        user_id INTEGER,
+        FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE SET NULL
+    );
     """)
+    # 迁移：用户池已改为文件驱动（config/user_pool.json），早期版本建的 user_pool
+    # 表不再使用，直接删除，避免留下「改了表不生效 / 改了文件不生效」的双份数据源。
+    # 该表只存在于尚未上线的开发库，无历史数据风险。
+    try:
+        cur.execute("PRAGMA foreign_keys=OFF")
+        cur.execute("DROP TABLE IF EXISTS user_pool")
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            cur.execute("PRAGMA foreign_keys=ON")
+        except Exception:  # noqa: BLE001
+            pass
+    # 迁移：申请单改为记录「池中的角色名」（pool_role），便于审批时核对；
+    # 早期库没有该列，按需补齐（pool_id 列已废弃，保留不影响）。
+    cur.execute("PRAGMA table_info(user_registrations)")
+    rcols = [r[1] for r in cur.fetchall()]
+    if "pool_role" not in rcols:
+        cur.execute("ALTER TABLE user_registrations ADD COLUMN pool_role TEXT DEFAULT ''")
     # 迁移：为已存在的库补充 parent_id 列（支持分类层级）
     cur.execute("PRAGMA table_info(categories)")
     cols = [r[1] for r in cur.fetchall()]
@@ -249,11 +365,10 @@ def _seed(conn, cur):
     perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
     # 存量库自动关联新权限到已拥有相关权限的角色
     _wire_new_permissions(conn, cur, perm_ids)
-    # 建立分类树（幂等）→ 同步分类维度的浏览/查询/下载权限，并迁移旧权限、授权默认角色
-    ensure_category_hierarchy(conn=conn, cur=cur)
-    sync_category_permissions(conn=conn, cur=cur)
-    # 重新读取权限 id 映射（已含动态分类权限）
-    perm_ids = {r["key"]: r["id"] for r in cur.execute("SELECT id,`key` FROM permissions").fetchall()}
+    # 【顺序要求】先建角色，再建分类树并同步分类权限：
+    # sync_category_permissions 只对【已存在】的角色授予分类浏览/查询权限，
+    # 若在角色创建之前调用，全新库下的 admin/editor/viewer 都拿不到分类权限，
+    # 表现为「新注册用户审批通过后登录，侧边栏与知识库一片空白」。
     # 角色（builtin 标志控制是否允许删除；示例角色 builtin=0 可删改）
     for rname, meta in DEFAULT_ROLES.items():
         is_builtin = int(meta.get("builtin", 1))
@@ -264,18 +379,67 @@ def _seed(conn, cur):
             if pk in perm_ids:
                 cur.execute("INSERT OR IGNORE INTO role_permissions(role_id, permission_id) VALUES (?,?)",
                             (rid, perm_ids[pk]))
+    # 角色就绪后建立分类树并同步分类权限（admin 全量、editor/viewer 全量 view+search）
+    ensure_category_hierarchy(conn=conn, cur=cur)
+    sync_category_permissions(conn=conn, cur=cur)
     # 默认管理员
     admin_role = cur.execute("SELECT id FROM roles WHERE name='admin'").fetchone()["id"]
     if not cur.execute("SELECT 1 FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone():
-        salt, h = hash_password(DEFAULT_ADMIN_PASS)
+        pwd, source = _initial_admin_password()
+        salt, h = hash_password(pwd)
         cur.execute(
             "INSERT INTO users(username, display_name, password_salt, password_hash, role_id, status, created_at) "
             "VALUES (?,?,?,?,?,1,?)",
             (DEFAULT_ADMIN_USER, "系统管理员", salt, h, admin_role, _now()))
+        if source == "generated":
+            # 随机口令只在创建时出现这一次，必须显著打印，否则运维无从登录
+            print("=" * 66)
+            print("[重要] 已创建默认管理员账号：%s" % DEFAULT_ADMIN_USER)
+            print("       初始口令（随机生成）：%s" % pwd)
+            print("       口令同时已写入：%s" % INITIAL_PASS_FILE)
+            print("       请首次登录后立即修改密码，并删除上述口令文件。")
+            print("       如需固定口令，请在 .env 配置 KB_ADMIN_PASS 后重建 data/kb_admin.db。")
+            print("=" * 66)
     # 功能开关
     for key, name, desc, en in DEFAULT_FEATURES:
         cur.execute("INSERT OR IGNORE INTO feature_flags(`key`, name, description, enabled) VALUES (?,?,?,?)",
                     (key, name, desc, en))
+    _migrate_register_feature(conn, cur)
+
+
+# 旧版「自助注册」开关的描述文案（用于识别"从未配置过"的存量库）
+_OLD_REGISTER_DESC = "允许访客自行注册为只读账号"
+
+
+def _migrate_register_feature(conn, cur):
+    """把旧语义的 register_enabled 升级为「用户池 + 审批」语义。
+
+    旧开关含义是「访客自助注册为只读账号」，默认关闭；新语义是「工号+姓名
+    匹配用户池、按池授权、管理员审批」，默认应开启。这里仅在开关描述仍为旧
+    文案（说明管理员从未按新语义配置过）时，一并刷新描述并置为开启；
+    若管理员已显式配置过（描述已是新文案或已被改动），则只补描述、不覆盖其值。
+    """
+    # 【顺序要求】必须先读旧描述再刷新描述：若先把描述更新成新文案，
+    # 下一次比对永远不相等，迁移条件形同虚设（开关会一直停留在旧值 0）。
+    row = cur.execute(
+        "SELECT description, enabled FROM feature_flags WHERE `key`='register_enabled'").fetchone()
+    never_configured = bool(row) and (row["description"] or "") == _OLD_REGISTER_DESC
+    for key, name, desc, _en in DEFAULT_FEATURES:
+        cur.execute("UPDATE feature_flags SET name=?, description=? WHERE `key`=?", (name, desc, key))
+    if never_configured:
+        cur.execute("UPDATE feature_flags SET enabled=1 WHERE `key`='register_enabled'")
+
+
+def _ensure_user_pool_file():
+    """确保 config/user_pool.json 存在（缺失时按虚拟池模板生成）。
+
+    在服务启动路径调用：让管理员第一次打开「用户池」页就有文件可看，
+    也便于直接编辑文件。内容由 user_pool.DEFAULT_DOC 决定。
+    """
+    try:
+        user_pool.load_doc()
+    except Exception as e:  # noqa: BLE001
+        print("[警告] 用户池文件不可用（%s）：%s" % (USER_POOL_FILE, e))
 
 
 # ============ 权限 / 角色 查询 ============
@@ -491,9 +655,250 @@ def delete_user(user_id: int):
     if user and user["username"] == DEFAULT_ADMIN_USER:
         conn.close()
         raise ValueError("默认管理员不可删除")
+    conn.execute("UPDATE user_registrations SET user_id=NULL WHERE user_id=?", (user_id,))
     conn.execute("DELETE FROM users WHERE id=?", (user_id,))
     conn.commit()
     conn.close()
+    # 注：用户池占用状态按 users 表的工号实时派生，删除账号后工号自动可重新注册，
+    # 无需在此清理任何占用标记（见 list_user_pool）。
+
+
+# ============ 用户池（自助注册白名单） ============
+# 池数据本身存于 config/user_pool.json（见 app/user_pool.py）；
+# 本节函数只做「读文件 + 关联数据库派生状态」，不把名单复制进数据库。
+def list_user_pool(only_enabled: bool = False) -> list:
+    """用户池列表：文件内容 + 数据库派生的注册状态。
+
+    派生字段（不落库，故不会出现与 users 表不一致的脏状态）：
+      used            工号已注册（users 表中存在同名账号）
+      used_user_id / used_username
+      pending         存在待审批申请
+      role_id         池中的角色名解析出的角色 id（角色不存在则为 None）
+    """
+    entries = user_pool.list_entries(only_enabled=only_enabled)
+    if not entries:
+        return []
+    conn = _conn()
+    role_ids = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM roles").fetchall()}
+    users_by_no = {r["username"]: r for r in conn.execute(
+        "SELECT id, username, display_name FROM users").fetchall()}
+    pending = {r["emp_no"] for r in conn.execute(
+        "SELECT emp_no FROM user_registrations WHERE status='pending'").fetchall()}
+    conn.close()
+    out = []
+    for e in entries:
+        u = users_by_no.get(e["emp_no"])
+        out.append({
+            "emp_no": e["emp_no"], "name": e["name"], "dept": e["dept"],
+            "role": e["role"], "role_id": role_ids.get(e["role"]),
+            "status": e["status"], "note": e["note"],
+            "used": 1 if u else 0,
+            "used_user_id": u["id"] if u else None,
+            "used_username": u["username"] if u else None,
+            "pending": 1 if e["emp_no"] in pending else 0,
+        })
+    return out
+
+
+def _norm(v) -> str:
+    return ("" if v is None else str(v)).strip()
+
+
+def _role_names() -> set:
+    conn = _conn()
+    names = {r["name"] for r in conn.execute("SELECT name FROM roles").fetchall()}
+    conn.close()
+    return names
+
+
+def user_pool_info() -> dict:
+    """用户池文件元信息（路径 / 来源 / 更新时间），供界面提示管理员去哪里改。"""
+    info = user_pool.pool_info()
+    info["file"] = USER_POOL_FILE
+    return info
+
+
+def create_pool_entry(emp_no, name, dept="", role="", note="", status=1):
+    """新增池条目（直接写入 config/user_pool.json）。"""
+    if role and role not in _role_names():
+        raise ValueError("角色「%s」不存在" % role)
+    return user_pool.create_entry(emp_no, name, dept=dept, role=role,
+                                  status=status, note=note)
+
+
+def update_pool_entry(emp_no, data: dict):
+    """更新池条目（按工号定位，允许改工号）。
+
+    【防呆】已注册账号的工号不允许改名：改名后 users 表里的账号（username 仍是旧工号）
+    再也匹配不上池中条目，会表现为「已注册却显示未注册、占用状态丢失」。
+    """
+    if "role" in data and data["role"] and data["role"] not in _role_names():
+        raise ValueError("角色「%s」不存在" % data["role"])
+    if "emp_no" in data and _norm(data.get("emp_no")) != _norm(emp_no):
+        conn = _conn()
+        exists = conn.execute("SELECT 1 FROM users WHERE username=?", (_norm(emp_no),)).fetchone()
+        conn.close()
+        if exists:
+            raise ValueError("该工号已注册账号，不允许修改工号（请先删除对应账号）")
+    return user_pool.update_entry(emp_no, data)
+
+
+def delete_pool_entry(emp_no):
+    """删除池条目（不影响已注册账号，仅使其无法再自助注册）。"""
+    return user_pool.delete_entry(emp_no)
+
+
+def import_user_pool(items: list, mode: str = "merge") -> dict:
+    """批量导入用户池（真实花名册走这里），结果写回 config/user_pool.json。
+
+    items: [{emp_no, name, dept?, role?}]，role 为【角色名】。
+    mode:  merge   —— 同工号更新、新工号新增
+           replace —— 先清空【未被注册占用】的条目再导入
+    返回 {created, updated, skipped, cleared, errors:[{row, msg}]}
+    """
+    if not isinstance(items, list):
+        raise ValueError("导入数据必须是数组")
+    result = {"created": 0, "updated": 0, "skipped": 0, "cleared": 0, "errors": []}
+    if mode == "replace":
+        # 保留已注册工号：删掉它们的池条目会让「已注册员工」在界面上凭空消失
+        keep = [p["emp_no"] for p in list_user_pool() if p["used"]]
+        result["cleared"] = user_pool.clear_entries(keep_emp_nos=keep)
+    r = user_pool.import_entries(items, mode=mode, valid_roles=_role_names())
+    result.update({k: r[k] for k in ("created", "updated", "skipped", "errors")})
+    return result
+
+
+def _norm(v) -> str:
+    return ("" if v is None else str(v)).strip()
+
+
+# ============ 注册申请与审批 ============
+def min_password_length() -> int:
+    return 6
+
+
+def create_registration(emp_no, name, password) -> int:
+    """提交注册申请。
+
+    校验链（用户池来自 config/user_pool.json）：
+    工号在池 → 池条目启用 → 姓名与池中完全一致 → 未被注册（users 表无同名账号）
+    → 无在审申请。全部通过才写入 pending 申请，由管理员审批后生成账号。
+    """
+    emp_no, name = _norm(emp_no), _norm(name)
+    if not emp_no or not name:
+        raise ValueError("工号与姓名不能为空")
+    if not password or len(password) < min_password_length():
+        raise ValueError("密码至少 %d 位" % min_password_length())
+    entry = user_pool.get_entry(emp_no)
+    if not entry:
+        raise ValueError("工号「%s」不在用户池中，请联系系统管理员" % emp_no)
+    if entry["status"] != 1:
+        raise ValueError("工号「%s」已被停用，请联系系统管理员" % emp_no)
+    if entry["name"] != name:
+        raise ValueError("工号与姓名不匹配，请核对后重新填写")
+    conn = _conn()
+    try:
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (emp_no,)).fetchone():
+            raise ValueError("该工号已注册，请直接登录")
+        if conn.execute("SELECT 1 FROM user_registrations WHERE emp_no=? AND status='pending'",
+                        (emp_no,)).fetchone():
+            raise ValueError("该工号的注册申请已在审批中，请等待管理员处理")
+        # 角色按【名称】解析：池文件里存的是角色名，避免角色 id 在环境间漂移
+        role_id = None
+        if entry["role"]:
+            row = conn.execute("SELECT id FROM roles WHERE name=?", (entry["role"],)).fetchone()
+            role_id = row["id"] if row else None
+        salt, h = hash_password(password)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO user_registrations(emp_no, name, dept, password_salt, password_hash, "
+            "pool_role, role_id, status, apply_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
+            (emp_no, name, entry["dept"], salt, h, entry["role"], role_id, _now()))
+        rid = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return rid
+
+
+def list_registrations(status: str = None) -> list:
+    """注册申请列表（不返回密码哈希）。pending 排在最前。"""
+    conn = _conn()
+    sql = ("SELECT r.id, r.emp_no, r.name, r.dept, r.role_id, ro.name AS role_name, "
+           "r.status, r.apply_at, r.review_at, r.reviewer_id, r.review_note, r.user_id, "
+           "u.username AS reviewer_name, au.username AS created_username "
+           "FROM user_registrations r "
+           "LEFT JOIN roles ro ON r.role_id=ro.id "
+           "LEFT JOIN users u ON r.reviewer_id=u.id "
+           "LEFT JOIN users au ON r.user_id=au.id")
+    args = []
+    if status:
+        sql += " WHERE r.status=?"
+        args.append(status)
+    sql += " ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END, r.id DESC"
+    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+    conn.close()
+    return rows
+
+
+def pending_registration_by_emp(emp_no):
+    """按工号查在审申请（登录失败时用于给出「待审批」的准确提示）。"""
+    conn = _conn()
+    row = conn.execute(
+        "SELECT id, emp_no, name, status FROM user_registrations "
+        "WHERE emp_no=? AND status='pending'", (_norm(emp_no),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def approve_registration(reg_id: int, reviewer_id=None, role_id=None, note="") -> int:
+    """审批通过：按申请中保存的密码哈希直接建账号（status=1 可登录）。"""
+    conn = _conn()
+    try:
+        reg = conn.execute("SELECT * FROM user_registrations WHERE id=?", (reg_id,)).fetchone()
+        if not reg:
+            raise ValueError("申请不存在")
+        if reg["status"] != "pending":
+            raise ValueError("该申请已处理（%s）" % reg["status"])
+        final_role = role_id if role_id not in (None, "", 0) else reg["role_id"]
+        if final_role is None:
+            raise ValueError("该工号未预设角色，请先为用户池条目指定角色")
+        if not conn.execute("SELECT 1 FROM roles WHERE id=?", (final_role,)).fetchone():
+            raise ValueError("角色不存在（id=%s）" % final_role)
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (reg["emp_no"],)).fetchone():
+            raise ValueError("账号「%s」已存在，无法重复创建" % reg["emp_no"])
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users(username, display_name, password_salt, password_hash, role_id, status, created_at) "
+            "VALUES (?,?,?,?,?,1,?)",
+            (reg["emp_no"], reg["name"], reg["password_salt"], reg["password_hash"], final_role, _now()))
+        uid = cur.lastrowid
+        cur.execute(
+            "UPDATE user_registrations SET status='approved', role_id=?, review_at=?, reviewer_id=?, "
+            "review_note=?, user_id=? WHERE id=?",
+            (final_role, _now(), reviewer_id, _norm(note), uid, reg_id))
+        conn.commit()
+        # 注：用户池不落库，账号建好后「已注册」状态由工号自动派生，无需回写文件。
+    finally:
+        conn.close()
+    return uid
+
+
+def reject_registration(reg_id: int, reviewer_id=None, note=""):
+    """驳回申请（保留记录与原因，工号不占用，用户可重新提交）。"""
+    conn = _conn()
+    try:
+        reg = conn.execute("SELECT * FROM user_registrations WHERE id=?", (reg_id,)).fetchone()
+        if not reg:
+            raise ValueError("申请不存在")
+        if reg["status"] != "pending":
+            raise ValueError("该申请已处理（%s）" % reg["status"])
+        conn.execute(
+            "UPDATE user_registrations SET status='rejected', review_at=?, reviewer_id=?, review_note=? "
+            "WHERE id=?", (_now(), reviewer_id, _norm(note), reg_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ============ 分类 ============

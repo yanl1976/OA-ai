@@ -10,6 +10,8 @@
     POST /api/auth/login            -> 登录
     POST /api/auth/logout           -> 登出
     GET  /api/auth/me               -> 当前用户
+    GET  /api/auth/register-info    -> 注册开关与密码要求
+    POST /api/auth/register         -> 自助注册（工号+姓名须在用户池，提交后待审批）
     GET  /api/health                -> 健康检查
     GET  /api/query                 -> BM25 检索 (受 api_public 开关控制)
 
@@ -30,6 +32,12 @@
     GET  /api/admin/permissions     -> 权限目录 (permission.view)
     GET/POST/PUT/DELETE /api/admin/roles[/<id>]   (role.manage)
     GET/POST/PUT/DELETE /api/admin/users[/<id>]   (user.view / user.manage)
+    GET  /api/admin/registrations                 -> 注册申请列表 (user.view)
+    POST /api/admin/registrations/<id>/approve    -> 审批通过并建账号 (user.manage)
+    POST /api/admin/registrations/<id>/reject     -> 驳回申请 (user.manage)
+    GET/POST /api/admin/user-pool                 -> 用户池白名单 (user.view / user.manage)
+    POST /api/admin/user-pool/import              -> 用户池批量导入 (user.manage)
+    PUT/DELETE /api/admin/user-pool/<emp_no>      -> 按工号编辑/删除池条目 (user.manage)
     GET/PUT /api/admin/features[/<key>]           (system.manage)
     POST /api/admin/reindex                          (system.manage)
     GET  /api/admin/stats                             (system.manage)
@@ -492,11 +500,41 @@ def auth_login():
     password = data.get("password") or ""
     user = admin.authenticate(username, password)
     if not user:
+        # 认证失败时区分「待审批」：注册申请尚未经管理员审批，账号根本不存在，
+        # 若只报「用户名或密码错误」用户会反复重试而不知原因。
+        if admin.pending_registration_by_emp(username):
+            return jsonify({"error": "该工号的注册申请已提交，请等待管理员审批通过后登录"}), 403
         return jsonify({"error": "用户名或密码错误，或账号已禁用"}), 401
     session["user_id"] = user["id"]
     session.permanent = True
     admin.update_last_login(user["id"])
     return jsonify({"ok": True, "user": _current_user()})
+
+
+@app.route("/api/auth/register-info")
+def auth_register_info():
+    """注册页公开信息：开关是否开启 + 密码长度要求。"""
+    return jsonify({
+        "enabled": bool(admin.get_feature("register_enabled", 0)),
+        "min_password_length": admin.min_password_length(),
+    })
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    """自助注册：工号+姓名须命中用户池，提交后进入 pending，等管理员审批。"""
+    if not admin.get_feature("register_enabled", 0):
+        return jsonify({"error": "自助注册已关闭，请联系系统管理员"}), 403
+    data = request.get_json(silent=True) or {}
+    emp_no = (data.get("emp_no") or data.get("username") or "").strip()
+    name = (data.get("name") or data.get("display_name") or "").strip()
+    password = data.get("password") or ""
+    try:
+        rid = admin.create_registration(emp_no, name, password)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "status": "pending", "id": rid,
+                    "msg": "注册申请已提交，请等待管理员审批通过后登录"})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -1684,6 +1722,113 @@ def adm_user_update(uid):
         return jsonify({"ok": True})
 
 
+# ===================== 注册审批 =====================
+def _int_or_none(v):
+    if v in (None, "", 0, "0"):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route("/api/admin/registrations")
+@login_required("user.view")
+def adm_registrations():
+    """注册申请列表（附带用户池与角色，供审批页一次取全）。"""
+    regs = admin.list_registrations()
+    return jsonify({
+        "registrations": regs,
+        "pending_count": sum(1 for r in regs if r["status"] == "pending"),
+        "roles": admin.list_roles(with_perms=False),
+    })
+
+
+@app.route("/api/admin/registrations/<int:reg_id>/approve", methods=["POST"])
+@login_required("user.manage")
+def adm_registration_approve(reg_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        uid = admin.approve_registration(
+            reg_id, reviewer_id=session.get("user_id"),
+            role_id=_int_or_none(data.get("role_id")), note=data.get("note", ""))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "user_id": uid})
+
+
+@app.route("/api/admin/registrations/<int:reg_id>/reject", methods=["POST"])
+@login_required("user.manage")
+def adm_registration_reject(reg_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        admin.reject_registration(reg_id, reviewer_id=session.get("user_id"),
+                                  note=data.get("note", ""))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True})
+
+
+# ===================== 用户池（自助注册白名单） =====================
+@app.route("/api/admin/user-pool")
+@login_required("user.view")
+def adm_user_pool():
+    """用户池（文件内容 + 数据库派生的注册状态）+ 文件元信息。"""
+    try:
+        pool = admin.list_user_pool()
+        info = admin.user_pool_info()
+    except ValueError as e:
+        # 池文件损坏且备份不可用时，明确告知管理员去修文件，而不是显示空池
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"pool": pool, "info": info,
+                    "roles": admin.list_roles(with_perms=False)})
+
+
+@app.route("/api/admin/user-pool", methods=["POST"])
+@login_required("user.manage")
+def adm_user_pool_create():
+    data = request.get_json(silent=True) or {}
+    try:
+        admin.create_pool_entry(
+            data.get("emp_no"), data.get("name"), dept=data.get("dept", ""),
+            role=data.get("role", ""), note=data.get("note", ""),
+            status=data.get("status", 1))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/user-pool/import", methods=["POST"])
+@login_required("user.manage")
+def adm_user_pool_import():
+    """批量导入用户池（真实花名册）。body: {items:[{emp_no,name,dept,role}], mode:'merge'|'replace'}。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        result = admin.import_user_pool(data.get("items") or [], mode=data.get("mode") or "merge")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "result": result})
+
+
+@app.route("/api/admin/user-pool/<emp_no>", methods=["PUT", "DELETE"])
+@login_required("user.manage")
+def adm_user_pool_update(emp_no):
+    """按【工号】编辑/删除池条目（池以工号为唯一键，无自增 id）。"""
+    if request.method == "PUT":
+        data = request.get_json(silent=True) or {}
+        try:
+            admin.update_pool_entry(emp_no, data)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"ok": True})
+    else:
+        try:
+            admin.delete_pool_entry(emp_no)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"ok": True})
+
+
 @app.route("/api/kb/features")
 @login_required()
 def kb_features():
@@ -2589,6 +2734,8 @@ def _warmup_vector_index():
 
 if __name__ == "__main__":
     admin.init_db()
+    # 用户池文件（config/user_pool.json）缺失时按模板生成，保证「用户池」页开箱可用
+    admin._ensure_user_pool_file()
     _seed_categories_from_source()
     try:
         admin.ensure_category_hierarchy()

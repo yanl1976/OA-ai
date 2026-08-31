@@ -60,7 +60,7 @@ function renderLogin() {
       <div id="lerr" class="alert err"></div>
       <button class="btn block" id="lbtn">登 录</button>
       <p class="muted" style="margin-top:16px;font-size:12px;text-align:center">
-        默认管理员 admin / Admin@123，登录后请尽快修改密码</p>
+        初始管理员口令见服务启动日志或 data/initial_admin_password.txt</p>
     </div>
   </div>`;
   const doLogin = async () => {

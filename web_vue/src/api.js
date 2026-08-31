@@ -38,6 +38,22 @@ export const api = {
   login: (username, password) => api.post("/api/auth/login", { username, password }),
   logout: () => api.post("/api/auth/logout"),
   me: () => api.get("/api/auth/me"),
+  // 自助注册（公开）：开关状态 + 提交申请（工号+姓名须命中用户池）
+  registerInfo: () => api.get("/api/auth/register-info"),
+  register: (empNo, name, password) =>
+    api.post("/api/auth/register", { emp_no: empNo, name, password }),
+  // 注册审批
+  registrations: () => api.get("/api/admin/registrations"),
+  approveRegistration: (id, roleId, note) =>
+    api.post(`/api/admin/registrations/${id}/approve`, { role_id: roleId || null, note: note || "" }),
+  rejectRegistration: (id, note) =>
+    api.post(`/api/admin/registrations/${id}/reject`, { note: note || "" }),
+  // 用户池（自助注册白名单，数据存于 config/user_pool.json，以工号为唯一键）
+  userPool: () => api.get("/api/admin/user-pool"),
+  createPoolEntry: (b) => api.post("/api/admin/user-pool", b),
+  updatePoolEntry: (empNo, b) => api.put("/api/admin/user-pool/" + encodeURIComponent(empNo), b),
+  deletePoolEntry: (empNo) => api.del("/api/admin/user-pool/" + encodeURIComponent(empNo)),
+  importUserPool: (items, mode) => api.post("/api/admin/user-pool/import", { items, mode }),
 
   categories: () => api.get("/api/kb/categories"),
   categoriesAll: () => api.get("/api/kb/categories_all"),

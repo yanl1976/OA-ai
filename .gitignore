@@ -37,6 +37,9 @@ config/.env.*
 # 否则开发机改的配置永远到不了生产机，会出现「开发机拉全部、生产机只拉 N 条」的偏差）；
 # 去重记录 .yzj_pull_synced.json 才是运行时本地状态，保持忽略、各环境独立。
 config/.yzj_pull_synced.json
+# 用户池（自助注册白名单）本体需入版本库（与 yzj_pull_tasks.json 同理，
+# 花名册要能随 git 同步到生产机）；其编辑前自动备份含历史名册，忽略即可。
+config/user_pool.json.bak
 
 # 索引重建前的本地备份（_backup_index_<时间戳>/）。
 # 曾误入库：生产部署时不上传该目录，git 便认为文件被删除（D），

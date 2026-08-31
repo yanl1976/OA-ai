@@ -2,6 +2,25 @@
 
 ## 更新日志
 
+### 2026-08-31 · 用户注册审批 + 用户池白名单
+
+登录页新增自助注册，注册须**工号 + 姓名命中用户池**并按池中预设角色授权，**管理员审批通过后才可登录**：
+
+| 环节 | 说明 |
+|---|---|
+| 注册入口 | 登录页「注册」页签（受系统设置「自助注册」开关控制，默认开启） |
+| 校验 | 工号在池中 → 池条目启用 → **姓名与池中完全一致** → 未被注册 → 无在审申请 |
+| 权限来源 | 池中该工号预设的角色（如 viewer / editor / 领导 / 秘书），审批时可临时改 |
+| 审批 | 系统设置 → 用户管理 → 「注册审批」页签：**通过**才真正建账号，或**驳回**（可填原因） |
+| 登录拦截 | 待审批账号登录返回 403 并明确提示「等待管理员审批」，不笼统报密码错误 |
+| 用户池维护 | 「用户池」页签：单条增删改 + **批量导入**（`工号,姓名,部门,角色`，支持合并/替换两模式） |
+
+配套修正：删除账号自动释放用户池占用（工号可重新注册）；首次建库时先建角色再同步分类权限
+（原顺序会导致新注册用户登录后无任何分类可见权限）。
+
+> 当前用户池为**虚拟数据**（E1001~E1008，见 `app/admin.py` 的 `DEFAULT_USER_POOL`），
+> 待提供真实花名册后，在「用户池 → 批量导入」用**替换模式**一次性换成真实数据。
+
 ### 2026-08-30 · 云之家审批单据自动拉取（重大功能 + 全链路排障）
 
 新增从云之家按模板自动拉取会议纪要等审批附件入库，并修复 10 类问题：
@@ -92,6 +111,16 @@
   --meta /opt/OA-ai/knowledge_base/uploads/user_documents.json            # 预览
 # 确认无误后加 --apply 执行
 ```
+
+### 用户注册审批与用户池（2026-08-31 新增）
+- **注册入口**：登录页「注册」页签，填工号 + 姓名 + 密码（≥6 位）提交申请。
+- **用户池白名单**：只有工号与姓名**同时命中用户池**才允许注册，杜绝任意账号灌入；池中预设的角色即该用户的权限来源（"用户池给定的权限"）。
+- **管理员审批**：申请进入 `pending`，管理员在**系统设置 → 用户管理 → 注册审批**中通过（立即创建可登录账号）或驳回（可填原因，工号释放可重提）。
+- **登录拦截**：待审批/已驳回账号登录时给出明确状态提示，不与"密码错误"混淆。
+- **用户池维护**：单条增删改；批量导入支持文本粘贴 `工号,姓名,部门,角色`（逗号或制表符分隔，`#` 开头为注释），两种模式：
+  - **合并**：同工号更新、新工号新增（日常增量维护）
+  - **替换**：先清空**未被注册占用**的条目再导入（换真实花名册时用，不会误删已注册员工的占用记录）
+- **占用联动**：审批通过 → 池中该工号标记已注册；管理员删除该账号 → 占用释放，工号可重新注册。
 
 ### 其他
 - **3D 知识图谱**：Three.js 渲染文档/分类/标签关联网络，节点可点击下钻。
@@ -243,7 +272,11 @@ Start-Process -FilePath "D:\python\python.exe" `
 - **3D 知识图谱**：http://127.0.0.1:8080/graph
 - **健康检查**：http://127.0.0.1:8080/api/health
 
-默认管理员：**`admin` / `Admin@123`**
+**初始管理员口令**（源码中不含任何明文口令）：
+- 首次建库时若在 `.env` 配置了 `KB_ADMIN_PASS`，则用它；否则**随机生成**，
+  口令会打印在服务启动日志中，并写入 `data/initial_admin_password.txt`。
+- 登录后请立即修改密码（用户管理 → 编辑），并删除该口令文件。
+- 存量环境巡检与重置：见下方「常见问题 → 管理员口令」。
 
 ### 4. 停止服务
 ```powershell
@@ -314,11 +347,24 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 ### 权限管理
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/auth/login` | 登录 |
+| POST | `/api/auth/login` | 登录（待审批账号返回 403 并提示等待审批） |
+| **GET** | `/api/auth/register-info` | **公开**：注册开关状态与密码长度要求 |
+| **POST** | `/api/auth/register` | **公开**：提交注册申请（`emp_no` + `name` + `password`） |
 | GET | `/api/admin/users` | 用户管理（需 `user.view`） |
 | GET | `/api/admin/roles` | 角色管理（需 `role.manage`） |
 | GET | `/api/admin/permissions` | 权限点列表 |
 | GET | `/api/admin/audit` | 审计日志 |
+
+### 注册审批与用户池（2026-08-31 新增）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/admin/registrations` | 注册申请列表 + 待审批数（需 `user.view`） |
+| POST | `/api/admin/registrations/<id>/approve` | 审批通过并建账号，可覆盖角色（需 `user.manage`） |
+| POST | `/api/admin/registrations/<id>/reject` | 驳回申请，可附原因（需 `user.manage`） |
+| GET | `/api/admin/user-pool` | 用户池列表（需 `user.view`） |
+| POST | `/api/admin/user-pool` | 新增池条目（需 `user.manage`） |
+| PUT/DELETE | `/api/admin/user-pool/<id>` | 编辑 / 删除池条目（需 `user.manage`） |
+| POST | `/api/admin/user-pool/import` | 批量导入：`{items:[{emp_no,name,dept,role}], mode:"merge"\|"replace"}` |
 
 ### 系统设置
 | 方法 | 路径 | 说明 |
@@ -780,8 +826,23 @@ A：BGE 模型冷启动。`serve.py` 已有后台预热，若仍慢说明预热�
 **Q：独立脚本读到 0 篇文档？**
 A：检查 `.env` 的 `KB_ROOT` 是否指向了生产路径。见上文「KB_ROOT 陷阱」。
 
-**Q：忘记管理员密码？**
-A：删除 `data/kb_admin.db` 重启服务，将重新初始化 `admin / Admin@123`（**会清空已有用户**，谨慎）。
+**Q：忘记管理员密码 / 想改初始口令？**
+A：用口令重置脚本，**不要删库**（删库会清空全部用户与角色配置）：
+
+```bash
+# 生产机
+/opt/OA-ai/venv/bin/python scripts/reset_admin_password.py --random   # 重置为随机强口令
+/opt/OA-ai/venv/bin/python scripts/reset_admin_password.py --new '新口令'
+/opt/OA-ai/venv/bin/python scripts/reset_admin_password.py --from-env # 用 .env 的 KB_ADMIN_PASS
+/opt/OA-ai/venv/bin/python scripts/reset_admin_password.py --check    # 只读巡检（是否仍用弱口令）
+```
+
+**Q：为什么源码里找不到默认管理员口令了？**
+A：原先 `app/admin.py` 把默认口令硬编码在源码里，而该文件受 Git 版本控制，等同于口令公开。
+现改为：`.env` 配置 `KB_ADMIN_PASS`，或首次建库时**随机生成**（打印到启动日志 + 写入
+`data/initial_admin_password.txt`）。
+**注意：改代码不会改变已存在数据库里的 admin 账号**——存量环境（含生产机）请用上面的脚本
+先 `--check` 巡检、再 `--random` 重置一次。
 
 **Q：多个 serve.py 进程冲突？**
 A：停止所有匹配 `serve.py` 的 python 进程后再启动单实例。
