@@ -67,6 +67,35 @@ const reclassCat = ref("");
 // 单篇内容提取中标记（doc_id，避免重复点击）
 const busyExtractId = ref(null);
 
+// 直接替换原文件（沿用原 doc_id，不新增条目）：FTP/格式升级场景
+const replaceFileId = ref(null);   // 当前正在替换的 doc_id（禁用重复点击）
+const fileInput = ref(null);        // 隐藏 <input type=file> 引用
+const pendingReplaceId = ref(null); // 已选文件、待读取上传的 doc_id
+function triggerReplace(d) {
+  if (replaceFileId.value) return;
+  pendingReplaceId.value = d.doc_id;
+  // 重置 input 以便同一文件可重复选择
+  if (fileInput.value) fileInput.value.value = "";
+  fileInput.value.click();
+}
+async function onReplaceFile(e) {
+  const f = e.target.files && e.target.files[0];
+  const docId = pendingReplaceId.value;
+  pendingReplaceId.value = null;
+  if (!f || !docId) return;
+  if (replaceFileId.value) return;
+  replaceFileId.value = docId;
+  try {
+    await api.replaceDocumentBinary(docId, f);
+    notify("原文件已替换，后台正在重新识别提取", "ok");
+    await pollUntilIndexed(docId);
+  } catch (err) {
+    notify(err.message || "替换失败", "err");
+  } finally {
+    replaceFileId.value = null;
+  }
+}
+
 // 标签编辑
 const tagEditId = ref(null);
 const tagEditText = ref("");
@@ -349,6 +378,9 @@ onUnmounted(() => stopPolling());
               <button class="btn sm" :disabled="busyExtractId === d.doc_id" @click="extractOne(d)">
                 {{ busyExtractId === d.doc_id ? '提取中…' : '内容提取' }}
               </button>
+              <button class="btn sm" :disabled="replaceFileId === d.doc_id" @click="triggerReplace(d)">
+                {{ replaceFileId === d.doc_id ? '替换中…' : '替换文件' }}
+              </button>
               <button class="btn sm danger" @click="remove(d)">删除</button>
             </template>
           </td>
@@ -400,6 +432,9 @@ onUnmounted(() => stopPolling());
       </div>
     </div>
   </div>
+
+  <!-- 隐藏的原文件选择器：供「替换文件」按钮调用，沿用原 doc_id 直接覆盖物理文件 -->
+  <input ref="fileInput" type="file" style="display:none" @change="onReplaceFile" />
 </template>
 
 <style scoped>

@@ -1392,6 +1392,62 @@ def kb_doc_tags(doc_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/kb/document/<doc_id>/binary", methods=["POST"])
+@login_required("kb.upload.manage")
+def kb_doc_replace_binary(doc_id):
+    """管理界面直接替换某文档的原始二进制文件（沿用原 doc_id，不新增条目）。
+
+    用法（multipart/form-data，字段名固定为 'file'）：
+        POST /api/kb/document/<doc_id>/binary
+        Content-Type: multipart/form-data; boundary=...
+        file=<新文件二进制>
+
+    典型场景：用户已通过 FTP / 其他途径把新文件放到服务器，或只是把 .doc
+    转成 .docx 后希望覆盖，又不想走「整篇重新上传」、不丢失原归类/标签/doc_id。
+    服务端会：
+        1) 用新文件覆盖物理存储（沿用原类别/年代目录，doc_id 不变）；
+        2) 更新 stored_path / ext / mimetype / filename，并把 indexed 复位为 0；
+        3) 入队后台内容提取，自动重提取文本并重建索引。
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "文件为空"}), 400
+    raw = f.read()
+    if not raw:
+        return jsonify({"error": "文件内容为空"}), 400
+    # 先做后端类型白名单校验（与上传一致），避免非法扩展名进入存储
+    ext = os.path.splitext(f.filename)[1].lower()
+    import mimetypes as _mt
+    _mty = _mt.guess_type(f.filename)[0] or ""
+    if ALLOWED_EXT and ext not in ALLOWED_EXT:
+        return jsonify({"error": "不支持的文件类型: %s" % ext}), 400
+    if BLOCKED_MIME and _mty in BLOCKED_MIME:
+        return jsonify({"error": "禁止的文件类型(MIME): %s" % _mty}), 400
+    if len(raw) > int(os.environ.get("KB_MAX_UPLOAD_BYTES", "104857600")):
+        return jsonify({"error": "文件超出大小限制"}), 413
+    res = kb_store.replace_upload_binary(doc_id, f.filename, raw)
+    if not res.get("ok"):
+        return jsonify({"error": res.get("error", "替换失败")}), 400
+    # 触发后台重提取（与 /api/admin/init/extract-one 一致：先复位再入队，
+    # 由后台 worker 提取 + 队列空闲时统一重建索引）。replace_upload_binary 已把
+    # indexed 复位为 0，这里再 mark_extracting 确保 text 也清空，避免旧快照覆盖。
+    try:
+        kb_store.mark_extracting([doc_id])
+        ups = kb_store._load_uploads()
+        target = next((u for u in ups if u.get("doc_id") == doc_id and not u.get("deleted")), None)
+        _EXTRACT_Q.put({
+            "filename": f.filename,
+            "category": target.get("category", "未分类") if target else "未分类",
+            "doc_id": doc_id,
+            "cat_hint": target.get("category", "未分类") if target else "未分类",
+        })
+    except Exception as e:
+        log.warning("替换文件后入队重提取失败 %s: %s", doc_id, e)
+    return jsonify({"ok": True, "doc_id": doc_id, "stored": res.get("stored", True)})
+
+
 @app.route("/api/kb/tag/<tag>/documents")
 @login_required()
 def kb_tag_docs(tag):

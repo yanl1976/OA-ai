@@ -111,6 +111,12 @@ export const api = {
     });
     return api.get("/api/kb/uploads?" + q.toString());
   },
+  // 管理界面直接替换文档原始文件（沿用原 doc_id，不新增条目）
+  replaceDocumentBinary: (id, file) => {
+    const form = new FormData();
+    form.append("file", file);
+    return api.postForm("/api/kb/document/" + id + "/binary", form);
+  },
   reclassifyDocument: (id, category) =>
     api.put("/api/kb/document/" + id, { category }),
   deleteUpload: (id) => api.del("/api/kb/uploads/" + id),

@@ -832,6 +832,80 @@ def get_upload_binary(doc_id: str):
     return None, None
 
 
+def replace_upload_binary(doc_id: str, filename: str, raw_bytes: bytes) -> dict:
+    """界面直接替换某上传文档的原始二进制文件（不新增条目，沿用原 doc_id）。
+
+    场景：用户已通过 FTP / 其他途径把新文件传到服务器，或仅是同名格式升级
+    （如 .doc -> .docx），希望在不重新走「整篇上传」流程、不丢失归类/标签/
+    原 doc_id 的前提下，直接覆盖物理文件并重提取文本。
+
+    行为：
+      1) 在「原类别/原年代」目录下，用新 ext 计算目标 stored_rel（doc_id 不变）；
+      2) 写入新文件并校验字节数；成功后删除旧二进制文件（ext 可能不同）；
+      3) 更新 entry 的 ext / stored_path / mimetype / filename / updated_at，
+         并把 indexed 复位为 0（等待后台重提取，真正文本由调用方入队触发）；
+      4) 不在此处重建索引（重提取由后台 worker 统一重建，保持与「内容提取」一致）。
+
+    返回 {"ok": bool, "doc_id": str, "stored": bool, "error": str}。
+    """
+    if not raw_bytes:
+        return {"ok": False, "doc_id": doc_id, "stored": False, "error": "文件内容为空"}
+    ext = os.path.splitext(filename)[1].lower()
+    with _STORE_LOCK:
+        ups = _load_uploads()
+        if not isinstance(ups, list):
+            ups = []
+        ups = [u for u in ups if isinstance(u, dict)]
+        target = next((u for u in ups if u.get("doc_id") == doc_id), None)
+        if target is None:
+            return {"ok": False, "doc_id": doc_id, "stored": False, "error": "文档不存在"}
+        if target.get("deleted"):
+            return {"ok": False, "doc_id": doc_id, "stored": False, "error": "文档已在回收站，不可替换"}
+        category = target.get("category", "未分类")
+        year = target.get("year") or _extract_year(filename, "")
+        old_path = _resolve_binary_path(target)
+        new_rel = _stored_rel_for(category, year, doc_id, ext)
+        new_path = os.path.join(UPLOAD_DIR, new_rel)
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            with open(new_path, "wb") as f:
+                f.write(raw_bytes)
+            if not (os.path.exists(new_path) and os.path.getsize(new_path) == len(raw_bytes)):
+                # 落盘异常：清理半截文件
+                try:
+                    if os.path.exists(new_path):
+                        os.remove(new_path)
+                except Exception:
+                    pass
+                return {"ok": False, "doc_id": doc_id, "stored": False,
+                        "error": "新文件落盘校验失败"}
+        except Exception as e:
+            return {"ok": False, "doc_id": doc_id, "stored": False,
+                    "error": "写入失败: %s" % e}
+        # 删除旧二进制（ext 可能不同，避免残留两份）
+        if old_path and os.path.abspath(old_path) != os.path.abspath(new_path):
+            try:
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+                # 清理可能已空的旧目录
+                od = os.path.dirname(old_path)
+                if od.startswith(UPLOAD_FILES_DIR) and not os.listdir(od):
+                    os.rmdir(od)
+            except Exception:
+                pass
+        target["filename"] = filename
+        target["ext"] = ext
+        target["stored_path"] = new_rel
+        target["mimetype"] = mimetype_for_ext(ext)
+        target["year"] = year
+        target["indexed"] = 0        # 等待后台重提取
+        target["updated_at"] = _now()
+        _save_uploads(ups)
+    uid, uname = audit_current_user()
+    audit_log("doc.replace_binary", doc_id, "%s -> %s" % (filename, category), uid, uname)
+    return {"ok": True, "doc_id": doc_id, "stored": True, "error": ""}
+
+
 def delete_upload_binary(doc_id: str):
     """删除上传文档关联的原始二进制文件（忽略不存在/异常）。"""
     import shutil
