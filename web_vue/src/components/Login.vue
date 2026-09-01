@@ -90,7 +90,7 @@ async function submitRegister() {
 <template>
   <div class="login-wrap">
     <div class="login-card">
-      <h1>OA 知识库门户</h1>
+      <h1 class="sys-title">OA 知识库门户</h1>
       <div class="sub">请登录以继续</div>
 
       <div v-if="registerEnabled" class="login-tabs">
@@ -165,7 +165,7 @@ async function submitRegister() {
           {{ regBusy ? "提交中…" : "提交注册申请" }}
         </button>
         <div class="login-tip">
-          工号与姓名须与用户池一致；提交后由管理员审批，通过后即可登录。
+          工号与姓名经校验通过；提交后由管理员审批，通过后即可登录。
           <a @click="switchTo('login')">返回登录</a>
         </div>
       </div>
@@ -174,6 +174,13 @@ async function submitRegister() {
 </template>
 
 <style scoped>
+.sys-title {
+  text-align: center;
+  font-size: 24px;
+  font-weight: 700;
+  color: #1f2937;
+  margin-bottom: 6px;
+}
 .login-tabs {
   display: flex;
   border-bottom: 1px solid var(--border, #e5e7eb);
