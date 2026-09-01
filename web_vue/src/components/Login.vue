@@ -11,6 +11,9 @@ const password = ref("");
 const err = ref("");
 const busy = ref(false);
 
+// 系统名称：动态取自后台「系统名称」卡片（GET /api/system/info，登录可见），未取到时兜底
+const sysName = ref("OA-AI 知识库");
+
 // 注册表单
 const reg = ref({ emp_no: "", name: "", password: "", confirm: "" });
 const regErr = ref("");
@@ -27,6 +30,13 @@ onMounted(async () => {
     minPwd.value = r.min_password_length || 6;
   } catch (e) {
     registerEnabled.value = false;
+  }
+  // 拉取后台系统名称（系统设置 → 系统名称卡片），动态显示在登录/注册页顶部
+  try {
+    const info = await api.systemInfo();
+    if (info && info.system_name) sysName.value = info.system_name;
+  } catch (e) {
+    /* 保留兜底默认值 */
   }
 });
 
@@ -90,7 +100,7 @@ async function submitRegister() {
 <template>
   <div class="login-wrap">
     <div class="login-card">
-      <h1 class="sys-title">OA 知识库门户</h1>
+      <h1 class="sys-title">{{ sysName }}</h1>
       <div class="sub">请登录以继续</div>
 
       <div v-if="registerEnabled" class="login-tabs">
