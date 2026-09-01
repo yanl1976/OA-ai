@@ -2,6 +2,7 @@
 import { ref, onMounted, watch } from "vue";
 import { api } from "../api.js";
 import { inject } from "vue";
+import DocxModal from "./DocxModal.vue";
 
 const props = defineProps({ docId: { type: String, default: "" } });
 const notify = inject("notify");
@@ -28,6 +29,20 @@ async function load() {
 
 function pdfUrl() {
   return api.docPdfUrl(props.docId, true);
+}
+// docx 原版版面预览（浏览器内直接渲染，不转 PDF）：复用同一下载端点（按 ext 回传二进制）
+const docxShow = ref(false);
+const docxUrl = ref("");
+function isDocx() {
+  const ext = (doc.value && doc.value.ext) || "";
+  return ext === ".docx" || ext === ".doc" || (doc.value && /word/.test(doc.value.mimetype || ""));
+}
+function openDocx() {
+  docxUrl.value = api.docPdfUrl(props.docId, true);
+  docxShow.value = true;
+}
+function closeDocx() {
+  docxShow.value = false;
 }
 function downloadUrl() {
   return "/api/kb/document/" + encodeURIComponent(props.docId) + "/pdf?download=1";

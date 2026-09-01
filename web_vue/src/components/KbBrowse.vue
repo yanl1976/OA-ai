@@ -3,6 +3,7 @@ import { ref, onMounted, inject, watch, computed } from "vue";
 import { api } from "../api.js";
 import CatTreeNode from "./CatTreeNode.vue";
 import PdfModal from "./PdfModal.vue";
+import DocxModal from "./DocxModal.vue";
 
 const notify = inject("notify");
 const openDerivedInManage = inject("openDerivedInManage");
@@ -153,6 +154,21 @@ function previewPdf() {
   pdfTitle.value = docDetail.value.label || docDetail.value.filename || "文档";
   pdfShow.value = true;
 }
+// docx/doc 原版版面预览（浏览器内直接渲染，不转 PDF）
+const docxShow = ref(false);
+const docxUrl = ref("");
+function isDocxDoc() {
+  const d = docDetail.value;
+  if (!d) return false;
+  const ext = d.ext || "";
+  if (ext === ".docx" || ext === ".doc") return true;
+  return /word/.test(d.mimetype || "");
+}
+function previewDocx() {
+  if (!docDetail.value) return;
+  docxUrl.value = api.docPdfUrl(docDetail.value.doc_id, true);
+  docxShow.value = true;
+}
 
 function openDerived(d) {
   openDerivedInManage(d.id);
@@ -294,6 +310,7 @@ onMounted(async () => {
         </div>
         <div class="toolbar" style="margin-bottom:10px">
           <button class="btn sm primary" @click="previewPdf">预览 PDF</button>
+          <button v-if="isDocxDoc()" class="btn sm primary" @click="previewDocx">预览 docx</button>
           <button class="btn sm" v-if="canDerived" @click="openDerivedForDoc(docDetail.doc_id)">纪要二次生成</button>
           <button
             class="btn sm disabled"
@@ -326,6 +343,7 @@ onMounted(async () => {
     </div>
 
     <PdfModal :show="pdfShow" :url="pdfUrl" :title="pdfTitle" @close="pdfShow = false" />
+    <DocxModal :show="docxShow" :url="docxUrl" :title="docDetail?.label || docDetail?.filename || 'DOCX 预览'" @close="docxShow = false" />
   </div>
 </template>
 
