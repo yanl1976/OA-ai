@@ -2184,8 +2184,8 @@ def _compute_version(commits):
 
 
 @app.route("/api/system/info")
-@login_required()
 def sys_info():
+    # 系统名称/版权为公开信息，登录页未登录也需读取，故不要求鉴权
     settings = _read_system_settings()
     commits = _git_commits()
     return jsonify({
