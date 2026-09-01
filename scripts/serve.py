@@ -1419,12 +1419,8 @@ def kb_doc_replace_binary(doc_id):
         return jsonify({"error": "文件内容为空"}), 400
     # 先做后端类型白名单校验（与上传一致），避免非法扩展名进入存储
     ext = os.path.splitext(f.filename)[1].lower()
-    import mimetypes as _mt
-    _mty = _mt.guess_type(f.filename)[0] or ""
-    if ALLOWED_EXT and ext not in ALLOWED_EXT:
+    if extract_text.ALLOWED_EXT and ext not in extract_text.ALLOWED_EXT:
         return jsonify({"error": "不支持的文件类型: %s" % ext}), 400
-    if BLOCKED_MIME and _mty in BLOCKED_MIME:
-        return jsonify({"error": "禁止的文件类型(MIME): %s" % _mty}), 400
     if len(raw) > int(os.environ.get("KB_MAX_UPLOAD_BYTES", "104857600")):
         return jsonify({"error": "文件超出大小限制"}), 413
     res = kb_store.replace_upload_binary(doc_id, f.filename, raw)
