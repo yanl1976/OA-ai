@@ -241,6 +241,90 @@ def _resolve_binary_path(u: dict):
     return None
 
 
+def _parse_doc_date(filename: str):
+    """从文件名解析文档日期（会议/发文日期），用于会议纪要等按日期倒序排列。
+
+    优先级（用户规则：以文号日期为准，文件名日期辅助）：
+      1) 文号日期段：形如 HYJYXSSPFB-20241021-003 / XXX-20241021-001 中的 8 位日期
+         （紧跟 '-' 后的 YYYYMMDD，范围 19800101~21001231）；
+      2) 文件名中文日期：(2024年10月21日) / 2024年10月21日；
+      3) 通用分隔日期：YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD；
+      4) 仅含 4 位年份（无月日）：按当年 1 月 1 日处理（弱精度，仍可比）。
+
+    返回 (year, month, day) 可比较元组；无法解析返回 None。
+    """
+    fn = filename or ""
+    # 1) 文号日期段：-\d{8}- 或 整体形如 *-YYYYMMDD-*
+    m = re.search(r"-(\d{8})(?:-|$)", fn)
+    if m:
+        s = m.group(1)
+        y, mo, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+        if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return (y, mo, d)
+    # 2) 中文日期：YYYY年M月D日（含半角括号/全角括号）
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]", fn)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return (y, mo, d)
+    # 3) 通用分隔日期
+    m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", fn)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return (y, mo, d)
+    # 4) 仅 4 位年份
+    yrs = re.findall(r"(?:18|19|20)\d{2}", fn)
+    for ys in yrs:
+        y = int(ys)
+        if 1980 <= y <= 2100:
+            return (y, 1, 1)
+    return None
+
+
+def _doc_sort_date_ord(d: dict):
+    """会议纪要排序键：有日期按日期倒序（用负数），无日期按入库时间倒序兜底。
+
+    返回用于 list.sort(reverse=True) 的 (日期序数或时间序数, 次级稳定键)。
+    约定：用 reverse=True 时，较大的值排前面。
+    """
+    dt = _parse_doc_date(d.get("filename", ""))
+    if dt:
+        ord_val = dt[0] * 10000 + dt[1] * 100 + dt[2]
+        return (1, ord_val)  # 有日期的组，按 ord_val 大者在前
+    # 无日期：入库时间倒序兜底（ISO 字符串字典序即可）
+    ca = d.get("created_at") or ""
+    return (0, _iso_ord(ca))
+
+
+def _iso_ord(iso_str: str):
+    """把 ISO 时间字符串转成可比较整数（越大越新）；非法返回 0。"""
+    if not iso_str:
+        return 0
+    digits = re.sub(r"\D", "", iso_str)
+    return int(digits) if digits else 0
+
+
+_MEETING_SUBTREE_CACHE = None
+
+
+def _in_meeting_subtree(cats: list):
+    """判断给定分类名集合是否落在『会议纪要分类』子树内（含根及全部子类）。
+
+    用于「会议纪要及其子类」统一按日期倒序排列。结果带模块级缓存，避免
+    每次列表查询都查库。
+    """
+    global _MEETING_SUBTREE_CACHE
+    if _MEETING_SUBTREE_CACHE is None:
+        try:
+            _MEETING_SUBTREE_CACHE = set(category_subtree_names("会议纪要分类"))
+        except Exception:
+            _MEETING_SUBTREE_CACHE = set()
+    if not _MEETING_SUBTREE_CACHE:
+        return False
+    return any(c in _MEETING_SUBTREE_CACHE for c in cats)
+
+
 def _extract_year(filename: str, content: str):
     """年份提取：文件名优先，其次正文年份，兜底上传当前年份。
 
@@ -465,7 +549,19 @@ def list_documents(category: str = None, q: str = None, year: int = None,
     # 年份 facet（在分页前统计，反映当前分类/关键词下的全部可选年份）
     years = sorted({d.get("year") for d in docs if d.get("year")})
     total = len(docs)
-    docs.sort(key=lambda d: (d.get("category", ""), -(d.get("year") or 0), d.get("filename", "")))
+    # 会议纪要（含所有子类）：按文档日期倒序（最新在前），有日期优先、无日期按入库时间兜底
+    _is_meeting = False
+    if category:
+        if isinstance(category, (list, tuple, set)):
+            _cats = [str(c) for c in category]
+            _is_meeting = any("会议纪要" in c for c in _cats) or _in_meeting_subtree(_cats)
+        else:
+            _cat = str(category)
+            _is_meeting = ("会议纪要" in _cat) or _in_meeting_subtree([_cat])
+    if _is_meeting:
+        docs.sort(key=_doc_sort_date_ord, reverse=True)
+    else:
+        docs.sort(key=lambda d: (d.get("category", ""), -(d.get("year") or 0), d.get("filename", "")))
     start = (page - 1) * page_size
     page_items = docs[start:start + page_size]
     return {
