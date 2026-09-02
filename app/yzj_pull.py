@@ -882,6 +882,20 @@ def run_task(task, dry_run=False, limit=None, force=False):
 _scheduler = None
 
 
+def _parse_hhmm(s):
+    """把 'HH:MM' 解析为 (hour, minute)；非法返回 None。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2})\s*[:：]\s*(\d{1,2})$", s)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if 0 <= h <= 23 and 0 <= mi <= 59:
+        return (h, mi)
+    return None
+
+
 def _cron_trigger_for(task):
     sched = task.get("schedule", "manual")
     if sched == "daily":
@@ -891,6 +905,50 @@ def _cron_trigger_for(task):
                         "hour": int(task.get("schedule_hour", 2)),
                         "minute": int(task.get("schedule_minute", 0))}
     return None, None
+
+
+def _cron_triggers_for(task):
+    """返回该任务的触发器列表 [(kind, trig_args, 序号后缀)]，支持一天多个执行时段。
+
+    配置方式（新）：schedule_times = ["09:00", "14:30", "21:00"]
+      - 每个时段注册一个独立 job，job id 形如 yzj_pull_<id>#0 / #1 / #2
+      - 与 weekly 配合时，每个时段都在指定星期执行
+    兼容（旧）：未配置 schedule_times 时，回退到单一 schedule_hour/schedule_minute。
+    这样历史配置无需改动即可继续工作。
+    """
+    sched = task.get("schedule", "manual")
+    if sched not in ("daily", "weekly"):
+        return []
+
+    raw = task.get("schedule_times")
+    times = []
+    if isinstance(raw, (list, tuple)):
+        times = [t for t in (_parse_hhmm(str(x)) for x in raw) if t]
+    elif isinstance(raw, str) and raw.strip():
+        # 也允许逗号分隔的字符串，便于 .env / JSON 里直接写
+        times = [t for t in (_parse_hhmm(x) for x in re.split(r"[,\s]+", raw.strip())) if t]
+
+    if not times:
+        kind, trig = _cron_trigger_for(task)
+        return [(kind, trig, "")] if kind else []
+
+    dow = int(task.get("schedule_weekday", 1)) if sched == "weekly" else None
+    out = []
+    for idx, (h, mi) in enumerate(times):
+        args = {"hour": h, "minute": mi}
+        if dow is not None:
+            args["day_of_week"] = dow
+        out.append(("cron", args, "#%d" % idx))
+    # 去重：同一时刻只注册一次（避免用户填重复时段导致重复拉取）
+    seen = set()
+    uniq = []
+    for kind, args, suffix in out:
+        key = (args.get("hour"), args.get("minute"), args.get("day_of_week"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((kind, args, suffix))
+    return uniq
 
 
 def start_scheduler():
@@ -907,12 +965,16 @@ def start_scheduler():
     for task in load_tasks():
         if not task.get("enabled"):
             continue
-        kind, trig = _cron_trigger_for(task)
-        if kind is None:
-            continue
         tid = task.get("id")
-        _scheduler.add_job(lambda t=task: _safe_run(t), kind, **trig, id="yzj_pull_%s" % tid, replace_existing=True)
-        logger.info("注册云之家拉取任务: %s (%s)", tid, trig)
+        # 支持一天多个执行时段（schedule_times）：每个时段注册一个独立 job，
+        # id 形如 yzj_pull_<tid>#0 / #1，便于在「调度作业」里分别看到下次执行时间。
+        triggers = _cron_triggers_for(task)
+        if not triggers:
+            continue
+        for kind, trig, suffix in triggers:
+            _scheduler.add_job(lambda t=task: _safe_run(t), kind, **trig,
+                               id="yzj_pull_%s%s" % (tid, suffix), replace_existing=True)
+        logger.info("注册云之家拉取任务: %s (%s)", tid, [t[1] for t in triggers])
     _scheduler.start()
     return _scheduler
 

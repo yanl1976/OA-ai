@@ -78,6 +78,7 @@ function blankTask() {
     schedule_hour: 2,
     schedule_minute: 0,
     schedule_weekday: 0,
+    schedule_times: ["02:00"],
   };
 }
 
@@ -88,7 +89,37 @@ function openCreate() {
 
 function openEdit(t) {
   editing.value = JSON.parse(JSON.stringify(t));
+  normalizeScheduleTimes(editing.value);
   showEditor.value = true;
+}
+
+// 统一 schedule_times：<任务>可配置一天多个执行时段；旧配置只有单一
+// schedule_hour/schedule_minute，这里补成等价的单元素数组，保证界面一致、后端兼容。
+function normalizeScheduleTimes(t) {
+  if (!t) return;
+  if (!Array.isArray(t.schedule_times) || t.schedule_times.length === 0) {
+    const h = String(t.schedule_hour ?? 2).padStart(2, "0");
+    const m = String(t.schedule_minute ?? 0).padStart(2, "0");
+    t.schedule_times = [h + ":" + m];
+  }
+  // 同步回旧字段，便于后端/旧逻辑回退时取值一致
+  const first = t.schedule_times[0] || "02:00";
+  const mm = /^(\d{1,2}):(\d{1,2})$/.exec(first);
+  if (mm) {
+    t.schedule_hour = parseInt(mm[1], 10);
+    t.schedule_minute = parseInt(mm[2], 10);
+  }
+}
+
+// 时段增删
+function addScheduleTime() {
+  if (!Array.isArray(editing.value.schedule_times)) editing.value.schedule_times = [];
+  editing.value.schedule_times.push("09:00");
+}
+function removeScheduleTime(i) {
+  if (!Array.isArray(editing.value.schedule_times)) return;
+  editing.value.schedule_times.splice(i, 1);
+  if (editing.value.schedule_times.length === 0) editing.value.schedule_times.push("02:00");
 }
 
 async function saveTask() {
@@ -211,10 +242,15 @@ async function loadPulledDocsOnly() {
 
 function scheduleText(t) {
   if (t.schedule === "manual") return "手动";
-  if (t.schedule === "daily") return "每天 " + String(t.schedule_hour).padStart(2, "0") + ":" + String(t.schedule_minute).padStart(2, "0");
+  // 多执行时段：优先按 schedule_times 展示（如「每天 09:00、14:30、21:00」）
+  const times = Array.isArray(t.schedule_times) && t.schedule_times.length
+    ? t.schedule_times
+    : [String(t.schedule_hour ?? 0).padStart(2, "0") + ":" + String(t.schedule_minute ?? 0).padStart(2, "0")];
+  const txt = times.join("、");
+  if (t.schedule === "daily") return "每天 " + txt;
   if (t.schedule === "weekly") {
     const wd = WEEKDAYS.find((w) => w.v === t.schedule_weekday);
-    return (wd ? wd.t : "周?") + " " + String(t.schedule_hour).padStart(2, "0") + ":" + String(t.schedule_minute).padStart(2, "0");
+    return (wd ? wd.t : "周?") + " " + txt;
   }
   return "-";
 }
@@ -384,12 +420,18 @@ onUnmounted(stopPoll);
               <select class="inp" v-model="editing.schedule"><option v-for="s in SCHEDULE_OPTS" :key="s.v" :value="s.v">{{ s.t }}</option></select>
             </div>
             <div class="row" v-if="editing.schedule!=='manual'">
-              <label>执行时间</label>
+              <label>执行时段</label>
               <template v-if="editing.schedule==='weekly'">
                 <select class="inp" v-model.number="editing.schedule_weekday"><option v-for="w in WEEKDAYS" :key="w.v" :value="w.v">{{ w.t }}</option></select>
               </template>
-              <input class="inp" type="number" min="0" max="23" v-model.number="editing.schedule_hour" /> 时
-              <input class="inp" type="number" min="0" max="59" v-model.number="editing.schedule_minute" /> 分
+              <div class="times-wrap">
+                <div v-for="(tm, i) in editing.schedule_times" :key="i" class="time-row">
+                  <input class="inp time-inp" type="time" v-model="editing.schedule_times[i]" />
+                  <button class="btn sm danger" @click="removeScheduleTime(i)" :disabled="editing.schedule_times.length<=1">删除</button>
+                </div>
+                <button class="btn sm" @click="addScheduleTime">+ 增加时段</button>
+                <span class="hint">可配置一天内多个自动拉取时段（如 09:00、14:30、21:00），每个时段各注册一个调度作业</span>
+              </div>
             </div>
           </div>
           <div class="yzj-modal-foot">
@@ -475,4 +517,8 @@ onUnmounted(stopPoll);
 .form .row label { width: 100px; flex: none; color: #475569; }
 .form .row .hint { font-size: 12px; color: #94a3b8; flex: none; }
 .inp { flex: 1; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 4px; }
+.times-wrap { display: flex; flex-direction: column; gap: 6px; }
+.time-row { display: flex; align-items: center; gap: 8px; }
+.time-inp { flex: none; width: 130px; }
+.times-wrap .hint { flex: none; font-size: 12px; color: #94a3b8; }
 </style>
