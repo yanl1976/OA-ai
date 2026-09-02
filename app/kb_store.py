@@ -543,12 +543,24 @@ def _all_browse_docs() -> list:
                 for d in raw["documents"]]
     for d in docs:
         seen.add(d.get("doc_id"))
+    # 业务流水号 doc_no 的回填表：manifest 是 bm25 索引快照，不含业务字段，
+    # 而「会议纪要」排序要用 doc_no（云之家 serialNo，如 HYJYXSSPFB-20260901-002）。
+    # 去重时 manifest 优先，若不给 manifest 条目补 doc_no，绝大多数已建索引的
+    # 文档会读不到流水号而退化到「文件名日期/入库时间」排序，表现为列表乱序。
+    # 这里用最新 uploads 补齐，避免为此重建整个索引。
+    no_by_id = {}
     for u in _load_uploads():
-        if u.get("deleted"):
+        if u.get("deleted") or "doc_id" not in u:
             continue  # 软删除（回收站）文档不在知识浏览中展示
-        if u["doc_id"] not in seen:
+        did = u["doc_id"]
+        if u.get("doc_no"):
+            no_by_id[did] = u["doc_no"]
+        if did not in seen:
             docs.append(_upload_to_doc(u))
-            seen.add(u["doc_id"])
+            seen.add(did)
+    for d in docs:
+        if not d.get("doc_no") and d.get("doc_id") in no_by_id:
+            d["doc_no"] = no_by_id[d["doc_id"]]
     return docs
 
 
