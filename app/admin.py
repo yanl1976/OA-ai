@@ -885,7 +885,8 @@ def approve_registration(reg_id: int, reviewer_id=None, role_id=None, note="") -
     # 注册审核通过通知（邮件，尽力发送，失败不影响审批结果）
     try:
         notify_mail.notify_register("approved", reg["emp_no"], reg["name"],
-                                     reviewer=str(reviewer_id or ""), note=note)
+                                     reviewer=str(reviewer_id or ""), note=note,
+                                     registered_at=(reg["created_at"] if "created_at" in reg.keys() else ""))
     except Exception:  # noqa: BLE001
         pass
     return uid
@@ -909,7 +910,8 @@ def reject_registration(reg_id: int, reviewer_id=None, note=""):
     # 注册审核驳回通知（邮件，尽力发送）
     try:
         notify_mail.notify_register("rejected", reg["emp_no"], reg["name"],
-                                     reviewer=str(reviewer_id or ""), note=note)
+                                     reviewer=str(reviewer_id or ""), note=note,
+                                     registered_at=(reg["created_at"] if "created_at" in reg.keys() else ""))
     except Exception:  # noqa: BLE001
         pass
 

@@ -182,32 +182,54 @@ def _send_async(subject, body):
     t.start()
 
 
+# 邮件正文里最多列出的文件条数，避免一次拉取几百个附件把邮件撑爆
+MAX_FILE_LIST = 50
+
+
 def notify_pull_update(task_name, stats):
     """云之家拉取完成后的内容更新通知。
 
     task_name: 任务名（如「天传所会议纪要」）；stats: run_task 的返回 dict。
+    stats 可含 "files"：[(filename, created_at), ...]，用于列出「文件名 + 入库时间」。
     """
     if not _is_enabled() or not _pull_enabled():
         return
     downloaded = (stats or {}).get("downloaded", 0)
     failed = (stats or {}).get("failed", 0)
-    subject = "【OA-ai 知识库】云之家拉取内容更新：%s" % task_name
+    files = (stats or {}).get("files") or []
+    subject = "【OA-ai 知识库】云之家拉取内容更新：%s（新增 %d）" % (task_name, downloaded)
+
     body = (
         "云之家审批单据拉取任务已完成。\n\n"
         "任务名称：%s\n"
         "新增/更新文档数：%d\n"
         "失败数：%d\n"
-        "时间：%s\n\n"
-        "可登录系统「云之家数据拉取」页面查看明细，或检索最新入库文档。"
+        "完成时间：%s\n"
         % (task_name, downloaded, failed, _now_str())
     )
+    if files:
+        body += "\n本次入库文件（文件名 — 入库时间）：\n"
+        for i, item in enumerate(files[:MAX_FILE_LIST], 1):
+            # 兼容 (文件名, 时间) 二元组与纯文件名字符串
+            if isinstance(item, (list, tuple)):
+                fn, tm = (item + ("", ""))[:2]
+            else:
+                fn, tm = item, ""
+            body += "  %d. %s%s\n" % (i, fn, ("  —  %s" % tm) if tm else "")
+        if len(files) > MAX_FILE_LIST:
+            body += "  ……（共 %d 个文件，此处仅列前 %d 个）\n" % (len(files), MAX_FILE_LIST)
+    else:
+        body += "\n本次没有新增文件。\n"
+    body += "\n可登录系统「云之家数据拉取」页面查看明细，或检索最新入库文档。"
     _send_async(subject, body)
 
 
-def notify_register(action, emp_no, name, reviewer="", note=""):
+def notify_register(action, emp_no, name, reviewer="", note="", registered_at=""):
     """注册审核结果通知。
 
     action: "approved" / "rejected"。
+    registered_at: 用户提交注册的申请时间（user_registrations.created_at）；
+                   为空时回退为「—」，注明是审核时间。
     """
     if not _is_enabled() or not _register_enabled():
         return
@@ -215,12 +237,14 @@ def notify_register(action, emp_no, name, reviewer="", note=""):
     subject = "【OA-ai 知识库】用户注册申请%s：%s（%s）" % (verb, name, emp_no)
     body = (
         "用户自助注册申请已%s。\n\n"
-        "申请人：%s\n"
+        "注册人：%s\n"
         "工号：%s\n"
+        "注册时间：%s\n"
         "审核人：%s\n"
+        "审核时间：%s\n"
         "审核备注：%s\n"
-        "时间：%s\n"
-        % (verb, name, emp_no, reviewer or "—", note or "—", _now_str())
+        % (verb, name, emp_no, registered_at or "—", reviewer or "—",
+           _now_str(), note or "—")
     )
     _send_async(subject, body)
 

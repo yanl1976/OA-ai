@@ -833,6 +833,9 @@ def run_task(task, dry_run=False, limit=None, force=False):
                     except Exception as e:  # noqa: BLE001
                         logger.warning("提取索引失败 %s: %s", doc_id, e)
                 saved_count += 1
+                # 收集「文件名 + 入库时间」，供拉取完成邮件通知列出明细
+                stats.setdefault("files", []).append(
+                    (uniq, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             synced[inst_id] = {"ts": int(time.time()), "files": saved_count,
                                "doc_ids": doc_ids,
                                "names": doc_names, "sizes": doc_sizes}
