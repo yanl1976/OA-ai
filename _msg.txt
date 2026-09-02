@@ -1,0 +1,14 @@
+feat: 邮件通知增加文件名+入库时间 与 注册人+注册时间
+
+拉取内容更新通知 app/notify_mail.py + app/yzj_pull.py:
+- yzj_pull 落盘时收集 stats["files"]，记录每个文件的文件名与入库时间
+- 邮件正文新增「本次入库文件（文件名 — 入库时间）」清单，逐条编号列出
+- 单次最多列 50 条(MAX_FILE_LIST)，超出仅提示总数，避免大批量拉取把邮件撑爆
+- 无新增文件时明确提示「本次没有新增文件」
+- 邮件主题带上新增数量，便于快速判断有无更新
+
+注册审核通知 app/notify_mail.py + app/admin.py:
+- notify_register 新增 registered_at 参数，展示用户提交申请的注册时间
+- 正文区分「注册人/注册时间」与「审核人/审核时间」，信息更完整
+- admin 审批通过/驳回两处均传入 user_registrations.created_at
+- 注册时间缺失时回退为「—」，不影响邮件发送
