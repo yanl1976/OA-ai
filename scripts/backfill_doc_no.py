@@ -59,12 +59,16 @@ def collect_flows(task):
     if not form_code_ids:
         print("[warn] 任务 %s 未配置模板，跳过" % task.get("id"))
         return []
+    # find_flows 定义在 yunzhijia_client（yzj_pull 仅在函数内局部 import，
+    # 模块级取不到 yzj_pull.find_flows），故从这里直接导入。
+    from yunzhijia_client import find_flows
+
     flows = []
     for cid in form_code_ids:
         page, page_size = 1, 50
         while True:
             try:
-                resp = yzj_pull.find_flows(
+                resp = find_flows(
                     form_code_ids=[cid],
                     status=task.get("status") or None,
                     create_time=None,

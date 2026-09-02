@@ -516,6 +516,10 @@ def _upload_to_doc(u: dict) -> dict:
         "label": u.get("label", u.get("filename", u["doc_id"])),
         "source": "upload",
         "year": u.get("year"),
+        # 业务流水号（云之家 serialNo，形如 HYJYXSSPFB-20260901-002）：
+        # 会议纪要等单据列表按它排序（日期 + 当日序号），比文件名日期权威。
+        # 必须透传，否则 _doc_sort_date_ord 读不到而退化到文件名解析。
+        "doc_no": u.get("doc_no", ""),
         "stored": bool(_resolve_binary_path(u)),
     }
 
