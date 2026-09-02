@@ -2,6 +2,49 @@
 
 ## 更新日志
 
+### 2026-09-02 · 会议纪要排序体系 + 文档替换 + docx 预览 + 邮件通知增强 + 多时段调度
+
+本阶段围绕「会议纪要如何按真实时间正确排列」与「文档维护便利性」展开，并修复了一个潜伏已久的
+**云之家凭证读不到**问题。
+
+**会议纪要排序（核心）**
+
+会议纪要（含各子类）列表改为按**单据日期倒序**（最新在前），日期来源按权威性三级取值：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | **业务流水号 `doc_no`**（云之家 `serialNo`，如 `HYJYXSSPFB-20260901-002`） | 最权威，含「单据日期 + 当日序号」，同日多份也能稳定排序 |
+| 2 | 文件名日期 | 文号日期段 / `YYYYMMDD_` 前缀 / `YYYY年M月D日` / `YYYY年M月`（无日按当月 1 日）/ 仅年份 |
+| 3 | 入库时间 `created_at` | 兜底，排在有日期的文档之后 |
+
+覆盖范围：**仅**「会议纪要」顶层分类及其子类（`周工作例会会议纪要` / `总经理会会议纪要` / `专题会议纪要` 等），其他分类保持原有「年份倒序 + 文件名」不变。
+
+**其他功能**
+
+| 功能 | 说明 |
+|---|---|
+| 管理界面替换原文件 | 上传管理每行新增「替换文件」：直接覆盖物理文件、沿用原 `doc_id`（不丢归类/标签），自动重提取 |
+| docx 原版版面预览 | 知识浏览新增「预览 docx」，浏览器内渲染原版版面（**不转 PDF**，用 `docx-preview`） |
+| 登录/注册页系统名称 | 动态读取后台「系统名称」卡片设置并居中显示，不再硬编码 |
+| 云之家多执行时段 | 任务可配一天多个自动拉取时段（如 `09:00` / `14:30` / `21:00`），每个时段独立注册调度作业 |
+| 邮件通知增强 | 拉取通知列出「文件名 + 入库时间」；注册通知增加「注册人 + 注册时间」 |
+| 邮件系统配置 | 系统设置新增邮件卡片（SMTP 配置、测试发送；拉取完成 / 注册审批两类通知开关） |
+
+**关键修复**
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **云之家拉取实际一直是坏的** | 生产机 venv **未安装 `python-dotenv`**，`load_dotenv()` 抛 `ImportError` 被 `try/except: pass` 静默吞掉 → `YUNZHIJIA_*` 凭证全空 → token 报「参数错误 11000400」 | `yunzhijia_client.py` 增加零依赖兜底：dotenv 不可用时自行解析 `.env` |
+| 定时拉取从未运行 | 未安装 `apscheduler`，`start_scheduler()` 启动失败（只打了 warning） | 生产机 `pip install apscheduler`（3.11.3） |
+| `KB_ROOT` 路径漂移 | `.env` 里被误填为 `/opt/OA-ai/knowledge_base`（非法部署根），靠代码自动纠正才用对 | 修正为 `/opt/OA-ai` |
+| 会议纪要排序读不到流水号 | 列表走 `_all_browse_docs()`，它**按 doc_id 去重且 manifest 优先**，而 manifest（BM25 索引快照）**不含 `doc_no`** → 绝大多数已建索引文档退化到文件名/入库时间排序 | 去重后用 uploads 的 `doc_no` 回填 manifest 条目（无需重建索引） |
+
+> **经验**：manifest 是索引快照，只含检索字段。**任何新增的业务字段（如 `doc_no`）都要在
+> `_all_browse_docs()` 里回填**，否则「新拉的有、老的没有」，表现为部分文档排序正常、部分乱序。
+
+存量文档（165 条）已用 `scripts/backfill_doc_no.py` 补录流水号，覆盖率 98.8%。
+详见下方「会议纪要排序」与「邮件通知」章节，排障见「云之家拉取排障 → Q14~Q16」。
+
 ### 2026-08-31 · 用户注册审批 + 用户池白名单
 
 登录页新增自助注册，注册须**工号 + 姓名命中用户池**并按池中预设角色授权，**管理员审批通过后才可登录**：
@@ -86,6 +129,49 @@
 - **去重与断点续传**：每条处理完即**增量保存**去重记录（原子写），中断不丢进度，下次续拉不重复；异常时 `finally` 兜底保存。
 - **自愈**：旧版本误判为「无附件」的记录会重新校验一次（用 `ver` 标记避免重复校验）。
 
+#### 多执行时段调度（2026-09-02 新增）
+
+一个任务可配置**一天内多个自动拉取时段**，每个时段注册一个独立调度作业。
+
+配置（`config/yzj_pull_tasks.json`）：
+
+```json
+{
+  "schedule": "daily",
+  "schedule_times": ["09:00", "14:30", "21:00"]
+}
+```
+
+| 项 | 说明 |
+|---|---|
+| `schedule_times` | 时段列表（`HH:MM`，兼容全角冒号 `09：00`），留空则回退到单时段 |
+| 与 `weekly` 配合 | 每个时段都在指定星期执行 |
+| 自动去重 | 同一时刻只注册一次，避免重复拉取 |
+| 作业 id | `yzj_pull_<任务id>#0` / `#1` / `#2`，日志里可分别看到各自的下次执行时间 |
+| 向后兼容 | 未配 `schedule_times` 时沿用旧的 `schedule_hour` / `schedule_minute` 单时段，历史配置无需改动 |
+
+前端「云之家拉取」任务编辑器可直接增删时段（`type=time` 控件），列表显示为「每天 09:00、14:30、21:00」。
+
+> ⚠️ **改完必须重启服务**：调度作业在 `kb` 服务**启动时**注册，改配置或改代码后
+> 不重启不会生效（表现为"设了时段却没执行"）：`sudo systemctl restart kb`
+>
+> ⚠️ apscheduler 的 cron 只排**未来**时间点。若重启时当天设定的时段已过，
+> 当天不会再触发，从**第二天**开始生效。
+
+**依赖**：定时调度需要 `apscheduler`（未安装时只打 warning，手动拉取仍可用）：
+
+```bash
+/opt/OA-ai/venv/bin/pip install apscheduler
+sudo systemctl restart kb
+```
+
+**自查调度作业是否注册成功**：
+
+```bash
+journalctl -u kb --since '5 min ago' --no-pager | grep -iE 'Scheduler started|注册云之家拉取任务'
+# 期望：Scheduler started / 注册云之家拉取任务: <id> ([{'hour': 9, 'minute': 0}, ...])
+```
+
 > **接口参考**：云之家 API 的请求/响应结构、附件两种控件（`Ps_0` list / `Kg_0` dict）字段对照、
 > 下载策略与排查命令，见 **[`docs/yunzhijia_api.md`](docs/yunzhijia_api.md)**。
 
@@ -112,6 +198,53 @@
 # 确认无误后加 --apply 执行
 ```
 
+### 会议纪要排序（2026-09-02 新增）
+
+会议纪要（含各子类）列表按**单据日期倒序**排列（最新在前）。日期来源按权威性三级取值：
+
+| 优先级 | 来源 | 示例 / 说明 |
+|---|---|---|
+| 1 | **业务流水号 `doc_no`** | 云之家 `serialNo`，如 `HYJYXSSPFB-20260901-002` → 日期 `20260901`、当日序号 `2`。最权威，**同日多份也能按流水先后排** |
+| 2 | 文件名日期 | `HYJYXSSPFB-20241021-003` 文号段 → `20251105_xxx` 日期戳前缀 → `(2024年10月21日)` → `2026年5月份`（无日按当月 1 日）→ 仅年份 |
+| 3 | 入库时间 `created_at` | 兜底；无日期的文档统一排在有日期的之后 |
+
+- **覆盖范围**：仅「会议纪要」顶层分类及其子类（`周工作例会会议纪要` / `总经理会会议纪要` / `专题会议纪要` 等，判定为分类名含「会议纪要」或在「会议纪要分类」子树内）。其他分类保持「年份倒序 + 文件名」。
+- **自动生效**：无需前端切换，也不暴露排序 UI。
+- **流水号从哪来**：云之家拉取落盘时由 `serialNo` 写入文档的 `doc_no` 字段。**手动上传的文档没有流水号**，走文件名日期 / 入库时间。
+
+存量文档补录流水号（脚本默认只预览，加 `--apply` 才写入）：
+
+```bash
+cd /opt/OA-ai
+/opt/OA-ai/venv/bin/python scripts/backfill_doc_no.py                 # 预览
+/opt/OA-ai/venv/bin/python scripts/backfill_doc_no.py --task <任务id>  # 只处理某个任务
+/opt/OA-ai/venv/bin/python scripts/backfill_doc_no.py --apply         # 实际写入（自动备份）
+```
+
+原理：调云之家流程列表（**只翻列表不下附件**，速度快）拿 `serialNo` + `formInstId`，
+再用 `config/.yzj_pull_synced.json` 里的 `formInstId → doc_ids` 映射回填。
+只补当前缺 `doc_no` 的文档，不覆盖已有值。需联网且服务停机与否均可（读的是本地元数据）。
+
+> ⚠️ **排序读不到流水号的典型坑**：列表走 `_all_browse_docs()`，它按 `doc_id` 去重且
+> **manifest 优先**，而 `documents_manifest.json` 是 BM25 索引快照、**不含 `doc_no`**。
+> 因此只有"还没进索引"的新文档带 `doc_no`，已建索引的都退化到文件名/入库时间排序，
+> 表现为**部分有序、部分乱序**。已在 `_all_browse_docs()` 用 uploads 数据回填 `doc_no`。
+>
+> **新增任何业务字段都要记得在这里回填**，否则会重现此类问题。
+
+**验证排序是否正确**（生产机，输出乱序条数应为 0）：
+
+```bash
+cd /opt/OA-ai && KB_ROOT=/opt/OA-ai /opt/OA-ai/venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/OA-ai/app')
+import kb_store as ks
+for cat in ['周工作例会会议纪要','总经理会会议纪要','专题会议纪要']:
+    items = (ks.list_documents(category=cat, page=1, page_size=300).get('items') or [])
+    sn = sum(1 for d in items if ks._parse_serial_no(d.get('doc_no','')))
+    print('%s: 共%d条 有流水号%d' % (cat, len(items), sn))
+"
+```
+
 ### 用户注册审批与用户池（2026-08-31 新增）
 - **注册入口**：登录页「注册」页签，填工号 + 姓名 + 密码（≥6 位）提交申请。
 - **用户池白名单**：只有工号与姓名**同时命中用户池**才允许注册，杜绝任意账号灌入；池中预设的角色即该用户的权限来源（"用户池给定的权限"）。
@@ -128,12 +261,62 @@
 - **派生分析**：会议纪要结构化解析（议题切分）、二次生成 PDF。
 - **权限与角色**：用户/角色/权限管理，细粒度权限点（查看、上传、删除、图谱、派生分析等）。
 
-### 系统设置与界面（2026-08-29 更新）
+### 文档替换与 docx 原版预览（2026-09-02 新增）
+
+**管理界面直接替换原文件**（上传管理 → 每行「替换文件」按钮）：
+
+- 覆盖物理文件并**沿用原 `doc_id`**，不新增条目、**不丢归类与标签**
+- 自动更新 `stored_path` / 扩展名 / MIME / 文件名，并触发后台重新提取与建索引
+- 旧二进制自动清理（扩展名不同也会删，避免残留两份）
+- 适合场景：已通过 FTP 把新文件传到服务器，或格式升级（`.doc` → `.docx`）后覆盖原条目
+
+> 与「重新上传」的区别：重新上传会产生**新 `doc_id`**（原条目仍在，需手动删旧）；
+> 「替换文件」是**原地覆盖**，历史记录、归类、标签、收藏一律保留。
+
+**docx 原版版面预览**（知识浏览 → 文档头部「预览 docx」按钮）：
+
+- 浏览器内**直接渲染 docx 原版版面**（分页、样式、排版），**不转 PDF**、不依赖公网、服务端零转换
+- 基于前端库 `docx-preview`，从后端 inline 端点取二进制后本地渲染
+- 与「纯文本预览」并存：正文区仍是提取出的纯文本，点按钮才看原版版面
+- PDF 走既有 `PdfModal`（iframe 直出），docx 走新增 `DocxModal`
+
+> 新建/修改前端依赖后，生产机需 `cd /opt/OA-ai/web_vue && npm install && npm run build`。
+
+### 邮件通知（SMTP，2026-09-02 增强）
+
+系统可在关键事件发生时发邮件通知，**总开关 + 两类事件独立开关**。
+
+| 配置项 | 说明 |
+|---|---|
+| `EMAIL_ENABLED` | 邮件总开关（关闭则全部不发） |
+| `EMAIL_NOTIFY_PULL` | 云之家拉取完成通知 |
+| `EMAIL_NOTIFY_REGISTER` | 注册审批结果通知 |
+| `EMAIL_TYPE` / `EMAIL_HOST` / `EMAIL_PORT` / `EMAIL_USER` / `EMAIL_PASSWORD` / `EMAIL_TO` | SMTP 连接与收件人 |
+
+配置入口：**系统设置 → 邮件配置卡片**（需 `system.manage` 权限），可填完直接「发送测试邮件」。
+配置持久化在 `.env`，模板见 `config/.env.example`。
+
+**通知内容**：
+
+| 事件 | 正文要点 |
+|---|---|
+| 云之家拉取完成 | 任务名、新增/更新数、失败数、完成时间，以及**本次入库文件清单（文件名 — 入库时间）**；单次最多列 50 条，超出提示总数 |
+| 注册审批通过/驳回 | **注册人**、工号、**注册时间**（提交申请的时间）、审核人、审核时间、审核备注 |
+
+> 「发送测试邮件」会**忽略总开关**（`force=True`），便于在总开关关闭时验证 SMTP 是否配通；
+> 日常事件通知则受总开关与对应事件开关双重控制。
+
+实现见 `app/notify_mail.py`（异步线程发送，失败不影响主业务流程）。
+
+### 系统设置与界面（2026-08-29 更新 / 2026-09-02 补充）
 - **统一卡片网格**：原「管理功能」「系统维护」两个分组合并为统一卡片网格（入口卡片带「进入 →」，维护卡片带状态）。「系统初始化」高危卡片红框置底。
 - **系统名称设定**：系统设置新增「🏷 系统名称」卡片，可设定系统名称并查看版本号。
   - **版本号**：由 Git 提交次数派生（每次 Git 更新即重新定义），规则为 `1.{commits//10}.{commits%10}`（每位满 10 进位，初始基准 1.0.0）。当前 55 次提交 → `v1.5.5`。
   - 系统名称持久化于 `config/system_settings.json`（默认 "OA-AI 知识库"）。
   - **首页左上角品牌名已变量化**：自动读取系统设置中的系统名称；管理员在系统设置修改并保存后，首页品牌名立即同步（全局响应式，无需刷新）。
+  - **登录 / 注册页顶部名称已变量化**（2026-09-02）：登录页顶部标题同样读取该系统名称并**居中显示**；未取到时兜底为 `OA-AI 知识库`。
+    - 配套改动：`GET /api/system/info` **不再要求登录**（系统名称与版权属公开信息，登录页未登录时也需读取；此前被 `@login_required` 挡住返回 401，导致登录页只能显示兜底值）。
+  - 注册页底部说明文案：「工号与姓名经校验通过；提交后由管理员审批，通过后即可登录。」
 - **页面水印**：所有内容显示页叠加全局半透明水印（使用者账号 + 姓名，如 `zhangsan（张三）`），用于信息流向追踪与防泄露。
   - 开关位于系统设置「🌐 页面水印」专用卡片（需 `system.manage` 权限切换），默认开启。
   - 后端以功能开关 `watermark_enabled` 持久化（`app/admin.py` 的 `DEFAULT_FEATURES`，默认 1）；`list_features()` 幂等补种，保证旧库升级后开关可用且可持久化切换。
@@ -152,24 +335,27 @@ kb_deploy/
 │   ├── rag_build_index.py    # BM25 索引构建脚本
 │   ├── vec_store.py          # BGE 语义向量索引（缺失时回退哈希方案）
 │   ├── llm.py                # MiniMax LLM 封装（思考剥离、查询改写、问题分解）
-│   ├── kb_store.py           # 文档存储 / 元数据
+│   ├── kb_store.py           # 文档存储 / 元数据（含会议纪要排序、doc_no 回填、替换原文件）
 │   ├── admin.py              # 用户 / 角色 / 权限 + 功能开关（含 watermark_enabled）
 │   ├── chat_store.py         # 对话会话持久化
 │   ├── extract_text.py       # 多格式文档解析（PDF/Office/HTML，含 .doc OLE 兜底）
-│   ├── yzj_pull.py           # 云之家审批单据拉取引擎（多模板/多控件/去重/自愈）
-│   ├── yunzhijia_client.py   # 云之家开放平台 API 封装（token/模板/流程/下载）
+│   ├── yzj_pull.py           # 云之家审批单据拉取引擎（多模板/多控件/去重/自愈/多时段调度）
+│   ├── yunzhijia_client.py   # 云之家开放平台 API 封装（token/模板/流程/下载，含 .env 零依赖兜底）
+│   ├── notify_mail.py        # SMTP 邮件通知（拉取完成 / 注册审批，异步发送）
 │   ├── pdf_make.py           # PDF 生成（reportlab）
 │   ├── derived_store.py      # 会议纪要结构化解析与派生
 │   ├── generate_data.py      # 原始数据导入
 │   └── crypto.py             # 加密（secret.key）
 ├── scripts/
 │   ├── serve.py              # ✅ 启动入口（Flask，默认 8080）
+│   ├── backfill_doc_no.py    # 存量文档补录云之家流水号 doc_no（预览 / --apply）
 │   ├── fix_yzj_ext.py        # 修复云之家历史「名实不符」文件（预览 / --apply）
 │   ├── start.sh              # ✅ 一行命令启动 + 进程守护（崩溃自动重启）
 │   └── install.sh            # 首次安装脚本（systemd 服务）
 ├── web_vue/                  # 前端（Vue 3 + Vite + Three.js）
 │   ├── dist/                 # 生产构建（serve.py 直接托管，无需 dev server）
 │   └── src/components/       # SearchView / KbBrowse / ChatView / MeetingDerived ...
+│                             # 2026-09-02 新增：DocxModal（docx 原版预览）、Login（系统名称居中）
 ├── docs/
 │   └── yunzhijia_api.md      # 云之家接口参考（字段结构/附件控件/下载策略/排障）
 ├── knowledge_base/
@@ -206,6 +392,25 @@ pip install -r requirements.txt
 
 > 注：`requirements.txt` 仅列核心依赖。文档解析还需 `pdfplumber`/`PyMuPDF`、`python-docx`、`openpyxl`、`python-pptx`、`numpy`、`reportlab`、`python-dotenv`；部署脚本需 `paramiko`。若缺包，按启动报错逐个安装即可。
 
+**可选但强烈建议安装**：
+
+| 包 | 用途 | 不装的后果 |
+|---|---|---|
+| `apscheduler` | 云之家**定时**拉取调度 | 定时拉取**永不运行**（只打一行 warning，手动拉取仍可用，极易忽略） |
+| `python-dotenv` | 加载 `.env` | 凭证读不到 → 云之家/邮件等全部失败（详见排障 Q14） |
+
+```bash
+/opt/OA-ai/venv/bin/pip install apscheduler python-dotenv
+sudo systemctl restart kb
+```
+
+**前端新增依赖**（2026-09-02 起，用于 docx 原版预览）：
+
+```bash
+cd web_vue && npm install      # 会拉取 docx-preview
+npm run build
+```
+
 ### 2. 配置 `.env`
 
 复制 `config/.env.example` 为根目录 `.env`，关键项：
@@ -220,6 +425,17 @@ pip install -r requirements.txt
 | `KB_API_HOST` | 监听地址，默认 `0.0.0.0` |
 | `KB_API_PORT` | 监听端口，默认 `8080` |
 | `KB_TOP_K` | 检索返回条数，默认 `5` |
+| `EMAIL_ENABLED` | 邮件通知**总开关**（`true`/`false`），关闭则全部不发 |
+| `EMAIL_NOTIFY_PULL` | 云之家拉取完成通知开关 |
+| `EMAIL_NOTIFY_REGISTER` | 注册审批结果通知开关 |
+| `EMAIL_TYPE` | SMTP 类型，通常 `smtp` |
+| `EMAIL_HOST` / `EMAIL_PORT` | SMTP 服务器与端口（如 `smtp.exmail.qq.com` / `465`） |
+| `EMAIL_USER` / `EMAIL_PASSWORD` | SMTP 账号与密码（或授权码） |
+| `EMAIL_TO` | 收件人，多个用逗号分隔 |
+
+> 邮件配置也可在**系统设置 → 邮件配置卡片**里可视化填写并测试（需 `system.manage` 权限），
+> 保存后写入 `.env`。模板见 `config/.env.example`。
+> ⚠️ `.env` 含明文凭证，**已被 `.gitignore` 排除，切勿提交**。
 
 > ⚠️ **`KB_ROOT` 陷阱**：必须填**部署根**（如 `/opt/OA-ai`），代码会自动在其下拼接
 > `knowledge_base/`、`data/`、`web_vue/dist/`。若误填成 `/opt/OA-ai/knowledge_base`，
@@ -333,8 +549,22 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 | GET | `/api/kb/document?doc_id=` | 文档详情 |
 | POST | `/api/kb/upload` | 文档上传解析入库 |
 | POST | `/api/kb/upload-zip` | 批量 ZIP 上传 |
+| **POST** | `/api/kb/document/<doc_id>/binary` | **替换原文件**（multipart，字段名 `file`）：覆盖物理文件、沿用原 `doc_id`，自动重提取（需 `kb.upload.manage`） |
 | GET | `/api/kb/categories` | 分类树 |
 | GET | `/api/kb/tags` | 标签 |
+
+### 文档替换（2026-09-02 新增）
+
+```bash
+# 用新文件覆盖原条目（doc_id 不变，归类/标签保留）
+curl -X POST http://127.0.0.1:8080/api/kb/document/up_xxx/binary \
+  -H "Authorization: Bearer <token>" \
+  -F "file=@新文件.docx"
+# 返回：{"ok":true,"doc_id":"up_xxx","stored":true}
+```
+
+后端做扩展名白名单（`extract_text.ALLOWED_EXT`）与大小上限（`KB_MAX_UPLOAD_BYTES`，默认 100MB）校验，
+通过后写入新文件、删除旧二进制（扩展名不同也会清理），`indexed` 复位为 0 并入队后台重提取。
 
 ### 智能对话
 | 方法 | 路径 | 说明 |
@@ -373,6 +603,9 @@ BGE 模型冷启动约 20-33 秒（sentence-transformers 初始化需联网校�
 | PUT | `/api/system/info` | 更新系统名称（需 `system.manage`，1~60 字符），请求体 `{ "system_name": "..." }` |
 | GET | `/api/admin/features` | 功能开关列表（含 `watermark_enabled`）；旧库首次访问自动补种缺失开关 |
 | PUT | `/api/admin/feature` | 切换功能开关（见上方"页面水印"） |
+| GET | `/api/admin/email-config` | 读取邮件 SMTP 配置（需 `system.manage`，密码不返回明文给前端表单以外用途） |
+| POST | `/api/admin/email-config` | 保存邮件配置（写入 `.env`） |
+| POST | `/api/admin/email-config/test` | **发送测试邮件**（忽略总开关，用于验证 SMTP 是否配通） |
 
 ### 派生分析（会议纪要）
 | 方法 | 路径 | 说明 |
@@ -850,6 +1083,28 @@ A：停止所有匹配 `serve.py` 的 python 进程后再启动单实例。
 **Q：新增的系统名称 / 页面水印 / 卡片整理等前端改动没生效？**
 A：前端改动需 `npm run build` 重建 `web_vue/dist`，而 **`dist/` 被 `.gitignore` 忽略，`git pull` 拉不到**。生产机更新必须另行同步 dist：开发机 `python deploy_dist.py`（走既定部署脚本，不触碰 git 跟踪文件），或生产机 `cd /opt/OA-ai/web_vue && npm run build`。后端 `scripts/serve.py`、`app/admin.py` 等会随 `git pull` 更新。
 
+**Q：登录页顶部显示的不是我设置的系统名称？**
+A：登录页顶部读取 `GET /api/system/info`。若显示兜底值 `OA-AI 知识库`，说明该接口**没读到**（未登录被 401 拦截，或 `config/system_settings.json` 未设置）。
+2026-09-02 起该 GET 接口**已改为公开**（不要求登录），`git pull` + 重启后登录页即显示后台设置的系统名称。
+
+**Q：云之家定时拉取设了时段却不执行？**
+A：按以下顺序排查：
+1. **是否装了 `apscheduler`** —— 未安装时启动日志只有一行 warning，手动拉取仍可用但**定时永不运行**：
+   `/opt/OA-ai/venv/bin/pip install apscheduler`
+2. **改完配置/代码是否重启了服务** —— 调度作业在**启动时**注册，不重启不生效：`sudo systemctl restart kb`
+3. **当天时段是否已过** —— apscheduler 只排未来时间点，重启时若当天的点已过，从**第二天**开始生效
+4. 看日志确认注册情况：`journalctl -u kb --since '5 min ago' | grep -iE 'Scheduler started|注册云之家拉取任务'`
+
+**Q：会议纪要列表顺序看起来乱？**
+A：先确认覆盖范围——只有**分类名含「会议纪要」**的分类才走日期倒序，其他分类仍是「年份倒序 + 文件名」。
+若已在该范围内仍乱，多半是**读不到流水号**：列表数据源 `_all_browse_docs()` 以 manifest 优先，而 manifest 是索引快照、不含 `doc_no`。已在代码里回填修复（`git pull` + 重启）；存量文档用 `scripts/backfill_doc_no.py` 补录流水号。
+另注意：**手动上传的文档没有流水号**（只有云之家拉取的才有），它们只能按文件名日期 / 入库时间排，会统一排在有流水号的文档之后。
+
+**Q：docx 点「预览 docx」没反应 / 渲染失败？**
+A：该能力依赖前端库 `docx-preview`（2026-09-02 新增）。生产机需先装依赖再构建：
+`cd /opt/OA-ai/web_vue && npm install && npm run build`。
+若已构建仍失败，打开浏览器控制台看是否有 `docx-preview` 相关报错；也可能是该文件实际不是 OOXML（如「.docx 名 + PDF 内容」，见排障 Q6）。
+
 **Q：升级后系统设置里「页面水印」开关切换不生效？**
 A：旧库缺少 `watermark_enabled` 这一行时，`setFeature` 的 UPDATE 会因找不到行而静默失效。已在 `admin.list_features()` 增加幂等补种（首次访问 `/api/admin/features` 自动 `INSERT OR IGNORE` 补入缺失开关），`git pull` + 重启后前端首次加载即补入，开关即可持久化切换。
 
@@ -1178,3 +1433,121 @@ print('总数', len(d), dict(c))
 
 > **判读要点**：如果 `no-attachment(ver=None)` 长期不减少，说明自愈没生效
 > （先查 Q3）；拉取停止时先看文件 `mtime` 判断是"结束了"还是"卡住"。
+
+### Q14：云之家拉取失败，报「获取 accessToken 失败：参数错误 11000400」（**凭证读不到**）
+
+**症状**：手动拉取与定时拉取都失败，日志出现
+
+```
+Traceback: raise RuntimeError("获取 accessToken(scope=team) 失败：参数错误 11000400 ...")
+```
+
+而 `.env` 里 `YUNZHIJIA_APP_ID` / `APP_SECRET` / `ECP_ID` **明明都配了**。
+
+**根因（2026-09-02 定位）**：生产机 venv **未安装 `python-dotenv`**。`app/yunzhijia_client.py`
+在模块顶层这样加载：
+
+```python
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass          # ← ImportError 被静默吞掉，日志毫无痕迹
+```
+
+包缺失 → `load_dotenv()` 从未执行 → `os.environ` 里没有 `YUNZHIJIA_*` → 凭证读成空串
+→ 云之家服务端判定参数缺失，返回 `11000400`。
+
+**自查**：
+
+```bash
+/opt/OA-ai/venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/OA-ai/app')
+import yunzhijia_client as y
+print('APP_ID:', bool(y.APP_ID), '| SECRET:', bool(y.APP_SECRET), '| EID:', bool(y.EID))
+"
+# 全为 False 即命中此问题（.env 没被加载）
+```
+
+**修复（二者选一，代码兜底已内建）**：
+
+```bash
+# 方案 A：装包（推荐，顺带解决其他依赖 .env 的地方）
+/opt/OA-ai/venv/bin/pip install python-dotenv
+sudo systemctl restart kb
+
+# 方案 B：仅靠代码兜底（2026-09-02 起 yunzhijia_client 自带 .env 解析，无需装包）
+# 确认已 pull 到该版本后重启即可
+sudo systemctl restart kb
+```
+
+> **经验**：与 Q4 同源——**警惕 `except Exception: pass`**。这次也是异常被吞，
+> 表现为"凭证相关"的远端错误码，极难联想到本地缺包。
+> 修复方式正是"零依赖兜底"：dotenv 不可用时自行解析 `.env` 注入环境变量。
+
+**验证**：
+
+```bash
+/opt/OA-ai/venv/bin/python -c "
+import sys; sys.path.insert(0,'/opt/OA-ai/app')
+import yunzhijia_client as y
+print('token ok:', bool(y.get_access_token()))
+"
+# token ok: True 即为已修复
+```
+
+### Q15：定时拉取从未运行过（连第一次都没跑）
+
+**根因**：`app/yzj_pull.py` 的 `start_scheduler()` 依赖 `apscheduler`，缺失时只打一行 warning：
+
+```
+WARNING:yzj_pull:未安装 apscheduler，云之家拉取定时调度不可用（手动触发仍可用）
+```
+
+服务照常启动、手动拉取也正常，极易被忽略——实际上**每天的定时任务从未注册过**。
+
+**修复**：
+
+```bash
+/opt/OA-ai/venv/bin/pip install apscheduler
+sudo systemctl restart kb
+```
+
+**确认**：
+
+```bash
+journalctl -u kb --since '5 min ago' --no-pager | grep -iE 'Scheduler started|apscheduler'
+# 期望：INFO:apscheduler.scheduler:Scheduler started / [信息] 云之家拉取调度器已启动
+```
+
+> 装完仍不执行 → 多半是「改了配置没重启」或「当天时段已过」，见上方
+> 「常见问题 → 云之家定时拉取设了时段却不执行」。
+
+### Q16：`KB_ROOT` 被填成非法路径（路径二次叠加 / 独立脚本读到 0 篇）
+
+**症状**：
+
+```
+[警告] KB_ROOT='/opt/OA-ai/knowledge_base' 不是合法部署根（缺少 scripts/ 目录），已自动改用推导值 /opt/OA-ai
+```
+
+或独立脚本报 `uploads 条数: 0`、路径出现 `/opt/OA-ai/knowledge_base/knowledge_base/uploads/...`。
+
+**根因**：`/opt/OA-ai/.env` 里 `KB_ROOT` 被误填为 `/opt/OA-ai/knowledge_base`（多了一层）。
+`kb_store` 会在其下再拼 `knowledge_base/uploads`，导致路径二次叠加。
+`serve.py` 有防御（检测到无 `scripts/` 自动回退推导值），所以服务**仍能跑**，但隐患很大。
+
+**修复**：
+
+```bash
+sed -i 's|^KB_ROOT=.*|KB_ROOT=/opt/OA-ai|' /opt/OA-ai/.env
+grep '^KB_ROOT' /opt/OA-ai/.env      # → KB_ROOT=/opt/OA-ai
+sudo systemctl restart kb
+```
+
+> 独立脚本（非 Flask 进程）不会走 serve.py 的防御逻辑，**必须显式指定** `KB_ROOT`：
+> ```bash
+> cd /opt/OA-ai && KB_ROOT=/opt/OA-ai /opt/OA-ai/venv/bin/python scripts/xxx.py
+> # 或在脚本开头：os.environ["KB_ROOT"] = "/opt/OA-ai"，再 import kb_store
+> ```
+> 注意 `os.environ` 要在 **import `kb_store` 之前**设置——`KB_ROOT` 是模块级常量，import 后改无效。
