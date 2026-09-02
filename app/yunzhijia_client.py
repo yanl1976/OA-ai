@@ -27,7 +27,33 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
-    pass
+    # 【修复·凭证读不到】生产机 venv 常未安装 python-dotenv，此时 load_dotenv
+    # 抛 ImportError 被静默吞掉，导致 YUNZHIJIA_* 全部读成空串，最终 token 接口
+    # 返回「参数错误 11000400」，云之家拉取与流水号补录全部失败且无明显报错。
+    # 这里做零依赖兜底：自行从项目根 .env 解析并注入环境变量（不覆盖已有值）。
+    load_dotenv = None  # noqa: F811
+    try:
+        import os as _os
+
+        def _load_env_fallback():
+            here = _os.path.dirname(_os.path.abspath(__file__))
+            root = _os.path.dirname(here)  # app/ 的上一级 = 项目根
+            env_path = _os.path.join(root, ".env")
+            if not _os.path.exists(env_path):
+                return
+            with open(env_path, "r", encoding="utf-8", errors="replace") as _f:
+                for line in _f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.split("#")[0].strip().strip('"').strip("'")
+                    if k and k not in _os.environ:
+                        _os.environ[k] = v
+
+        _load_env_fallback()
+    except Exception:
+        pass
 
 
 def _cfg(key, default=""):
