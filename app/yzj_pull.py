@@ -806,7 +806,11 @@ def run_task(task, dry_run=False, limit=None, force=False):
                 used_names.add(uniq.strip().lower())
                 # 自动归类（按文件名/标题关键词匹配分类树，校验存在，否则兜底 target_category）
                 category = _auto_classify(template_name, fl.get("title") or "", uniq) or cat
-                doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia")
+                # 业务流水号（云之家 serialNo，如 HYJYXSSPFB-20260901-002）：
+                # 内含单据日期与当日序号，作为会议纪要排序的权威依据写入 doc_no。
+                _serial = (fl.get("serialNo") or "").strip()
+                doc_id = save_upload_raw(uniq, category, raw, source="yunzhijia",
+                                         doc_no=_serial)
                 doc_ids.append(doc_id)
                 doc_names.append(uniq)
                 doc_sizes.append(len(raw))

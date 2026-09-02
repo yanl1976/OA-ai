@@ -254,26 +254,46 @@ def _parse_doc_date(filename: str):
     返回 (year, month, day) 可比较元组；无法解析返回 None。
     """
     fn = filename or ""
-    # 1) 文号日期段：-\d{8}- 或 整体形如 *-YYYYMMDD-*
+    # 0) 文号日期段（最规范、优先级最高）：HYJYXSSPFB-20241021-003 中的 20241021
     m = re.search(r"-(\d{8})(?:-|$)", fn)
     if m:
         s = m.group(1)
         y, mo, d = int(s[:4]), int(s[4:6]), int(s[6:8])
         if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
             return (y, mo, d)
-    # 2) 中文日期：YYYY年M月D日（含半角括号/全角括号）
+    # 1) 开头日期戳：如 20251105_xxx（云之家拉取常带的时间戳前缀，可靠性高）
+    m = re.match(r"^(\d{8})[_\-\s]", fn)
+    if m:
+        s = m.group(1)
+        y, mo, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+        if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return (y, mo, d)
+    # 2) 中文日期：YYYY年M月D日（含半角/全角括号，如 (2024年10月21日）)
     m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]", fn)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
             return (y, mo, d)
-    # 3) 通用分隔日期
+    # 3) 中文年月（无「日」）：如 2026年5月份 → 按该月 1 日
+    #    实测大量纪要只写到「X月」而无具体日，此前会退化成 1月1日导致排序混乱。
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月", fn)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        if 1980 <= y <= 2100 and 1 <= mo <= 12:
+            return (y, mo, 1)
+    # 4) 通用分隔日期
     m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", fn)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
             return (y, mo, d)
-    # 4) 仅 4 位年份
+    # 5) 通用分隔年月（无日）：YYYY-MM / YYYY.MM
+    m = re.search(r"(\d{4})[.\-/](\d{1,2})(?![\d])", fn)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        if 1980 <= y <= 2100 and 1 <= mo <= 12:
+            return (y, mo, 1)
+    # 6) 仅含 4 位年份（无月日）：按当年 1 月 1 日处理（弱精度，仍可比）
     yrs = re.findall(r"(?:18|19|20)\d{2}", fn)
     for ys in yrs:
         y = int(ys)
@@ -282,19 +302,49 @@ def _parse_doc_date(filename: str):
     return None
 
 
+def _parse_serial_no(doc_no: str):
+    """解析业务流水号（云之家 serialNo），返回 (日期序数, 当日序号)。
+
+    格式：类型前缀-YYYYMMDD-序号，如 HYJYXSSPFB-20260901-002
+      -> (20260901, 2)
+    该日期是单据在云之家的流水日期，比文件名日期权威；序号保证同一天多份
+    单据也能稳定排序。无法解析返回 None。
+    """
+    s = (doc_no or "").strip()
+    if not s:
+        return None
+    m = re.search(r"-(\d{8})-(\d{1,6})(?:$|-)", s)
+    if m:
+        ds, seq = m.group(1), int(m.group(2))
+        y, mo, d = int(ds[:4]), int(ds[4:6]), int(ds[6:8])
+        if 1980 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return (y * 10000 + mo * 100 + d, seq)
+    return None
+
+
 def _doc_sort_date_ord(d: dict):
     """会议纪要排序键：有日期按日期倒序（用负数），无日期按入库时间倒序兜底。
 
     返回用于 list.sort(reverse=True) 的 (日期序数或时间序数, 次级稳定键)。
     约定：用 reverse=True 时，较大的值排前面。
+
+    日期来源优先级：
+      1) 业务流水号 doc_no（云之家 serialNo，形如 XXX-20260901-002）—— 最权威，
+         同时带出「当日序号」作为次级排序键（同日多份按流水号先后）；
+      2) 文件名解析（文号段 / 日期戳 / 中文年月日 / 年月 / 仅年份）；
+      3) 无日期：入库时间 created_at 倒序兜底。
     """
+    sn = _parse_serial_no(d.get("doc_no", ""))
+    if sn:
+        # 有流水号：日期序数 + 当日序号（序号越大越新）
+        return (2, sn[0], sn[1])
     dt = _parse_doc_date(d.get("filename", ""))
     if dt:
         ord_val = dt[0] * 10000 + dt[1] * 100 + dt[2]
-        return (1, ord_val)  # 有日期的组，按 ord_val 大者在前
+        return (1, ord_val, 0)
     # 无日期：入库时间倒序兜底（ISO 字符串字典序即可）
     ca = d.get("created_at") or ""
-    return (0, _iso_ord(ca))
+    return (0, _iso_ord(ca), 0)
 
 
 def _iso_ord(iso_str: str):
@@ -813,7 +863,7 @@ def _resolve_doc_id_conflict(doc_id: str, raw_bytes: bytes, ups: list) -> str:
 
 
 def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = None,
-                     source: str = "upload") -> str:
+                     source: str = "upload", doc_no: str = "") -> str:
     """仅落盘原始二进制 + 占位 entry（text 暂空），极快，供上传接口同步返回。
 
     真正的文本提取/结构化（extract + post_process）由后台任务异步补写，
@@ -822,6 +872,10 @@ def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = 
     year：归档年度。zip 批量上传时应传入「目录中的年度层」（如 2026年度），
     否则不同年度的同名文件会归到同一年度目录、并更容易触发 doc_id 冲突。
     不传时回退为从文件名中解析年份。
+
+    doc_no：业务流水号（云之家 serialNo，形如 HYJYXSSPFB-20260901-002）。
+    内含「单据日期 + 当日序号」，是比文件名更权威的排序依据；会议纪等单据
+    列表按此排序即可保证「最新在前 + 同日按序号」，不受文件名混乱影响。
     """
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(UPLOAD_FILES_DIR, exist_ok=True)
@@ -868,6 +922,7 @@ def save_upload_raw(filename: str, category: str, raw_bytes: bytes, year: int = 
                  "text": "", "created_at": _now(),
                  "stored_path": stored_rel,
                  "mimetype": mimetype,
+                 "doc_no": doc_no or "",
                  "ext": ext, "year": year, "tags": [], "deleted": 0, "deleted_at": None,
                  "source": source,
                  "indexed": 0}   # indexed=0 标记尚未经后台提取/建索引
