@@ -991,6 +991,13 @@ def _safe_run(task):
     finally:
         # 兜底：异常退出时也要把已处理部分的去重记录落盘（增量保存之外的保险）
         flush_task_synced(tid)
+        # 兜底复位运行态：无论 run_task 是正常返回、内部 except 提前 return、
+        # 还是抛异常冒泡到此处，都必须把 running 置 False。否则 _PROGRESS[tid]
+        # 会永久卡在 running=True —— 前端一直显示「拉取中」、中止按钮失效、
+        # 无法重新开始（即 2026-09-08 出现的拉取锁死根因）。
+        if tid in _PROGRESS:
+            _PROGRESS[tid]["running"] = False
+            _PROGRESS[tid]["done_at"] = int(time.time())
 
 
 def shutdown_scheduler():

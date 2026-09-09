@@ -120,19 +120,44 @@ def _auth_header():
 _CLOUDFLOW_BASE = f"{API_BASE}/gateway/workflow/form/thirdpart"
 
 
-def _cloudflow_post(path, body, access_token=None):
-    """cloudflow 接口统一 POST：accessToken 拼 QueryString。"""
-    tok = access_token or get_access_token()
-    url = f"{_CLOUDFLOW_BASE}/{path}?accessToken={tok}"
-    r = requests.post(url, json=body, headers=_HEADERS_JSON, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    # getTemplates 直接返回数组(list)；其余接口返回 {success,data,...}
-    if isinstance(data, list):
-        return data
-    if not data.get("success"):
-        raise RuntimeError("cloudflow %s 失败：%s" % (path, r.text[:400]))
-    return data.get("data", {})
+def _cloudflow_post(path, body, access_token=None, _retries=3):
+    """cloudflow 接口统一 POST：accessToken 拼 QueryString。
+
+    对服务端「系统繁忙/限流」(success=false，如 errorCode 1100997) 与网络层异常
+    (超时/连接失败) 做指数退避重试，避免云之家偶发繁忙直接导致整批拉取失败。
+    """
+    import logging
+    _log = logging.getLogger("yunzhijia_client")
+    last_err = None
+    for _attempt in range(_retries):
+        try:
+            tok = access_token or get_access_token()
+            url = f"{_CLOUDFLOW_BASE}/{path}?accessToken={tok}"
+            r = requests.post(url, json=body, headers=_HEADERS_JSON, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            # getTemplates 直接返回数组(list)；其余接口返回 {success,data,...}
+            if isinstance(data, list):
+                return data
+            if not data.get("success"):
+                last_err = "cloudflow %s 失败：%s" % (path, r.text[:400])
+                if _attempt + 1 < _retries:
+                    _log.warning("cloudflow %s 返回非 success，%d/%d 退避重试: %s",
+                                 path, _attempt + 1, _retries, r.text[:200])
+                    time.sleep(2 ** _attempt)  # 1s / 2s / 4s
+                    continue
+                raise RuntimeError(last_err)
+            return data.get("data", {})
+        except requests.RequestException as e:
+            last_err = "cloudflow %s 请求异常: %s" % (path, e)
+            if _attempt + 1 < _retries:
+                _log.warning("cloudflow %s 网络异常 %d/%d，退避重试: %s",
+                             path, _attempt + 1, _retries, e)
+                time.sleep(2 ** _attempt)
+                continue
+            raise
+    if last_err:
+        raise RuntimeError(last_err)
 
 
 def get_templates():
