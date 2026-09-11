@@ -79,6 +79,12 @@ function renderMinutes(st) {
     const d = (it.decision || "").trim();
     if (d) parts.push(d);
   }
+  // 议题之后、出席人员之前插入省略说明行（如「其它内容省略」）。
+  // omitted_note 为 undefined/null → 默认插入；空字符串 → 用户主动移除。
+  let omitted = st.omitted_note;
+  if (omitted === undefined || omitted === null) omitted = "其它内容省略";
+  omitted = (omitted || "").trim();
+  if (omitted) parts.push(omitted);
   const p = (st.present || "").trim();
   if (p) parts.push(p);
   const a = (st.absent || "").trim();
@@ -107,7 +113,7 @@ const tpl = ref(null);                 // 解析后的结构化对象（structur
 const selItems = ref(new Set());       // 选中的议题序号
 const meta = reactive({
   org: "", doc_no: "", office_line: "", meeting_name: "",
-  meeting_seq: "", intro: "", present: "", absent: "",
+  meeting_seq: "", intro: "", present: "", absent: "", omitted_note: "",
 });
 
 // 回退模式：段落块选择
@@ -239,6 +245,7 @@ async function parseSource(text) {
       meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
       meta.intro = st.intro || "";
       meta.present = st.present || ""; meta.absent = st.absent || "";
+      meta.omitted_note = st.omitted_note || "其它内容省略";
       selItems.value = new Set(st.items.map((_, i) => i));
       blocks.value = []; selected.value = new Set();
       return;
@@ -268,6 +275,7 @@ async function generate() {
       org: meta.org, doc_no: meta.doc_no, office_line: meta.office_line,
       meeting_name: meta.meeting_name, meeting_seq: meta.meeting_seq,
       intro: meta.intro, items, present: meta.present, absent: meta.absent,
+      omitted_note: (meta.omitted_note || "").trim(),
     };
     payload = {
       source_doc_id, source_title,
@@ -325,6 +333,7 @@ async function editDerived(d) {
     meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
     meta.intro = st.intro || "";
     meta.present = st.present || ""; meta.absent = st.absent || "";
+    meta.omitted_note = st.omitted_note || "其它内容省略";
     selItems.value = new Set((d.selected_blocks || []).filter((i) => i < st.items.length));
     blocks.value = []; selected.value = new Set();
   };
@@ -585,15 +594,19 @@ onMounted(async () => {
                    :class="['block', 'item', { sel: selItems.has(i) }]">
               <input type="checkbox" :checked="selItems.has(i)" @change="toggleItem(i)" />
               <div class="block-txt">
-                <div class="item-title">{{ it.title }}</div>
-                <div class="item-body" v-if="it.body">{{ it.body }}</div>
-                <div class="item-dec" v-if="it.decision">{{ it.decision }}</div>
+                <input class="input" v-model="it.title" placeholder="议题标题" />
+                <textarea class="input" rows="2" v-model="it.body" placeholder="议题正文"></textarea>
+                <textarea class="input" rows="2" v-model="it.decision" placeholder="会议决定（如：会议一致通过…）"></textarea>
               </div>
               <span class="block-idx">议题 {{ i + 1 }}</span>
             </label>
             <div v-if="!tpl.items.length" class="muted">未识别到议题。</div>
           </div>
 
+          <div class="field" style="margin-top:6px">
+            <label>省略说明行（议题与出席人员之间，PDF 中加粗显示）</label>
+            <input class="input" v-model="meta.omitted_note" placeholder="其它内容省略" />
+          </div>
           <div class="field-row" style="margin-top:6px">
             <div class="field"><label>出席人员</label>
               <textarea class="input" rows="2" v-model="meta.present"></textarea></div>
@@ -790,8 +803,10 @@ onMounted(async () => {
 }
 .block:hover { border-color: var(--primary); }
 .block.sel { border-color: var(--primary); background: var(--primary-soft); }
-.block input { margin-top: 2px; width: auto; }
-.block-txt { flex: 1; white-space: pre-wrap; line-height: 1.55; font-size: 13px; }
+.block input[type="checkbox"] { margin-top: 4px; width: auto; }
+.block-txt { flex: 1; min-width: 0; white-space: pre-wrap; line-height: 1.55; font-size: 13px; }
+.block-txt input,
+.block-txt textarea { width: 100%; box-sizing: border-box; }
 .block-idx { position: absolute; top: 4px; right: 6px; font-size: 10px; color: var(--muted); }
 
 .item-title { font-weight: 700; margin-bottom: 2px; white-space: normal; }

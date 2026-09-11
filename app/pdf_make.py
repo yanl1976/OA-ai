@@ -186,6 +186,11 @@ def build_derived_pdf(meta: dict) -> bytes:
                               leading=24, alignment=TA_LEFT, spaceBefore=6,
                               firstLineIndent=0, wordWrap="CJK",
                               textColor=colors.black)
+    # 省略说明行（如「其它内容省略」）：黑体加粗、左对齐并首行缩进 2 字，位于议题与出席之间
+    s_omitted = ParagraphStyle("omitted", fontName=_font("hei"), fontSize=15.9,
+                               leading=24, alignment=TA_LEFT, spaceBefore=8,
+                               spaceAfter=6, firstLineIndent=15.9 * 2,
+                               textColor=colors.black)
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -251,6 +256,14 @@ def build_derived_pdf(meta: dict) -> bytes:
             if (it.get("decision") or "").strip():
                 for para in _split_indent_paras(it["decision"]):
                     story.append(Paragraph(_esc_br(para), s_item_body))
+        # 「内容主题之下、出席人员之上」：省略说明行（如「其它内容省略」），
+        # 加粗（黑体）显示。omitted_note 为 None → 默认插入；空字符串 → 不显示。
+        omitted = tpl.get("omitted_note")
+        if omitted is None:
+            omitted = "其它内容省略"
+        omitted = (omitted or "").strip()
+        if omitted:
+            story.append(Paragraph(_esc(omitted), s_omitted))
         # 出席/列席名单：按红头原版式排版（姓名两全角空格分隔、每行 5 人、
         # 续行 4 全角空格缩进对齐姓名起点），与前端预览一致。
         from derived_store import _format_attendees as _fmt_att

@@ -604,6 +604,14 @@ def render_minutes(struct: dict) -> str:
         d = (it.get("decision") or "").strip()
         if d:
             parts.append(d)
+    # 「内容主题之下、出席人员之上」插入省略说明行（如「其它内容省略」）。
+    # omitted_note 为 None 表示未设置 → 默认插入；为空字符串表示用户主动移除。
+    omitted = struct.get("omitted_note")
+    if omitted is None:
+        omitted = "其它内容省略"
+    omitted = (omitted or "").strip()
+    if omitted:
+        parts.append(omitted)
     p = (struct.get("present") or "").strip()
     if p:
         parts.append(_format_attendees(p))
