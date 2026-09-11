@@ -79,10 +79,10 @@ function renderMinutes(st) {
     const d = (it.decision || "").trim();
     if (d) parts.push(d);
   }
-  // 议题之后、出席人员之前插入省略说明行（如「其它内容省略」）。
+  // 议题之后、出席人员之前插入省略说明行（如「其他事项略去」）。
   // omitted_note 为 undefined/null → 默认插入；空字符串 → 用户主动移除。
   let omitted = st.omitted_note;
-  if (omitted === undefined || omitted === null) omitted = "其它内容省略";
+  if (omitted === undefined || omitted === null) omitted = "其他事项略去";
   omitted = (omitted || "").trim();
   if (omitted) parts.push(omitted);
   const p = (st.present || "").trim();
@@ -245,7 +245,7 @@ async function parseSource(text) {
       meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
       meta.intro = st.intro || "";
       meta.present = st.present || ""; meta.absent = st.absent || "";
-      meta.omitted_note = st.omitted_note || "其它内容省略";
+      meta.omitted_note = st.omitted_note || "其他事项略去";
       selItems.value = new Set(st.items.map((_, i) => i));
       blocks.value = []; selected.value = new Set();
       return;
@@ -333,7 +333,7 @@ async function editDerived(d) {
     meta.meeting_seq = st.meeting_seq || seqFromHlines || hlines[4] || "";
     meta.intro = st.intro || "";
     meta.present = st.present || ""; meta.absent = st.absent || "";
-    meta.omitted_note = st.omitted_note || "其它内容省略";
+    meta.omitted_note = st.omitted_note || "其他事项略去";
     selItems.value = new Set((d.selected_blocks || []).filter((i) => i < st.items.length));
     blocks.value = []; selected.value = new Set();
   };
@@ -605,7 +605,7 @@ onMounted(async () => {
 
           <div class="field" style="margin-top:6px">
             <label>省略说明行（议题与出席人员之间，PDF 中加粗显示）</label>
-            <input class="input" v-model="meta.omitted_note" placeholder="其它内容省略" />
+            <input class="input" v-model="meta.omitted_note" placeholder="其他事项略去" />
           </div>
           <div class="field-row" style="margin-top:6px">
             <div class="field"><label>出席人员</label>
