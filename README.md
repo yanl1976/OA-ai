@@ -2,6 +2,27 @@
 
 ## 更新日志
 
+### 2026-09-12 · 云之家通讯录（人员信息）获取
+
+新增独立工具目录 [`scripts/contact/`](scripts/contact/)，按云之家「通讯录同步」能力拉取企业全量在职人员（当前 **369 人**）。
+
+| 项 | 说明 |
+|---|---|
+| 接口 | `POST /gateway/openimport/open/person/getall?accessToken=xxx`（`resGroupSecret` 级 token） |
+| 密钥 | `.env` 新增 `YUNZHIJIA_CONTACT_SECRET`：管理中心 → 系统设置 → 系统集成 → 通讯录同步 → **只读密钥** |
+| 产出 | `scripts/contact/data/contact_persons.json`（原始 20 字段）+ `contact_persons.csv`（完全版，UTF-8 BOM） |
+| 用法 | `python scripts/contact/fetch_contact.py` 拉取 → `python scripts/contact/export_contact_csv.py` 导 CSV |
+
+**排障要点**（本次踩坑，务必注意）：
+
+| 现象 | 根因 |
+|---|---|
+| `10000404 请求的URI地址不存在` | 路径漏了 `/person/` 层，正确是 `openimport/open/person/getall`，写成 `openimport/open/getAllPersons` 必 404 |
+| `10000401 认证失败` | 误用 `YUNZHIJIA_RESGROUP_SECRET`（**文件服务**密钥，只够下载审批附件）调通讯录，必须用「通讯录同步」只读密钥 |
+| `11003008 产品非法/令牌非法` | `openorg/contacts/searchUser` 属另一条产品线，token 需用 `Authorization: Bearer <token>` 头；本项目不走该接口 |
+
+详见下方「云之家通讯录（人员信息）获取」章节。
+
 ### 2026-09-02 · 会议纪要排序体系 + 文档替换 + docx 预览 + 邮件通知增强 + 多时段调度
 
 本阶段围绕「会议纪要如何按真实时间正确排列」与「文档维护便利性」展开，并修复了一个潜伏已久的
@@ -114,6 +135,62 @@
 - **查询改写**：多轮对话中自动补全指代（「那它的流程呢？」→「公司安全生产责任制的流程有哪些」）。首轮无历史时跳过，零开销。
 - **对比分解**：检测对比意图（含「对比/区别/差异」等），拆解为多个子问题分别检索后合并，支持跨文档对比分析。
 - **思考过程剥离**：推理模型的 `<think>` 标签自动剥离，不污染回答。
+
+### 云之家通讯录（人员信息）获取（2026-09-12 新增）
+
+独立目录 [`scripts/contact/`](scripts/contact/)，从云之家「通讯录同步」能力拉取企业全量在职人员。
+
+**文件**
+
+| 文件 | 说明 |
+|---|---|
+| `scripts/contact/fetch_contact.py` | 拉取全量人员 → `data/contact_persons.json`（内部按 `begin/count` 分页，每页上限 1000） |
+| `scripts/contact/export_contact_csv.py` | 由 JSON 生成**完全版 CSV**（全 20 字段、UTF-8 with BOM，Excel 直接打开不乱码） |
+| `scripts/contact/data/contact_persons.json` | 369 人原始数据 |
+| `scripts/contact/data/contact_persons.csv` | 369 × 20 列完全版人员表 |
+
+**使用**
+
+```bash
+cd kb_deploy
+python scripts/contact/fetch_contact.py        # 拉取全量 → JSON
+python scripts/contact/export_contact_csv.py   # JSON → 完全版 CSV
+```
+
+**配置（`.env`）**
+
+| 变量 | 说明 |
+|---|---|
+| `YUNZHIJIA_CONTACT_SECRET` | **通讯录同步只读密钥**（管理中心 → 系统设置 → 系统集成 → 通讯录同步）。缺省回退 `YUNZHIJIA_RESGROUP_SECRET` |
+| `YUNZHIJIA_ECP_ID` | 企业 eid（当前 `25450288`），即请求参数 `eid` |
+
+> **易错**：`YUNZHIJIA_RESGROUP_SECRET` 是**文件服务**密钥，只用于下载审批附件；
+> 拿它调通讯录必然返回 `10000401 认证失败`。两把密钥不可混用。
+
+**接口与鉴权**
+
+```
+token:  POST /gateway/oauth2/token/getAccessToken
+        body {eid, secret=YUNZHIJIA_CONTACT_SECRET, timestamp(毫秒), scope:"resGroupSecret"}
+
+数据:   POST /gateway/openimport/open/person/getall?accessToken=<token>
+        Content-Type: application/x-www-form-urlencoded
+        表单: eid=25450288, data='{"begin":0,"count":1000}'
+```
+
+`data` 是 **JSON 字符串**；返回条数 < `count` 即到末页（当前一页取完 369 人）。
+
+**人员字段（20 个）**
+
+`openId`、`uid`、`name`、`department`、`jobTitle`、`phone`、`email`、`jobNo`、`gender`、`status`、`staffType`、`orgId`、`hireDate`、`birthday`、`positiveDate`、`photoUrl`、`contact`、`weights`、`isHidePhone`、`orgUserType`
+
+- `department` 形如 `天水电传电气设备有限责任公司\装配部`（反斜杠分隔层级）
+- 少量人员 `department`/`jobTitle` 为空（未分配部门），使用时需兜底
+- `contact` 是嵌套 JSON 字符串（多种联系方式），`photoUrl` 是头像链接；做精简表时可剔除
+
+**增量同步（可选）**：把接口换成 `person/getAtTime` 并传 `time`（`yyyy-MM-dd HH:mm:ss`），即可只拉该时刻之后的变更人员。
+
+---
 
 ### 云之家审批单据自动拉取（2026-08-30 新增）
 从云之家（云之家开放平台）按模板自动拉取审批完成的会议纪要等单据附件入库。
