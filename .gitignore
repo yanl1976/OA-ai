@@ -7,10 +7,7 @@ venv/
 
 # Node
 web_vue/node_modules/
-# 说明：web_vue/dist/ 原被忽略，现【放行入库】——目的让服务器直接 `git pull`
-# 即可拿到最新前端构建产物，不必再走 deploy_dist.py 的 SFTP 推送
-# （该方式依赖部署用户对 /opt 的写权限，常因权限/连错机器失败）。
-# 注意：本仓库为公开仓库，dist 仅为前端构建产物，不含任何密钥/凭证。
+web_vue/dist/
 
 # 敏感数据（本地数据库与加密密钥，切勿上传）
 data/
