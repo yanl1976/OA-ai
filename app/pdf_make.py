@@ -13,8 +13,9 @@
       hei     标题/议题标题 → 无衬线黑体（对应源 FZXBSJW/SimHei）
       song    文号/次数    → 宋体（对应源 SimSun）
       fangsong 落款/导语/正文/会议决定 → 仿宋（对应源 FangSong）
-  - 各角色字体文件路径位于 KB_FONT_DIR 目录（默认 /opt/OA-ai/fonts），
-    可用环境变量覆盖；缺失时回退到默认字体。
+  - 各角色字体文件路径位于 KB_FONT_DIR 目录（默认取【项目根/fonts】，即
+    app/../fonts，开发机与生产机各自解析到自己的目录），可用环境变量
+    KB_FONT_DIR 覆盖；缺失时回退到默认字体。
   - 中文渲染：必须嵌入真实 CJK 字体（TrueType/glyf 轮廓），reportlab 在 build
     时会自动对所用字形做子集化，体积保持小巧。
 """
