@@ -195,6 +195,12 @@ def notify_pull_update(task_name, stats):
     if not _is_enabled() or not _pull_enabled():
         return
     downloaded = (stats or {}).get("downloaded", 0)
+    # 仅当本次实际拉取到新内容（新增/更新文档数 > 0）才通知；
+    # 没有任何新内容（全部命中去重跳过、或下载全失败）则不发送，避免无意义打扰。
+    if downloaded <= 0:
+        logger.info("云之家拉取任务「%s」无新内容(downloaded=%d)，跳过邮件通知",
+                    task_name, downloaded)
+        return
     failed = (stats or {}).get("failed", 0)
     files = (stats or {}).get("files") or []
     subject = "【OA-ai 知识库】云之家拉取内容更新：%s（新增 %d）" % (task_name, downloaded)
