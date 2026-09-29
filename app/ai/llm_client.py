@@ -1,128 +1,156 @@
-#!/usr/bin/env python3
-"""LLM 公共调用层（MiniMax，OpenAI 兼容格式）。
+# -*- coding: utf-8 -*-
+"""模型调用边界层（参照 AI 开发标准模板 2.1 / 4.3）。
 
-统一承载系统内的所有大模型调用：
-  - 文档结构化排版（extract_text 复用）
-  - 对话式智能问答（serve.py 对话接口复用）
+职责：
+  - call_chat()：统一封装 fetch（urllib）/ 超时 / 错误归一化 / 重试 / 思考关闭。
+  - strip_thinking()：剥离推理模型的 <think> 思考过程（MiniMax-M2.x 无法关闭）。
+  - 复用辅助函数：structured_extract（文档排版）/ rewrite_query（查询改写）/
+    looks_like_comparison（对比判断）/ decompose_question（对比分解）。
+      这些被对话以外的功能（extract_text）复用，故留在公共底座而非对话专用层。
 
-所有调用均走 .env 配置，无 key 时显式抛错，不降级为"静默空答"。
+设计纪律（与标准模板一致）：
+  - 超时用 socket 超时（Python 对应 AbortController）。
+  - 错误归一化：401/403 直接抛（不重试）；429/5xx/网络重试。
+  - 日志只打印长度 / 状态 / 条数，绝不打印 key / 正文 / quote。
 """
 import os
+import re
 import json
+import time
+import logging
 import urllib.request
 import urllib.error
-from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-    env_path = Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-except ImportError:  # pragma: no cover
-    pass
-
-MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
-MINIMAX_API_URL = os.environ.get(
-    "MINIMAX_API_URL",
-    "https://api.minimax.chat/v1/chat/completions",
+from ai.llm_config import (
+    api_key, api_url, model, is_enabled,
+    max_tokens as _def_max_tokens, timeout as _def_timeout, retries as _def_retries,
 )
-MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "abab6.5s-chat")
+
+logger = logging.getLogger("kb.llm.client")
 
 # 推理模型（MiniMax-M2.x 系列）的思考过程【无法关闭】，响应 content 会包含
-# <think>...</think> 标签。若不剥离，用户会在回答开头看到一长串思考过程
-# （M2.5 的思考常为英文），观感极差。默认剥离，可通过环境变量关闭（调试用）。
+# <think>...</think> 标签。若不剥离，用户会在回答开头看到一长串思考过程。
 STRIP_THINKING = os.environ.get("MINIMAX_STRIP_THINKING", "true").strip().lower() not in (
     "0", "false", "no", "off", "")
 
-# 推理模型推荐 temperature=1.0（官方建议），低温会压制其推理能力。
-# 但文档结构化排版等「忠实还原」类任务仍需低温，故保留按场景传参。
-_DEFAULT_TEMPERATURE = 1.0
 
 _THINK_RE = None
 
 
-def _strip_thinking(text: str) -> str:
+def _strip_thinking(text):
     """剥离响应中的 <think>...</think> 思考过程，只保留正式回答。"""
     global _THINK_RE
     if not text:
         return text
     if _THINK_RE is None:
-        import re
         _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
     cleaned = _THINK_RE.sub("", text)
     # 兼容未闭合的 <think>（响应被 max_tokens 截断时可能出现）
     if "<think>" in cleaned.lower():
-        import re
         cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     return cleaned.strip()
 
 
-def is_configured() -> bool:
-    return bool(MINIMAX_API_KEY)
+def is_configured():
+    return is_enabled()
 
 
-def chat(messages: list, *, temperature: float = None, max_tokens: int = 8192,
-         timeout: int = 300) -> str:
-    """通用对话接口。
+def _classify_http(e):
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code
+    return None
+
+
+def call_chat(messages, *, temperature=None, max_tokens=None,
+              timeout=None, retries=None, strip_thinking=None):
+    """通用对话调用（OpenAI 兼容格式）。
 
     messages: [{"role": "system"|"user"|"assistant", "content": "..."}, ...]
-    返回模型回复文本（str），已自动剥离推理模型的 <think> 思考过程。
+    返回模型回复文本（str，已剥离 <think> 思考过程）。
 
-    参数说明：
-      temperature: 默认 1.0（推理模型官方推荐）。忠实还原类任务请显式传低值。
-      max_tokens:  默认 8192。推理模型会先消耗 token 做思考，原来的 2048
-                   会导致正式回答被截断，故调大。
+    参数全部有默认值（来自 llm_config 的成本闸门），调用方可按需覆盖。
+    失败抛出 RuntimeError（带可诊断信息）；401/403 不重试，429/5xx/网络重试。
     """
-    if not MINIMAX_API_KEY:
+    if not api_key():
         raise RuntimeError("MINIMAX_API_KEY 未配置，请在 .env 中设置")
 
     if temperature is None:
-        temperature = _DEFAULT_TEMPERATURE
+        temperature = 1.0  # 推理模型官方推荐；忠实还原类任务请显式传低值
+    _max = _def_max_tokens() if max_tokens is None else max_tokens
+    _timeout = _def_timeout() if timeout is None else timeout
+    _retries = _def_retries() if retries is None else retries
 
     payload = {
-        "model": MINIMAX_MODEL,
+        "model": model(),
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": _max,
     }
     headers = {
-        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Authorization": "Bearer %s" % api_key(),
         "Content-Type": "application/json",
     }
     req = urllib.request.Request(
-        MINIMAX_API_URL,
+        api_url(),
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("LLM HTTP 错误 %s: %s" % (e.code, e.read().decode()))
-    except urllib.error.URLError as e:
-        raise RuntimeError("LLM 网络错误: %s" % e)
 
-    # OpenAI 兼容返回格式
-    content = None
-    if "choices" in result and result["choices"]:
-        content = result["choices"][0]["message"]["content"]
-    elif "reply" in result:  # 兼容旧版 MiniMax
-        content = result["reply"]
-    else:
-        raise RuntimeError("LLM 返回异常: %s" % json.dumps(result, ensure_ascii=False)[:500])
+    last_err = None
+    for attempt in range(max(1, _retries + 1)):
+        try:
+            with urllib.request.urlopen(req, timeout=_timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            content = None
+            if "choices" in result and result["choices"]:
+                content = result["choices"][0]["message"]["content"]
+            elif "reply" in result:  # 兼容旧版 MiniMax
+                content = result["reply"]
+            else:
+                raise RuntimeError("LLM 返回异常: %s"
+                                   % json.dumps(result, ensure_ascii=False)[:500])
 
-    # 剥离推理模型的思考过程（<think>...</think>），只保留正式回答
-    if STRIP_THINKING:
-        content = _strip_thinking(content)
-        # 思考被剥离后可能整体为空（极少数情况：模型只思考未作答）
-        if not content:
-            raise RuntimeError(
-                "LLM 仅返回了思考过程而未给出正式回答，请重试或调大 max_tokens")
-    return content
+            if strip_thinking if strip_thinking is not None else STRIP_THINKING:
+                content = _strip_thinking(content)
+                if not content:
+                    raise RuntimeError(
+                        "LLM 仅返回了思考过程而未给出正式回答，请重试或调大 max_tokens")
+            logger.info("LLM 调用成功：输入 %d 条消息，回复 %d 字（第 %d 次尝试）",
+                        len(messages), len(content), attempt + 1)
+            return content
+
+        except urllib.error.HTTPError as e:
+            code = e.code
+            # 401/403 是鉴权问题，重试只是浪费配额 —— 直接抛
+            if code in (401, 403):
+                raise RuntimeError("LLM 鉴权失败（HTTP %s）：请检查 MINIMAX_API_KEY" % code)
+            last_err = RuntimeError("LLM HTTP 错误 %s: %s" % (code, e.read().decode()[:300]))
+            logger.warning("LLM HTTP %s（瞬时故障，将重试 %d/%d）", code, attempt + 1, _retries)
+        except urllib.error.URLError as e:
+            last_err = RuntimeError("LLM 网络错误: %s" % e)
+            logger.warning("LLM 网络错误（将重试 %d/%d）: %s", attempt + 1, _retries, e)
+        except RuntimeError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_err = RuntimeError("LLM 未知错误: %s" % e)
+            logger.warning("LLM 调用异常（将重试 %d/%d）: %s", attempt + 1, _retries, e)
+
+        # 重试瞬时故障（指数退避，封顶 8s）
+        if attempt < _retries:
+            time.sleep(min(2 ** attempt, 8))
+
+    raise last_err or RuntimeError("LLM 调用失败（未知原因）")
 
 
-def structured_extract(raw_text: str) -> str:
+# ============ 检索增强：查询改写 + 对比问题分解 ============
+# 这两项用于解决「检索喂料不准」导致的答非所问（多轮省略指代 / 跨文档对比）。
+# 均为「轻量辅助调用」：低温、限长、失败即回退到原问题，绝不阻塞主流程。
+_AUX_TIMEOUT = 30      # 辅助调用超时（秒），避免拖慢整体响应
+_AUX_MAX_TOKENS = 512  # 辅助调用只需短输出
+
+
+def structured_extract(raw_text):
     """文档结构化排版（忠实原文重排）。供 extract_text 复用。"""
     system_prompt = (
         "你是一个中文文档排版还原工具。输入是 PDF/Word 抽取出的原始文本"
@@ -141,39 +169,22 @@ def structured_extract(raw_text: str) -> str:
         "E. 直接输出整理后的纯文本，不要任何说明文字、不要 Markdown 代码块标记。\n"
     )
     snippet = raw_text[:60000]
-    return chat([
+    return call_chat([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": (
             "请将以下文档严格忠实原文地整理为干净的多行纯文本（不得遗漏任何内容）：\n\n"
             + snippet)},
-        # 「忠实还原原文」类任务必须低温，避免推理模型的默认高温导致自由发挥
     ], temperature=0.1, max_tokens=8192)
 
 
-# ============ 检索增强：查询改写 + 对比问题分解 ============
-# 这两项用于解决「检索喂料不准」导致的答非所问：
-#   1) 多轮对话中用户常省略主语（如「那它的流程呢？」），直接用这句话去检索
-#      必然搜不到，需结合上文补全为独立问句。
-#   2) 跨文档对比类问题（如「A 和 B 有什么区别」）单轮检索往往只召回其中一方，
-#      需拆成多个子问题分别检索后合并。
-# 均为「轻量辅助调用」：低温、限长、失败即回退到原问题，绝不阻塞主流程。
-
-_AUX_TIMEOUT = 30      # 辅助调用超时（秒），避免拖慢整体响应
-_AUX_MAX_TOKENS = 512  # 辅助调用只需短输出
-
-
-def rewrite_query(question: str, history: list, timeout: int = _AUX_TIMEOUT) -> str:
+def rewrite_query(question, history, timeout=_AUX_TIMEOUT):
     """把多轮对话中的「省略指代」问题补全为可独立检索的问句。
-
-    例：上文谈「安全生产责任制」，用户问「那它的流程呢？」
-        → 「安全生产责任制的工作流程是什么？」
 
     history: [{"role": "user"|"assistant", "content": "..."}, ...]
     失败或无需改写时返回原问题（保证主流程不被阻塞）。
     """
     if not question or not history:
         return question  # 首轮无历史，无需改写
-    # 只取最近若干轮，控制 prompt 体积与延迟
     recent = history[-6:]
     hist_txt = "\n".join(
         ("用户：" if m.get("role") == "user" else "助手：") + (m.get("content") or "")[:400]
@@ -188,36 +199,31 @@ def rewrite_query(question: str, history: list, timeout: int = _AUX_TIMEOUT) -> 
         "4. 补全时优先使用上文出现过的【文档名/制度名/术语】原词。\n"
     )
     try:
-        out = chat([
+        out = call_chat([
             {"role": "system", "content": system},
             {"role": "user", "content": "对话历史：\n%s\n\n用户最后的问题：%s\n\n改写后的检索问句："
              % (hist_txt, question)},
         ], temperature=0.1, max_tokens=_AUX_MAX_TOKENS, timeout=timeout)
         out = (out or "").strip().strip("\"'“”‘’ \n")
-        # 异常保护：改写结果为空或过长则回退原问题
         if not out or len(out) > 200:
             return question
         return out
-    except Exception:
+    except Exception:  # noqa: BLE001
         return question  # 改写失败不影响主流程
 
 
-# 对比/多主体意图的关键词（用于避免对每个简单问题都做 LLM 分解，控制延迟）
 _COMPARE_HINTS = ("对比", "比较", "区别", "差异", "异同", "相比", "有何不同",
                   "哪个", "有哪些不同", "对照", " versus ", " vs ")
 
 
-def looks_like_comparison(question: str) -> bool:
+def looks_like_comparison(question):
     """快速判断是否疑似「对比/多主体」问题（纯规则，零延迟）。"""
     q = (question or "").lower()
     return any(h in q for h in _COMPARE_HINTS)
 
 
-def decompose_question(question: str, timeout: int = _AUX_TIMEOUT) -> list:
+def decompose_question(question, timeout=_AUX_TIMEOUT):
     """把对比/多主体问题拆为若干可独立检索的子问题。
-
-    例：「对比安全生产责任制和党风廉政责任制的差异」
-        → ["安全生产责任制的要求和内容", "党风廉政建设责任制的要求和内容"]
 
     返回子问题列表；失败或不适用时返回 [原问题]（主流程不受影响）。
     """
@@ -233,7 +239,7 @@ def decompose_question(question: str, timeout: int = _AUX_TIMEOUT) -> list:
         "4. 若问题只涉及单一对象、无需对比，则只输出原问题本身一行。\n"
     )
     try:
-        out = chat([
+        out = call_chat([
             {"role": "system", "content": system},
             {"role": "user", "content": "原问题：%s\n\n子问题列表：" % question},
         ], temperature=0.1, max_tokens=_AUX_MAX_TOKENS, timeout=timeout)
@@ -242,7 +248,6 @@ def decompose_question(question: str, timeout: int = _AUX_TIMEOUT) -> list:
         subs = [l for l in lines if len(l) >= 4][:4]
         if not subs:
             return [question]
-        # 始终保留原问题作为第一个检索入口（保证整体语义不丢）
         return [question] + [s for s in subs if s != question][:3]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return [question]

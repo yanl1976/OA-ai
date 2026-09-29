@@ -106,7 +106,7 @@ async function send() {
   input.value = "";
   scrollBottom();
   try {
-    const r = await api.chatSend(activeId.value, q, 5, selScope.value || undefined);
+    const r = await api.chatSend(activeId.value, q, 8, selScope.value || undefined);
     if (!activeId.value) {
       activeId.value = r.session_id;
       await loadSessions();
@@ -115,6 +115,7 @@ async function send() {
     const last = messages.value[messages.value.length - 1];
     last.content = r.answer;
     last.refs = r.refs || [];
+    last.truncated = !!r.truncated;   // 部分参考文档被截断（长文档超出单篇字符预算）
     last.loading = false;
     if (scope.value.length === 0) scope.value = r.scope || [];
   } catch (e) {
@@ -216,6 +217,10 @@ onMounted(async () => {
           <div class="msg-body">
             <div class="msg-text" :class="{ error: m.error }" v-if="!m.loading">{{ m.content }}</div>
             <div class="msg-text loading" v-else>{{ m.content }}</div>
+
+            <div class="trunc-warn" v-if="m.role === 'assistant' && m.truncated && !m.loading">
+              ⚠ 部分参考文档因篇幅过长已截断展示，相关结论可能不完整，建议缩小对话范围或指定具体文档。
+            </div>
 
             <div class="refs" v-if="m.role === 'assistant' && m.refs && m.refs.length">
               <div class="refs-title">参考来源</div>
@@ -369,6 +374,11 @@ onMounted(async () => {
 .msg-text.error { background: #fef0f0; color: #c0392b; }
 .msg-text.loading { color: #909399; font-style: italic; }
 
+.trunc-warn {
+  margin-top: 8px; padding: 8px 12px; border-radius: 6px;
+  background: #fef7e8; border: 1px solid #f5d68a; color: #a06a00;
+  font-size: 12.5px; line-height: 1.6; text-align: left;
+}
 .refs { margin-top: 10px; text-align: left; }
 .refs-title { font-size: 12px; color: #909399; margin-bottom: 6px; }
 .ref-card {

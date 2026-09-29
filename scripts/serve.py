@@ -109,7 +109,8 @@ import search as kb_search_mod
 import vec_store
 import derived_store
 import chat_store
-import llm
+from ai import chat_engine
+from ai.llm_client import is_configured
 import sqlite3
 import zipfile
 import tempfile
@@ -2519,61 +2520,12 @@ def _seed_categories_from_source():
 
 
 # ===================== 对话式智能问答 =====================
-def _build_chat_prompt(question: str, contexts: list, scope_names: list) -> str:
-    """构造系统指令：强调边界、引用、汇报式中文回答。"""
-    scope_desc = "、".join(scope_names) if scope_names else "全部知识库"
-    ctx_block = "\n\n---\n\n".join(
-        "【文档《%s》（分类：%s）】\n%s" % (c["filename"], c.get("category") or "—", c.get("content") or c.get("text") or "")
-        for c in contexts
-    ) or "（无相关文档）"
-    system = (
-        "你是企业知识库智能分析助手，负责结合下方【参考文档】回答用户问题，"
-        "并给出有洞察的分析与总结。\n\n"
-        "【对话范围边界】\n"
-        "你当前仅被授权依据「%s」相关文档作答。\n"
-        "若用户问题明显超出该范围（涉及其他分类或未收录内容），请明确说明："
-        "『该问题超出我当前可对话的知识范围（仅限%s），无法作答。』\n\n"
-        "【核心原则·忠实但不复读】\n"
-        "1. 事实层面必须忠实：引用【参考文档】中的条款、数据、流程时，"
-        "不得编造文档未提及的具体内容（如虚构条款号、数值、标准条目）。\n"
-        "2. 分析层面应当主动：这是重点——你【需要且应当】在忠实原文事实的基础上，"
-        "进行归纳、对比、提炼要点、识别风险与关联、给出判断。"
-        "严禁只是把原文片段逐条罗列复制（那是复读机，用户不需要）。\n"
-        "3. 区分「事实」与「推断」：文档写明的作为事实并标注出处；"
-        "你基于事实做的推断或判断，请显式说明（如「由此可推断」「建议关注」），"
-        "让用户能分辨哪句是原文、哪句是你的分析。\n"
-        "4. 资料不足时如实说明：『依据现有资料不足以得出确切结论』，"
-        "并说明还缺少哪方面的资料，不要臆测。\n\n"
-        "【回答规范·汇报式分析】\n"
-        "用简体中文作答，按问题复杂度选用结构（不必机械套用四段）：\n"
-        "一、结论先行：先用 1-3 句话直接回答用户的问题（最重要，放最前）。\n"
-        "二、依据与事实：引用参考文档的具体条款/数据/流程，注明来源文档名。"
-        "必要时用表格对比多个文档的差异。\n"
-        "三、分析洞察：归纳共性、对比差异、指出风险点/例外情况/关联影响。\n"
-        "四、行动建议：给出可执行的下一步建议（若问题涉及操作）。\n"
-        "简单问题可合并简化，不要为凑结构而冗长。\n\n"
-        "【引用要求】\n"
-        "凡涉及具体事实、数据、条款，必须标注出处文档名（如：《XXX标准》）。\n\n"
-        "下方为本次检索到的参考文档（已限定在你被授权的范围内）：\n%s"
-        % (scope_desc, scope_desc, ctx_block)
-    )
-    return system
+# 已迁移：对话角色 / 提示词 / 安全边界逻辑现位于 app/ai/chat_prompt.py + chat_context.py，
+# 编排位于 app/ai/chat_engine.py。本函数不再被调用，保留仅供历史参考。
 
 
-def _retrieve_for_chat(question: str, perms: set, top_k: int = 4, category: str = None) -> list:
-    """检索并按对话分类权限（search）过滤；返回 top_k 个命中文档（含 text/regions）。
-
-    category: 用户前端主动选定的检索域（顶层类型名）。若提供，先校验授权，再展开为
-        白名单（含后代）硬约束召回；None 表示"全部我有权限的"（仍受账号权限过滤）。
-    """
-    cat_allow = None
-    if category:
-        if not admin.check_cat_action(perms, category, "search"):
-            return []
-        cat_allow = set([category] + admin.get_category_descendants(category))
-    raw = kb_search_mod.hybrid_search(question, top_k=top_k * 4, categories=cat_allow)
-    filtered = [r for r in raw if admin.check_cat_action(perms, r.get("category"), "search")]
-    return filtered[:top_k]
+# 已迁移：检索（按权限过滤 + 多子问题合并）逻辑现位于 app/ai/chat_engine.py 的
+# _retrieve()。本函数不再被调用，保留仅供历史参考。
 
 
 def _chat_scope_names(perms: set) -> list:
@@ -2675,120 +2627,55 @@ def kb_chat_session_rename(sid):
 def kb_chat():
     """发送一条消息并获取智能回答（支持多轮，会话长期保存）。
 
-    入参：{ session_id?, question, top_k? }
+    入参：{ session_id?, question, top_k?, category? }
       - 不传 session_id 则自动新建会话。
-      - 返回 { session_id, answer, refs, scope }
+      - 返回 { session_id, answer, refs, scope, selected_scope, truncated, prompt_version }
     """
-    if not admin.get_feature("chat_enabled", 1):
-        return jsonify({"error": "对话功能已关闭"}), 403
-    if not llm.is_configured():
-        return jsonify({"error": "LLM 未配置（MINIMAX_API_KEY）"}), 503
-
     uid = session.get("user_id")
     data = request.get_json(silent=True) or {}
     question = (data.get("question") or "").strip()
     if not question:
         return jsonify({"error": "缺少参数 question"}), 400
-    # 参考文档数量：由 5 提到 8。MiniMax-M2.5 具备 20 万 token 上下文，
-    # 足以容纳；更多资料 = 更完整的分析依据（原来只给 4-5 篇，容易「资料不足」）。
+    # 参考文档数量上限（MiniMax-M2.5 具备 20 万 token 上下文，足以容纳更多资料）
     top_k = int(data.get("top_k", 8))
     top_k = max(1, min(16, top_k))
+    sel_cat = (data.get("category") or "").strip()
 
-    # 1) 对话边界：按账号分类 search 权限
     perms = set(admin.get_user_permissions(uid))
-    scope_names = _chat_scope_names(perms)
+
+    # ---- HTTP 层鉴权与契约（业务逻辑由 chat_engine.run 收敛）----
+    if not admin.get_feature("chat_enabled", 1):
+        return jsonify({"error": "对话功能已关闭"}), 403
+    if not is_configured():
+        return jsonify({"error": "LLM 未配置（MINIMAX_API_KEY）"}), 503
+    scope_names = chat_engine._scope_names(perms)
     if not scope_names:
         return jsonify({"error": "当前账号无可对话的分类权限（需分类的查询权限）"}), 403
+    # 域选择越权防护：选定域必须先通过账号授权校验（防前端篡改越权选域）
+    if sel_cat and not admin.check_cat_action(perms, sel_cat, "search"):
+        return jsonify({"error": "无权在该分类域对话"}), 403
 
-    # 1b) 域选择：用户可前端主动选定对话范围（顶层类型名）；留空 = 全部授权域。
-    #     越权防护：选定域必须先通过账号授权校验（防前端篡改越权选域）。
-    sel_cat = (data.get("category") or "").strip()
-    if sel_cat:
-        if not admin.check_cat_action(perms, sel_cat, "search"):
-            return jsonify({"error": "无权在该分类域对话"}), 403
-
-    # 2) 会话：复用或新建
-    sid = data.get("session_id")
-    if sid:
-        if not chat_store.get_session(int(sid), uid):
-            return jsonify({"error": "会话不存在"}), 404
-    else:
-        first_title = question[:40]
-        sid = chat_store.create_session(uid, first_title)
-
-    # 3) 组装多轮历史（仅用户/助手文本，不含系统）
-    #    必须先于检索：查询改写需要结合上文才能补全指代。
-    history = []
-    for m in chat_store.list_messages(sid):
-        if m["role"] in ("user", "assistant"):
-            history.append({"role": m["role"], "content": m["content"]})
-    history.append({"role": "user", "content": question})
-
-    # 4) 检索（按分类 search 权限过滤）
-    #    4a) 查询改写：多轮时把「那它的流程呢？」这类省略指代的问题补全，
-    #        否则拿半句话去检索必然搜不到。首轮无历史时自动跳过，零开销。
-    search_query = llm.rewrite_query(question, history[:-1])
-    #    4b) 对比类问题分解：「A 和 B 有什么区别」单轮检索往往只召回一方，
-    #        拆成子问题分别检索后合并，保证对比双方资料齐全。
-    if llm.looks_like_comparison(search_query):
-        sub_queries = llm.decompose_question(search_query)
-    else:
-        sub_queries = [search_query]
-    #    4c) 多子问题检索并按文档去重合并（保留各自最高分）
-    hits = []
-    seen_doc = set()
-    for sq in sub_queries:
-        for h in _retrieve_for_chat(sq, perms, top_k=top_k, category=sel_cat or None):
-            d = h.get("doc_id")
-            if d in seen_doc:
-                continue
-            seen_doc.add(d)
-            hits.append(h)
-        if len(hits) >= top_k * 3:  # 合并池上限，避免上下文爆炸
-            break
-    hits = hits[:top_k * 2]
-
-    # 5) 调 LLM：系统指令 + 历史 + 当前问题
     try:
-        answer = llm.chat(
-            [{"role": "system", "content": _build_chat_prompt(question, hits, scope_names)}]
-            + history
-        )
-    except Exception as e:
+        result = chat_engine.run(
+            uid=uid, question=question, perms=perms,
+            session_id=data.get("session_id"), top_k=top_k,
+            category=sel_cat or None)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except RuntimeError as e:
         return jsonify({"error": "LLM 调用失败: %s" % e}), 502
-
-    # 6) 持久化消息
-    refs = [{
-        "doc_id": h["doc_id"],
-        "filename": h.get("filename"),
-        "category": h.get("category"),
-        "score": h.get("score"),
-        "snippet": (h.get("snippet") or "")[:300],
-        "content": h.get("content") or h.get("text") or "",
-        "char_start": h.get("char_start"),
-        "char_end": h.get("char_end"),
-        "regions": h.get("regions", []),
-    } for h in hits]
-    chat_store.add_message(sid, "user", question)
-    chat_store.add_message(sid, "assistant", answer, refs)
-
-    # 7) 审计
-    try:
-        _row = admin._conn().execute(
-            "SELECT username FROM users WHERE id=?", (uid,)).fetchone()
-        _uname = _row["username"] if _row else ""
-    except Exception:
-        _uname = ""
-    kb_store.audit_log("kb.chat", target="session:%d" % sid, detail=question,
-                       user_id=uid, username=_uname)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": "对话处理失败: %s" % e}), 500
 
     return jsonify({
         "ok": True,
-        "session_id": sid,
-        "answer": answer,
-        "refs": refs,
-        "scope": scope_names,
+        "session_id": result["session_id"],
+        "answer": result["answer"],
+        "refs": result["refs"],
+        "scope": result["scope"],
         "selected_scope": sel_cat or "all",
+        "truncated": result.get("truncated", False),
+        "prompt_version": result.get("prompt_version"),
     })
 
 

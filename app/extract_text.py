@@ -33,11 +33,11 @@ except ImportError:
 
 import os
 
-# 复用统一 LLM 调用层（MiniMax，OpenAI 兼容）
+# 复用统一 LLM 调用层（MiniMax，OpenAI 兼容）—— 已迁移至 app/ai/llm_client
 try:
-    from .llm import structured_extract, is_configured
+    from ai.llm_client import structured_extract, is_configured
 except ImportError:  # 直接以脚本运行时的回退
-    from llm import structured_extract, is_configured
+    from ai.llm_client import structured_extract, is_configured
 
 ALLOWED_EXT = {".txt", ".md", ".csv", ".docx", ".doc", ".xlsx", ".pptx", ".pdf"}
 
