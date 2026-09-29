@@ -18,7 +18,8 @@ from ai.llm_client import (
 )
 from ai.chat_prompt import build_system_prompt, PROMPT_VERSION
 from ai.chat_context import build_context_block
-from ai.chat_normalize import soft_check_references
+from ai.chat_normalize import soft_check_references, extract_cited_docs
+from ai.llm_config import ref_gate_enabled
 
 logger = logging.getLogger("kb.chat.engine")
 
@@ -119,7 +120,7 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
     # 5) 调 LLM（系统指令 + 历史 + 当前问题；history 末尾即当前问题）
     answer = call_chat([{"role": "system", "content": system}] + history)
 
-    # 6) 持久化消息 + 构造 refs
+    # 6) 构造 refs + 引用校验
     refs = [{
         "doc_id": h["doc_id"],
         "filename": h.get("filename"),
@@ -131,13 +132,39 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
         "char_end": h.get("char_end"),
         "regions": h.get("regions", []),
     } for h in hits]
+    cited = extract_cited_docs(answer)
+    dropped = soft_check_references(answer, refs)
+
+    # 7) 引用硬闸门（可选，默认关闭）：若回答引用了未检索到的文档（疑似编造），
+    #    追加纠正指令重答一次，把编造引用压回已提供的参考文档；重答仍失败则保留原答案并告警。
+    if dropped and ref_gate_enabled():
+        logger.info("引用硬闸门触发：回答引用了未检索到的文档 %s，尝试重答一次", dropped)
+        correct = (
+            "\n\n【纠正要求】你上面的回答引用了以下不在参考文档中的资料：%s。"
+            "这些资料并未提供给你，属于无依据的引用。请仅依据上方《KB_CONTEXT》"
+            "中实际给出的参考文档作答，删除所有无法由这些文档佐证的内容；"
+            "如确有不确定之处，明确说明『依据现有资料不足以得出确切结论』。"
+            % ("、".join("《%s》" % d for d in dropped))
+        )
+        try:
+            answer2 = call_chat([{"role": "system", "content": system}] + history
+                                + [{"role": "assistant", "content": answer},
+                                   {"role": "user", "content": correct}])
+            cited2 = extract_cited_docs(answer2)
+            dropped2 = soft_check_references(answer2, refs)
+            if not dropped2:  # 重答后无编造引用，采纳
+                answer, cited, dropped = answer2, cited2, dropped2
+                logger.info("引用硬闸门：重答成功，编造引用已消除")
+            else:
+                logger.warning("引用硬闸门：重答后仍有编造引用 %s，保留原答案并告警", dropped2)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("引用硬闸门：重答失败（%s），保留原答案并告警", e)
+
+    # 8) 持久化消息
     chat_store.add_message(sid, "user", question)
-    chat_store.add_message(sid, "assistant", answer, refs)
+    chat_store.add_message(sid, "assistant", answer, refs, dropped_refs=dropped)
 
-    # 7) 引用软校验（不阻断，仅日志告警）
-    soft_check_references(answer, refs)
-
-    # 8) 审计（带提示词版本，便于追溯「为什么这次结论与上次不同」）
+    # 9) 审计（带提示词版本，便于追溯「为什么这次结论与上次不同」）
     import admin
     import kb_store
     try:
@@ -148,7 +175,8 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
         _uname = ""
     kb_store.audit_log(
         "kb.chat", target="session:%d" % sid,
-        detail="%s|prompt=%s" % (question, PROMPT_VERSION),
+        detail="%s|prompt=%s|cited=%s|dropped=%s"
+               % (question, PROMPT_VERSION, cited, dropped),
         user_id=uid, username=_uname)
 
     return {
@@ -158,4 +186,6 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
         "scope": scope_names,
         "truncated": truncated,
         "prompt_version": PROMPT_VERSION,
+        "cited_refs": cited,
+        "dropped_refs": dropped,
     }

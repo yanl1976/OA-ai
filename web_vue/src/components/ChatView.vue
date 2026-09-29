@@ -51,6 +51,7 @@ async function openSession(sid) {
       role: m.role,
       content: m.content,
       refs: m.refs || [],
+      droppedRefs: m.dropped_refs || [],
     }));
   } catch (e) {
     notify("加载消息失败：" + (e.response?.data?.error || e.message), "err");
@@ -116,6 +117,7 @@ async function send() {
     last.content = r.answer;
     last.refs = r.refs || [];
     last.truncated = !!r.truncated;   // 部分参考文档被截断（长文档超出单篇字符预算）
+    last.droppedRefs = r.dropped_refs || [];  // 回答引用但不在检索结果中的文档（疑似编造引用）
     last.loading = false;
     if (scope.value.length === 0) scope.value = r.scope || [];
   } catch (e) {
@@ -220,6 +222,10 @@ onMounted(async () => {
 
             <div class="trunc-warn" v-if="m.role === 'assistant' && m.truncated && !m.loading">
               ⚠ 部分参考文档因篇幅过长已截断展示，相关结论可能不完整，建议缩小对话范围或指定具体文档。
+            </div>
+
+            <div class="ref-warn" v-if="m.role === 'assistant' && m.droppedRefs && m.droppedRefs.length && !m.loading">
+              ⚠ 本回答引用了以下未检索到的文档：{{ m.droppedRefs.join('、') }}。这些内容不在当前授权范围内已检索到的资料中，可能并非出自管理制度，请谨慎核实或缩小对话范围后重试。
             </div>
 
             <div class="refs" v-if="m.role === 'assistant' && m.refs && m.refs.length">
@@ -377,6 +383,11 @@ onMounted(async () => {
 .trunc-warn {
   margin-top: 8px; padding: 8px 12px; border-radius: 6px;
   background: #fef7e8; border: 1px solid #f5d68a; color: #a06a00;
+  font-size: 12.5px; line-height: 1.6; text-align: left;
+}
+.ref-warn {
+  margin-top: 8px; padding: 8px 12px; border-radius: 6px;
+  background: #fef0f0; border: 1px solid #f5b5b5; color: #c0392b;
   font-size: 12.5px; line-height: 1.6; text-align: left;
 }
 .refs { margin-top: 10px; text-align: left; }

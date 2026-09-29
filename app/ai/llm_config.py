@@ -84,9 +84,25 @@ def concurrency():
 
 
 def doc_char_budget():
-    """对话单篇参考文档的字符预算（1500-2500 区间，默认 2000）。"""
+    """对话单篇参考文档的字符预算（1500-2500 区间，默认 2500）。
+
+    上调至上限：长制度文档（如病假/医疗期待遇、跨多页的章节）在 2000 字处常被截断，
+    缺失关键条款会诱发模型『漏答』或『凭空补条款』。2500 字可覆盖绝大多数单制度段落，
+    代价仅是每个检索片段略多 token（top_k 文档总字符上限约 8×2500=2 万，仍在上下文内）。
+    """
     try:
-        v = int(os.environ.get("CHAT_DOC_CHAR_BUDGET", "2000"))
+        v = int(os.environ.get("CHAT_DOC_CHAR_BUDGET", "2500"))
     except (TypeError, ValueError):
-        v = 2000
+        v = 2500
     return max(1500, min(2500, v))
+
+
+def ref_gate_enabled():
+    """引用硬闸门开关（默认关闭）。
+
+    开启后：若回答引用了未检索到的文档（疑似编造引用），引擎会追加纠正指令
+    自动重答一次，把编造引用压回已提供的参考文档。关闭时仅把编造引用列表
+    回传前端提示，不额外消耗一次 LLM 调用（保持低延迟）。
+    """
+    return os.environ.get("CHAT_REF_GATE", "0").strip().lower() in (
+        "1", "true", "yes", "on")

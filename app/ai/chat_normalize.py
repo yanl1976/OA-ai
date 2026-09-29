@@ -18,6 +18,17 @@ logger = logging.getLogger("kb.chat.normalize")
 _DOC_REF_RE = re.compile(r"《([^》\n]{1,60})》")
 
 
+def extract_cited_docs(answer):
+    """从回答文本中提取所有《文档名》引用（去重，保序）。"""
+    if not answer:
+        return []
+    seen = []
+    for n in _DOC_REF_RE.findall(answer):
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
 def soft_check_references(answer, refs):
     """检查回答中《文档名》引用是否都在 refs 内。
 
@@ -32,7 +43,7 @@ def soft_check_references(answer, refs):
         fn = (r.get("filename") or "").strip()
         if fn:
             ref_names.add(fn)
-    mentioned = set(_DOC_REF_RE.findall(answer))
+    mentioned = set(extract_cited_docs(answer))
     if not mentioned:
         return []
 

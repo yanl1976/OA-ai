@@ -2676,6 +2676,8 @@ def kb_chat():
         "selected_scope": sel_cat or "all",
         "truncated": result.get("truncated", False),
         "prompt_version": result.get("prompt_version"),
+        "cited_refs": result.get("cited_refs", []),
+        "dropped_refs": result.get("dropped_refs", []),
     })
 
 

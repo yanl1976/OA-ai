@@ -85,8 +85,14 @@ def _conn():
                role TEXT,            -- 'user' / 'assistant'
                content TEXT,
                refs TEXT,            -- JSON: [{doc_id,filename,score,snippet}]
+               dropped_refs TEXT,    -- JSON: 回答引用但未检索到的文档名（疑似编造引用）
                created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
            )""")
+    # 兼容旧库（无 dropped_refs 列）按需补列，避免迁移脚本
+    try:
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN dropped_refs TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     return conn
 
 
@@ -143,7 +149,7 @@ def delete_session(session_id: int, user_id: int):
 def list_messages(session_id: int) -> list:
     conn = _conn()
     rows = conn.execute(
-        "SELECT id, role, content, refs, created_at FROM chat_messages "
+        "SELECT id, role, content, refs, dropped_refs, created_at FROM chat_messages "
         "WHERE session_id=? ORDER BY id ASC", (session_id,)).fetchall()
     conn.close()
     out = []
@@ -153,16 +159,23 @@ def list_messages(session_id: int) -> list:
             d["refs"] = __import__("json").loads(d["refs"] or "[]")
         except Exception:
             d["refs"] = []
+        try:
+            d["dropped_refs"] = __import__("json").loads(d["dropped_refs"] or "[]")
+        except Exception:
+            d["dropped_refs"] = []
         out.append(d)
     return out
 
 
-def add_message(session_id: int, role: str, content: str, refs: list = None):
+def add_message(session_id: int, role: str, content: str, refs: list = None,
+                dropped_refs: list = None):
     import json as _json
     conn = _conn()
     conn.execute(
-        "INSERT INTO chat_messages (session_id, role, content, refs) VALUES (?,?,?,?)",
-        (session_id, role, content, _json.dumps(refs or [], ensure_ascii=False)))
+        "INSERT INTO chat_messages (session_id, role, content, refs, dropped_refs) "
+        "VALUES (?,?,?,?,?)",
+        (session_id, role, content, _json.dumps(refs or [], ensure_ascii=False),
+         _json.dumps(dropped_refs or [], ensure_ascii=False)))
     conn.execute(
         "UPDATE chat_sessions SET updated_at=strftime('%Y-%m-%d %H:%M:%S','now','localtime') "
         "WHERE id=?", (session_id,))
