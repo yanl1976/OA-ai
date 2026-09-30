@@ -394,6 +394,29 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
             if _cat_allow is not None and c.get("category") not in _cat_allow:
                 continue
             bm25_chunks.setdefault(d, []).append((c, final_sc))
+        # ---- 强制实体召回（补漏，有界）：保证已召回文档中含强制实体的 chunk 进入 reranker ----
+        # 背景：BM25 最终仅取 phrase-boost 后的 top_k*3 个 chunk，BGE 亦仅取 top_k*6。
+        # 当查询实体是「常见词」（如「安宁宁」在数十篇纪要里都作为出席人出现）时，
+        # 真正命中的 chunk（如第三十次纪要「安宁宁同志兼任营销管理部部长」）既不含
+        # 精确查询串、其 BM25 词法分又被常见词稀释，既掉出 BM25 前 N、又未必进 BGE
+        # 前 N —— 该 chunk 从未进入 reranker，实体约束（只过滤已召回集）无从救起。
+        # 对策：检测到强制实体后，仅对【已被召回到文档级】的文档，把其中含全部强制
+        # 实体的 chunk 补注入候选集（用原始 BM25 分为基线，仅用于进入召回/reranker，
+        # 不污染档位判断）。这样：① 第三十次本身已在文档级召回（BM25 第 7 / BGE 第 5），
+        # 其 chunk1 必被补入并送 reranker，被打 0.9665 顶到最前；② 不引入新文档，
+        # `ranked`（RRF 融合后文档集）规模不变，避免常见名把 reranker 撑到数十篇而变慢。
+        if _mandatory:
+            _recalled = set(bm25_chunks) | set(vec_chunks)
+            for i, c in enumerate(chunks):
+                d = c.get("doc_id")
+                if d is None or d not in _recalled:
+                    continue
+                tl = (c.get("text", "") or "").lower()
+                if all(e.lower() in tl for e in _mandatory):
+                    if _cat_allow is not None and c.get("category") not in _cat_allow:
+                        continue
+                    _raw = float(scores[i]) if i < len(scores) else 0.0
+                    bm25_chunks.setdefault(d, []).append((c, _raw))
     except FileNotFoundError:
         bm25_chunks = {}
     except Exception:
