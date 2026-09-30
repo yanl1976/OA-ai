@@ -36,6 +36,8 @@ import jieba
 
 import numpy as np
 
+from chunk_utils import chunk_text  # 统一切分策略，与 rag_build_index 保持一致
+
 # ========== 配置 ==========
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VEC_DIR = os.path.join(KB_ROOT, "knowledge_base", "vec_index")
@@ -131,31 +133,6 @@ def get_embedder():
     return _EMBEDDER
 
 
-# ==================== 文本切分 ====================
-def _chunk_with_offsets(text: str):
-    """按段落切分，返回 [(chunk_text, char_start, char_end), ...]。"""
-    paragraphs = text.split("\n")
-    chunks = []
-    buf = ""
-    buf_start = None
-    cursor = 0
-    for para in paragraphs:
-        p = para.rstrip("\n")
-        if buf and len(buf) + len(p) + 1 > CHUNK_SIZE:
-            end = buf_start + len(buf)
-            chunks.append((buf, buf_start, end))
-            buf = ""
-            buf_start = None
-        if buf_start is None:
-            buf_start = cursor
-        buf = (buf + "\n" + p) if buf else p
-        cursor += len(p) + 1
-    if buf.strip():
-        end = buf_start + len(buf)
-        chunks.append((buf, buf_start, end))
-    return chunks or [(text, 0, len(text))]
-
-
 # ==================== 向量索引 ====================
 class VecIndex:
     def __init__(self):
@@ -182,7 +159,7 @@ class VecIndex:
     def _doc_chunks(self, doc):
         content = doc.get("content") or ""
         pairs = []
-        for i, (ct, cs, ce) in enumerate(_chunk_with_offsets(content)):
+        for i, (ct, cs, ce) in enumerate(chunk_text(content, chunk_size=CHUNK_SIZE)):
             if not ct.strip():
                 continue
             pairs.append((self._make_chunk_meta(doc, ct, cs, ce, i), ct))

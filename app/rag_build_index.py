@@ -24,6 +24,7 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 
 import kb_store  # 复用统一文档加载与年份提取
+from chunk_utils import chunk_text  # 统一切分策略，与 vec_store 保持一致
 
 # ========== 配置 ==========
 KB_ROOT = os.environ.get("KB_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,29 +34,7 @@ INDEX_FILE = os.path.join(INDEX_DIR, "bm25_index.pkl")
 META_FILE = os.path.join(INDEX_DIR, "doc_metadata.pkl")
 MANIFEST_FILE = os.path.join(INDEX_DIR, "documents_manifest.json")
 
-CHUNK_SIZE = 1200  # 每个文本块的字符数（与 vec_store 一致，放大粒度降低碎片化）
-
-
-def chunk_text(text, chunk_size=CHUNK_SIZE):
-    """将长文本切分为小块（按段落切分），并记录在全文中的绝对字符偏移。"""
-    paragraphs = text.split("\n")
-    chunks = []
-    buf = ""
-    buf_start = None
-    cursor = 0
-    for para in paragraphs:
-        p = para.rstrip("\n")
-        if buf and len(buf) + len(p) + 1 > chunk_size:
-            chunks.append((buf, buf_start, buf_start + len(buf)))
-            buf = ""
-            buf_start = None
-        if buf_start is None:
-            buf_start = cursor
-        buf = (buf + "\n" + p) if buf else p
-        cursor += len(p) + 1
-    if buf.strip():
-        chunks.append((buf, buf_start, buf_start + len(buf)))
-    return chunks or [(text, 0, len(text))]
+CHUNK_SIZE = 1200  # 每个文本块的字符数上限（与 vec_store 一致）
 
 
 def build_index():
