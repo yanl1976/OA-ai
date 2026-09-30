@@ -16,6 +16,7 @@ import jieba
 import rag_query
 import vec_store
 import kb_store
+import reranker as _reranker
 
 RRF_K = vec_store.RRF_K
 # 文档级融合时，向量通道相对 BM25 的权重（bge 语义区分度更好，略加权）
@@ -33,6 +34,44 @@ SIM_FLOOR = 0.72
 ABS_SEMANTIC_TIER = 0.80
 # 每篇相关文档最多取多少个最相关 chunk 拼接进 content（控制 LLM 上下文长度，避免整本文档碎片噪声）
 MAX_CHUNKS_PER_DOC = 3
+
+# ============ 强实体硬约束（解决「人名/专有名词被语义漂移误召」）============
+# 问题：用户查「安宁宁任职」，BM25 把含「任职」关键字但全文无「安宁宁」的《公司章程》
+# 顶到前面，BGE 又把「安宁宁」语义关联到相邻主题；结果 LLM 拿到的是不含该人的文档，
+# 只能答「未检索到」。这类「实体未被命中却因其他词命中而返回」是 RAG 高频误召。
+#
+# 方案：从查询中抽「强实体」（纯中文、长度>=2、IDF 高于阈值，即稀有专有词：人名/
+# 项目号/机构名/编号），作为召回硬约束（AND 语义）——命中文档必须包含全部强实体，
+# 否则视为不相关直接剔除。此约束通用，不止于人名（如「S2026005 合同」也会要求命中
+# 项目号），但只是「第一道过滤」，无法区分『同文档内名单 chunk vs 议案 chunk』，
+# 后者需 reranker 精排（见 P2 计划）。
+_ENTITY_MIN_IDF = 2.0
+# 职务/任职变动动词与职务名词：人物任职类查询的强信号标记。含强实体且同 chunk 命中
+# 这些词的，视为「实体+职务」强相关，提至最高档，优先于仅列席/出席的名单 chunk。
+_ROLE_RE = re.compile(
+    r"兼任|聘任|免去|拟任|拟免|任职|部长|董事长|总经理|副总经理|经理|"
+    r"主任|局长|司长|委员|书记|副.*长"
+)
+
+
+# Reranker 精排：每篇候选文档最多取多少个最相关 chunk 喂给 Cross-Encoder 打分
+RERANK_TOP_CHUNKS = 8
+
+
+def _extract_mandatory_entities(qtokens, idf):
+    """抽取查询中的「强实体」作为召回硬约束 token 列表（去重保序）。"""
+    ents = []
+    for t in (qtokens or []):
+        t = str(t)
+        if len(t) < 2:
+            continue
+        # 仅纯中文（人名 / 中文机构 / 项目名），排除「任职」「管理」等通用词
+        if not re.fullmatch(r"[一-鿿]+", t):
+            continue
+        if (idf.get(t, 1.0) or 1.0) < _ENTITY_MIN_IDF:
+            continue
+        ents.append(t)
+    return list(dict.fromkeys(ents))
 
 # ============ 短语完整性加权（解决「检索结果碎片化」）============
 # 问题：jieba.lcut_for_search 会把查询切成过细的 token（如「管理办法」→「管理」「办法」），
@@ -293,9 +332,11 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     # 复用 BM25 已算好的 IDF（区分度权重）：稀有词（如「分包」IDF 5.5）
     # 比常见词（如「工程」IDF 1.7）更能代表用户意图，用于加权聚集度与短语加成。
     _idf = {}
+    _mandatory = []
     try:
         bm25, chunks = rag_query.load_index()
         _idf = getattr(bm25, "idf", None) or {}
+        _mandatory = _extract_mandatory_entities(qtokens, _idf)
         scores = bm25.get_scores(qtokens)
         # 先按原始 BM25 分召回较宽的候选（保证不漏），再对候选做短语完整性重排序：
         # 完整包含查询原串的 chunk 分数被放大，只命中零碎 token 的被压低。
@@ -405,29 +446,64 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     #   档 0 = 零词法命中（纯向量语义相似，最易产生「内容不符合」的误召回）
     _q_lower = (query or "").strip().lower()
 
+    def _chunk_rank(item):
+        """chunk 级排序键：(实体+职务, 完整短语命中, 短语完整度, 原分)。供 Reranker
+        选候选 chunk 与最终 content 拼接共用。"""
+        meta, sc = item
+        q = (query or "").strip().lower()
+        txt = (meta.get("text", "") or "").lower()
+        exact = 1 if (len(q) >= 2 and q in txt) else 0
+        boost = _phrase_boost(meta.get("text", ""), query, qtokens, idf=_idf)
+        role = 0
+        if _mandatory and _ROLE_RE.search(meta.get("text", "")):
+            if all(e.lower() in txt for e in _mandatory):
+                role = 1
+        return (role, exact, boost, sc)
+
     def _doc_quality(d):
-        """返回 (tier, best_prox)：tier 越大匹配质量越高。"""
+        """返回 (tier, best_prox, entity_satisfied)：tier 越大匹配质量越高。"""
         hits = list(vec_chunks.get(d, [])) + list(bm25_chunks.get(d, []))
         best_exact = 0
         best_prox = 0.0
+        entity_role = False   # 文档是否含「强实体 + 职务词」的强信号 chunk
+        union_text = ""
         for meta, _sc in hits:
             txt = (meta.get("text", "") or "")
             tl = txt.lower()
+            union_text += tl + "\n"
             if len(_q_lower) >= 2 and _q_lower in tl:
                 best_exact += tl.count(_q_lower)
             p = _proximity_score(txt, qtokens, idf=_idf)
             if p > best_prox:
                 best_prox = p
+            # 强实体 + 职务词同现：人物任职类查询的强信号（如「安宁宁…兼任部长」）
+            if _mandatory and _ROLE_RE.search(txt):
+                if all(e.lower() in tl for e in _mandatory):
+                    entity_role = True
+        entity_satisfied = True
+        if _mandatory:
+            # 命中文档必须包含全部强实体，否则视为实体未命中（语义漂移误召）
+            entity_satisfied = all(e.lower() in union_text for e in _mandatory)
+        if entity_role:
+            return 4, best_prox, entity_satisfied   # 最高档：实体且上下文为职务
         if best_exact > 0:
-            return 3, best_prox
+            return 3, best_prox, entity_satisfied
         if best_prox >= PROX_TIER2:
-            return 2, best_prox
+            return 2, best_prox, entity_satisfied
         if best_prox > 0:
-            return 1, best_prox
-        return 0, 0.0
+            return 1, best_prox, entity_satisfied
+        return 0, 0.0, entity_satisfied
 
     _qual = {d: _doc_quality(d) for d, _ in ranked}
     ranked.sort(key=lambda ds: (_qual[ds[0]][0], _qual[ds[0]][1], ds[1]), reverse=True)
+
+    # ---- 强实体硬约束：剔除未命中实体的文档（消除语义漂移误召）----
+    # 若查询含强实体且库中存在「命中实体」的文档，则仅保留这些文档；
+    # 若全库都未命中实体（_sat 为空），则回退不过滤，避免误杀真实存在的弱相关。
+    if _mandatory:
+        _sat = [ds for ds in ranked if _qual[ds[0]][2]]
+        if _sat:
+            ranked = _sat
 
     # 供前端全文高亮用的匹配词：归并重叠词后的分词（如「智能/智能化」→「智能化」），
     # 并按长度降序（前端先标长词，避免短词抢先切割）。单字不返回，避免高亮噪音。
@@ -471,8 +547,41 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     if _kept:
         ranked = _kept
 
-    # 截断放在最后：分档排序 + 质量门槛都已完成，此时真正的命中必然排在最前，
-    # 不会被数量截断挤掉（详见上方「不要按 top_k 截断」的说明）。
+    # ---- Reranker 精排（chunk 级交互式打分，根治 BM25 长度偏好 / 文档级聚合丢信号）----
+    # 对每个候选文档取其命中 chunk 的 top-RERANK_TOP_CHUNKS，交给 Cross-Encoder 对
+    # (query, chunk) 重新打分；文档分取最高 chunk 分，content 用 rerank 高分 chunk。
+    # 模型未安装 / 加载失败 / 推理异常时自动回退到上方 tier+RRF 排序（不阻塞对话）。
+    _rr_best = {}
+    _rr_doc_score = {}
+    try:
+        if _reranker.is_available():
+            _rr_texts, _rr_doc_of, _rr_chunk_of = [], [], []
+            for d, _s in ranked:
+                all_hits = list(vec_chunks.get(d, [])) + list(bm25_chunks.get(d, []))
+                cand = sorted(all_hits, key=_chunk_rank, reverse=True)[:RERANK_TOP_CHUNKS]
+                for m, _sc in cand:
+                    txt = (m.get("text", "") or "").strip()
+                    if not txt:
+                        continue
+                    _rr_texts.append(txt)
+                    _rr_doc_of.append(d)
+                    _rr_chunk_of.append(m)
+            if _rr_texts:
+                _rr_scores = _reranker.rerank(query, _rr_texts)
+                if _rr_scores:
+                    for i, (d, m) in enumerate(zip(_rr_doc_of, _rr_chunk_of)):
+                        sc = _rr_scores[i]
+                        if d not in _rr_doc_score or sc > _rr_doc_score[d]:
+                            _rr_doc_score[d] = sc
+                        _rr_best.setdefault(d, []).append((sc, m))
+                    for d in _rr_best:
+                        _rr_best[d].sort(key=lambda x: x[0], reverse=True)
+                    ranked = sorted(ranked, key=lambda ds: _rr_doc_score.get(ds[0], 0.0), reverse=True)
+    except Exception:
+        pass  # 任何异常都回退到既有排序
+
+    # 截断放在最后：分档排序 + 质量门槛 + Reranker 精排都已完成，此时真正的命中必然
+    # 排在最前，不会被数量截断挤掉。
     ranked = ranked[:top_k]
 
     results = []
@@ -484,20 +593,16 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
         # 其次才是分数最高者。原因：摘要给用户看的是「关键词在哪出现的上下文」，
         # 若挑中的 chunk 只有零散单字命中，摘要就会显得支离破碎（碎片化）。
         # 排序键 = (是否完整短语命中, 短语完整度系数, 原分数)，三者依次比较。
-        _q = (query or "").strip().lower()
-
-        def _chunk_rank(item):
-            meta, sc = item
-            txt = (meta.get("text", "") or "").lower()
-            exact = 1 if (len(_q) >= 2 and _q in txt) else 0
-            boost = _phrase_boost(meta.get("text", ""), query, qtokens, idf=_idf)
-            return (exact, boost, sc)
-
         best_chunk = None
         best_sc = -1
         if all_hits:
-            best_meta, best_sc = max(all_hits, key=_chunk_rank)
-            best_chunk = best_meta
+            # 优先用 Reranker 高分 chunk（若可用）；否则退回 _chunk_rank 选最佳摘要
+            if d in _rr_best:
+                best_chunk = _rr_best[d][0][1]
+                best_sc = _rr_best[d][0][0]
+            else:
+                best_meta, best_sc = max(all_hits, key=_chunk_rank)
+                best_chunk = best_meta
 
         # regions：所有命中 chunk 的字符区间（去重、排序），供前端"内容高亮"
         regions = []
@@ -517,9 +622,12 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
         # 既不丢失答案片段，又避免整本文档所有碎片灌入上下文造成噪声。
         # 选取时同样优先完整短语命中的 chunk（复用 _chunk_rank），保证拼接进
         # 上下文的是「关键词完整出现」的段落，而非零散碎片。
-        top_hits = sorted(all_hits, key=_chunk_rank, reverse=True)[:MAX_CHUNKS_PER_DOC]
-        raw_chunks = sorted((m for m, _ in top_hits),
-                            key=lambda m: m.get("char_start", 0) or 0)
+        if d in _rr_best:
+            raw_chunks = [m for _sc, m in _rr_best[d][:MAX_CHUNKS_PER_DOC]]
+        else:
+            top_hits = sorted(all_hits, key=_chunk_rank, reverse=True)[:MAX_CHUNKS_PER_DOC]
+            raw_chunks = sorted((m for m, _ in top_hits),
+                                key=lambda m: m.get("char_start", 0) or 0)
         content = "\n".join((m.get("text", "") or "").strip()
                             for m in raw_chunks if (m.get("text") or "").strip())
 
