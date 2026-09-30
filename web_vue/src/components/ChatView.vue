@@ -52,6 +52,7 @@ async function openSession(sid) {
       content: m.content,
       refs: m.refs || [],
       droppedRefs: m.dropped_refs || [],
+      factWarnings: m.fact_warnings || [],
     }));
   } catch (e) {
     notify("加载消息失败：" + (e.response?.data?.error || e.message), "err");
@@ -118,6 +119,7 @@ async function send() {
     last.refs = r.refs || [];
     last.truncated = !!r.truncated;   // 部分参考文档被截断（长文档超出单篇字符预算）
     last.droppedRefs = r.dropped_refs || [];  // 回答引用但不在检索结果中的文档（疑似编造引用）
+    last.factWarnings = r.fact_warnings || [];  // 回答关键数值未能在参考原文直接核验（事实校验，默认关闭）
     last.loading = false;
     if (scope.value.length === 0) scope.value = r.scope || [];
   } catch (e) {
@@ -226,6 +228,10 @@ onMounted(async () => {
 
             <div class="ref-warn" v-if="m.role === 'assistant' && m.droppedRefs && m.droppedRefs.length && !m.loading">
               ⚠ 本回答引用了以下未检索到的文档：{{ m.droppedRefs.join('、') }}。这些内容不在当前授权范围内已检索到的资料中，可能并非出自管理制度，请谨慎核实或缩小对话范围后重试。
+            </div>
+
+            <div class="fact-warn" v-if="m.role === 'assistant' && m.factWarnings && m.factWarnings.length && !m.loading">
+              ⚠ 本回答中的以下数值（天数/金额/百分比）未能在当前参考文档原文中直接核验：{{ m.factWarnings.join('、') }}。可能存在条款解读偏差，请对照制度原文确认。
             </div>
 
             <div class="refs" v-if="m.role === 'assistant' && m.refs && m.refs.length">
@@ -388,6 +394,11 @@ onMounted(async () => {
 .ref-warn {
   margin-top: 8px; padding: 8px 12px; border-radius: 6px;
   background: #fef0f0; border: 1px solid #f5b5b5; color: #c0392b;
+  font-size: 12.5px; line-height: 1.6; text-align: left;
+}
+.fact-warn {
+  margin-top: 8px; padding: 8px 12px; border-radius: 6px;
+  background: #fff7e6; border: 1px solid #ffd591; color: #ad6800;
   font-size: 12.5px; line-height: 1.6; text-align: left;
 }
 .refs { margin-top: 10px; text-align: left; }

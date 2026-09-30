@@ -106,3 +106,15 @@ def ref_gate_enabled():
     """
     return os.environ.get("CHAT_REF_GATE", "0").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def fact_check_enabled():
+    """内容级事实数值校验开关（默认关闭）。
+
+    开启后：引擎对回答中的关键数值（天数/金额/百分比）做一次保守校验，
+    若数值未在参考原文中出现，返回 fact_warnings 供前端提示。关闭时完全不执行，
+    零额外开销、零误报打扰。该功能易误报（refs 仅为相关 chunk、纯文字曲解检测不到），
+    默认关闭，需评估对输出质量的影响后再开启。
+    """
+    return os.environ.get("CHAT_FACT_CHECK", "0").strip().lower() in (
+        "1", "true", "yes", "on")

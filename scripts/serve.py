@@ -2678,6 +2678,7 @@ def kb_chat():
         "prompt_version": result.get("prompt_version"),
         "cited_refs": result.get("cited_refs", []),
         "dropped_refs": result.get("dropped_refs", []),
+        "fact_warnings": result.get("fact_warnings", []),
     })
 
 
