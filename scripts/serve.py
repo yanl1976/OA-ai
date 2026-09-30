@@ -2679,6 +2679,7 @@ def kb_chat():
         "cited_refs": result.get("cited_refs", []),
         "dropped_refs": result.get("dropped_refs", []),
         "fact_warnings": result.get("fact_warnings", []),
+        "semantic_warnings": result.get("semantic_warnings", []),
     })
 
 

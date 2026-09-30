@@ -19,7 +19,8 @@ from ai.llm_client import (
 from ai.chat_prompt import build_system_prompt, PROMPT_VERSION
 from ai.chat_context import build_context_block
 from ai.chat_normalize import soft_check_references, extract_cited_docs, soft_check_facts
-from ai.llm_config import ref_gate_enabled, fact_check_enabled
+from ai.llm_config import ref_gate_enabled, fact_check_enabled, semantic_check_enabled
+from ai.semantic_check import semantic_check
 
 logger = logging.getLogger("kb.chat.engine")
 
@@ -164,10 +165,15 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
     #     仅作提示（fact_warn），不阻断、不重答。
     fact_warn = soft_check_facts(answer, refs) if fact_check_enabled() else []
 
+    # 6c) 整段语义事实校验（可选，默认关闭）：把回答整段与参考原文整段做 NLI，
+    #     标记『原文完全无支持/矛盾』的事实陈述（如人物-职务-会议关系编造），
+    #     仅作提示，不阻断、不重答（成本与误报取舍，见 semantic_check_enabled）。
+    semantic_warn = semantic_check(answer, context_block) if semantic_check_enabled() else []
+
     # 8) 持久化消息
     chat_store.add_message(sid, "user", question)
     chat_store.add_message(sid, "assistant", answer, refs, dropped_refs=dropped,
-                           fact_warnings=fact_warn)
+                           fact_warnings=fact_warn, semantic_warnings=semantic_warn)
 
     # 9) 审计（带提示词版本，便于追溯「为什么这次结论与上次不同」）
     import admin
@@ -180,8 +186,8 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
         _uname = ""
     kb_store.audit_log(
         "kb.chat", target="session:%d" % sid,
-        detail="%s|prompt=%s|cited=%s|dropped=%s|fact=%s"
-               % (question, PROMPT_VERSION, cited, dropped, fact_warn),
+        detail="%s|prompt=%s|cited=%s|dropped=%s|fact=%s|semantic=%s"
+               % (question, PROMPT_VERSION, cited, dropped, fact_warn, semantic_warn),
         user_id=uid, username=_uname)
 
     return {
@@ -194,4 +200,5 @@ def run(uid, question, perms, session_id=None, top_k=8, category=None):
         "cited_refs": cited,
         "dropped_refs": dropped,
         "fact_warnings": fact_warn,
+        "semantic_warnings": semantic_warn,
     }

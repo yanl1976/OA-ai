@@ -53,6 +53,7 @@ async function openSession(sid) {
       refs: m.refs || [],
       droppedRefs: m.dropped_refs || [],
       factWarnings: m.fact_warnings || [],
+      semanticWarnings: m.semantic_warnings || [],
     }));
   } catch (e) {
     notify("加载消息失败：" + (e.response?.data?.error || e.message), "err");
@@ -120,6 +121,7 @@ async function send() {
     last.truncated = !!r.truncated;   // 部分参考文档被截断（长文档超出单篇字符预算）
     last.droppedRefs = r.dropped_refs || [];  // 回答引用但不在检索结果中的文档（疑似编造引用）
     last.factWarnings = r.fact_warnings || [];  // 回答关键数值未能在参考原文直接核验（事实校验，默认关闭）
+    last.semanticWarnings = r.semantic_warnings || [];  // 整段语义事实校验（默认关闭）抓到的无支持/矛盾陈述
     last.loading = false;
     if (scope.value.length === 0) scope.value = r.scope || [];
   } catch (e) {
@@ -232,6 +234,15 @@ onMounted(async () => {
 
             <div class="fact-warn" v-if="m.role === 'assistant' && m.factWarnings && m.factWarnings.length && !m.loading">
               ⚠ 本回答中的以下数值（天数/金额/百分比）未能在当前参考文档原文中直接核验：{{ m.factWarnings.join('、') }}。可能存在条款解读偏差，请对照制度原文确认。
+            </div>
+
+            <div class="fact-warn" v-if="m.role === 'assistant' && m.semanticWarnings && m.semanticWarnings.length && !m.loading">
+              ⚠ 整段语义校验：本回答的以下事实陈述未能在当前参考文档原文中找到支持（可能属编造或误读）：
+              <ul class="sem-list">
+                <li v-for="(w, k) in m.semanticWarnings" :key="k">
+                  「{{ w.claim }}」<span class="sem-reason">（{{ w.verdict === 'contradicted' ? '与原文矛盾' : '原文无支持' }}{{ w.reason ? '：' + w.reason : '' }}）</span>
+                </li>
+              </ul>
             </div>
 
             <div class="refs" v-if="m.role === 'assistant' && m.refs && m.refs.length">

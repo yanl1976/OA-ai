@@ -118,3 +118,16 @@ def fact_check_enabled():
     """
     return os.environ.get("CHAT_FACT_CHECK", "0").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def semantic_check_enabled():
+    """整段语义事实校验开关（默认关闭）。
+
+    开启后：引擎把「回答整段」与「参考原文整段」交事实核查模型做 NLI，
+    标记回答中『原文完全无支持/矛盾』的事实陈述（如人物-职务-会议关系编造、
+    文件名真实但内容被曲解），返回 semantic_warnings 供前端提示。默认关闭：
+    每轮多一次 LLM 调用（成本+延迟），需评估影响后开启
+    （建议先开软提示观察误报，再决定是否接入硬闸门重答）。
+    """
+    return os.environ.get("CHAT_SEMANTIC_CHECK", "0").strip().lower() in (
+        "1", "true", "yes", "on")
