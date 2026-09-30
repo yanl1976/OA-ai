@@ -12,6 +12,7 @@ import re
 import html as _html
 
 import jieba
+import os
 
 import rag_query
 import vec_store
@@ -52,26 +53,45 @@ _ROLE_RE = re.compile(
     r"兼任|聘任|免去|拟任|拟免|任职|部长|董事长|总经理|副总经理|经理|"
     r"主任|局长|司长|委员|书记|副.*长"
 )
+# 查询切分符：职务动词/关系词，用于把查询切成「实体段」，避免把「任职」误当硬实体
+_ENTITY_SPLIT_RE = re.compile(
+    r"兼任|聘任|免去|拟任|拟免|任职|任免|职务|情况|关于|审议|同志|的|、|,|，|\s+"
+)
+# 不作为强实体硬约束的通用词（避免把描述性短语当实体，约束过宽）
+_ENTITY_STOP = {
+    "情况", "关于", "审议", "同志", "相关", "议案", "会议", "纪要", "公司", "集团",
+    "管理", "部门", "工作", "通知", "报告", "意见", "决定", "事项", "人员", "名单",
+    "出席", "列席", "主持", "参加", "以及", "进行", "开展", "提出", "要求", "按照",
+    "任期", "分工", "调整", "免去", "聘任", "兼任",
+}
 
 
 # Reranker 精排：每篇候选文档最多取多少个最相关 chunk 喂给 Cross-Encoder 打分
 RERANK_TOP_CHUNKS = 8
 
 
-def _extract_mandatory_entities(qtokens, idf):
-    """抽取查询中的「强实体」作为召回硬约束 token 列表（去重保序）。"""
+def _extract_mandatory_entities(query, qtokens, idf):
+    """抽取查询中的「强实体」（人名/短专有名词/项目号）作为召回硬约束（AND 语义）。
+
+    修复「安宁宁任职」误杀第三十次纪要：
+    1. 用正则从查询提取连续中文片段，避免 jieba 把「安宁宁」过切成「安宁」；
+    2. 先按职务动词/关系词把查询切段，避免把用户加的「任职」误判为强实体、
+       进而要求文档必须含「任职」——而第三十次纪要用词是「兼任/任免」不含「任职」，
+       原逻辑因此把真正答案误杀，只剩含「安宁宁+任职」的催收货款议案。
+    """
     ents = []
-    for t in (qtokens or []):
-        t = str(t)
-        if len(t) < 2:
-            continue
-        # 仅纯中文（人名 / 中文机构 / 项目名），排除「任职」「管理」等通用词
-        if not re.fullmatch(r"[一-鿿]+", t):
-            continue
-        if (idf.get(t, 1.0) or 1.0) < _ENTITY_MIN_IDF:
-            continue
-        ents.append(t)
-    return list(dict.fromkeys(ents))
+    seen = set()
+    for seg in _ENTITY_SPLIT_RE.split(query or ""):
+        for raw in re.findall(r"[一-鿿]{2,}", seg):
+            if raw in seen:
+                continue
+            seen.add(raw)
+            if raw in _ENTITY_STOP or _ROLE_RE.search(raw):
+                continue
+            if len(raw) > 6:   # 过长更像描述短语，不硬约束
+                continue
+            ents.append(raw)
+    return ents
 
 # ============ 短语完整性加权（解决「检索结果碎片化」）============
 # 问题：jieba.lcut_for_search 会把查询切成过细的 token（如「管理办法」→「管理」「办法」），
@@ -336,7 +356,7 @@ def hybrid_search(query: str, top_k: int = 20, categories: list = None):
     try:
         bm25, chunks = rag_query.load_index()
         _idf = getattr(bm25, "idf", None) or {}
-        _mandatory = _extract_mandatory_entities(qtokens, _idf)
+        _mandatory = _extract_mandatory_entities(query, qtokens, _idf)
         scores = bm25.get_scores(qtokens)
         # 先按原始 BM25 分召回较宽的候选（保证不漏），再对候选做短语完整性重排序：
         # 完整包含查询原串的 chunk 分数被放大，只命中零碎 token 的被压低。
